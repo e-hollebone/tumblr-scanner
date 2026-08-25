@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -24,12 +23,9 @@ from typing import Any
 from agent import run as agent_run
 from cache import (
     CACHE_DIR,
-    list_stale_t1_entries,
     load_entry,
-    load_log,
     save_entry,
 )
-from extractor import extract_from_html
 
 logger = logging.getLogger("tumblr-coordinator")
 
@@ -213,12 +209,12 @@ async def run_t1_batch(
                 # T0 creates the tab — sub-agent receives the ws_url
                 target_url = f"https://www.tumblr.com/{username}"
                 logger.info("Creating T1 tab for %s", username)
-                ws_url, target_id = await agent_run._new_tab_url(
-                    browser_ws, target_url
-                )
+                ws_url, target_id = await agent_run._new_tab_url(browser_ws, target_url)
                 logger.info(
                     "T1 tab created for %s: ws=%s target_id=%s",
-                    username, ws_url, target_id,
+                    username,
+                    ws_url,
+                    target_id,
                 )
                 result = await agent_run(
                     browser_ws=browser_ws,
@@ -232,7 +228,7 @@ async def run_t1_batch(
                     cache_dir=cache_root,
                     pre_existing_ws_url=ws_url,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — agent error is captured as error result below
                 logger.error("T1 agent failed for %s: %s", username, exc)
                 result = {
                     "username": username,
@@ -252,11 +248,14 @@ async def run_t1_batch(
                 # T0 owns cleanup — close the tab regardless of agent outcome
                 if target_id:
                     await agent_run.close_tab(browser_ws, target_id)
-                    logger.info("T1 tab closed for %s (target_id=%s)", username, target_id)
+                    logger.info(
+                        "T1 tab closed for %s (target_id=%s)", username, target_id
+                    )
                 elif ws_url:
                     logger.warning(
                         "T1 agent for %s had ws_url but no target_id — "
-                        "tab may not be closable", username
+                        "tab may not be closable",
+                        username,
                     )
             elapsed = time.monotonic() - start
             logger.info(
@@ -323,12 +322,12 @@ async def run_t2_batch(
                 # T0 creates the tab — sub-agent receives the ws_url
                 target_url = f"https://www.tumblr.com/{username}"
                 logger.info("Creating T2 tab for %s", username)
-                ws_url, target_id = await agent_run._new_tab_url(
-                    browser_ws, target_url
-                )
+                ws_url, target_id = await agent_run._new_tab_url(browser_ws, target_url)
                 logger.info(
                     "T2 tab created for %s: ws=%s target_id=%s",
-                    username, ws_url, target_id,
+                    username,
+                    ws_url,
+                    target_id,
                 )
                 result = await agent_run(
                     browser_ws=browser_ws,
@@ -342,7 +341,7 @@ async def run_t2_batch(
                     cache_dir=cache_root,
                     pre_existing_ws_url=ws_url,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — agent error is captured as error result below
                 logger.error("T2 agent failed for %s: %s", username, exc)
                 result = {
                     "username": username,
@@ -362,11 +361,14 @@ async def run_t2_batch(
                 # T0 owns cleanup — close the tab regardless of agent outcome
                 if target_id:
                     await agent_run.close_tab(browser_ws, target_id)
-                    logger.info("T2 tab closed for %s (target_id=%s)", username, target_id)
+                    logger.info(
+                        "T2 tab closed for %s (target_id=%s)", username, target_id
+                    )
                 elif ws_url:
                     logger.warning(
                         "T2 agent for %s had ws_url but no target_id — "
-                        "tab may not be closable", username
+                        "tab may not be closable",
+                        username,
                     )
             elapsed = time.monotonic() - start
             logger.info(
@@ -427,7 +429,7 @@ async def run_full_pipeline(
     Returns:
         Pipeline result with T0, T1 summary, T2 summary, and timing.
     """
-    browser = browser_ws or os.environ.get("TUMBLR_CDP_BROWSER", DEFAULT_CDP_BROWSER)
+    browser = browser_ws or DEFAULT_CDP_BROWSER
     cache_root = cache_dir or CACHE_DIR
 
     logger.info("=== Pipeline start ===")
@@ -461,7 +463,11 @@ async def run_full_pipeline(
         }
 
     # --- T1 ---
-    logger.info("Starting T1: %d usernames, max %d concurrent", len(t0_usernames), MAX_CONCURRENT_AGENTS)
+    logger.info(
+        "Starting T1: %d usernames, max %d concurrent",
+        len(t0_usernames),
+        MAX_CONCURRENT_AGENTS,
+    )
     t1_start = time.monotonic()
     t1_results = await run_t1_batch(
         browser_ws=browser,
@@ -670,7 +676,9 @@ def main() -> None:
                 dead = [r for r in t1_results if r.get("dead")]
                 error = [r for r in t1_results if r.get("status") == "error"]
                 print(f"Success:    {len(success)}")
-                print(f"Cached:     {len([r for r in t1_results if r.get('status') == 'cached'])}")
+                print(
+                    f"Cached:     {len([r for r in t1_results if r.get('status') == 'cached'])}"
+                )
                 print(f"Dead:       {len(dead)}")
                 print(f"Error:      {len(error)}")
         else:

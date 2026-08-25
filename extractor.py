@@ -53,9 +53,10 @@ def extract_from_html(html: str, target_blog: str | None = None) -> dict[str, An
     # out nav widgets, sidebar cells, and other non-post elements that also
     # carry data-cell-id but have no author information.
     cells = [
-        c for c in all_cells
+        c
+        for c in all_cells
         if c.select_one(
-            "article [aria-label], [data-post] [aria-label], a[href][rel=\"author\"]"
+            'article [aria-label], [data-post] [aria-label], a[href][rel="author"]'
         )
     ]
 

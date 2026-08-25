@@ -14,15 +14,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import logging
-import os
 import sys
-import time
 from argparse import ArgumentParser
 from pathlib import Path
 from typing import Any
 
-# Local imports — these are the modules we just wrote
+# Local imports — submodules we just wrote
 from coordinator import (
     CACHE_DIR,
     DEFAULT_CDP_BROWSER,
@@ -30,34 +27,34 @@ from coordinator import (
     LIMITS,
     MAX_CONCURRENT_AGENTS,
     get_t1_list_from_t0,
+    run_full_pipeline,
     run_t0,
     run_t1_batch,
     run_t2_batch,
-    run_full_pipeline,
     setup_logging,
 )
 from extractor import extract_from_html
 
 # Public API surface
 __all__ = [
+    "CACHE_DIR",
+    "DEFAULT_CDP_BROWSER",
+    "DEFAULT_RECRAWL_DAYS",
+    "LIMITS",
+    "MAX_CONCURRENT_AGENTS",
     "extract_from_html",
+    "run_full_pipeline",
     "run_t0",
     "run_t1_batch",
     "run_t2_batch",
-    "run_full_pipeline",
     "setup_logging",
-    "LIMITS",
-    "MAX_CONCURRENT_AGENTS",
-    "DEFAULT_RECRAWL_DAYS",
-    "DEFAULT_CDP_BROWSER",
-    "CACHE_DIR",
 ]
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI main — returns exit code."""
     parser = ArgumentParser(
-        description="Tumblr multi-tier username crawler",
+        description="Tumblr multi-tier username crawler — CLI entry point.",
         prog="run.py",
     )
     parser.add_argument(
@@ -117,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     setup_logging(args.verbose)
+    print(f"Verbose:  {args.verbose}")  # DEBUG
 
     if args.dry_run:
         print("=== DRY RUN ===")
@@ -128,7 +126,9 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print("Limits:")
         for tier, lim in LIMITS.items():
-            print(f"  {tier}: unique={lim['unique']} total={lim['total']} posts={lim['posts']}")
+            print(
+                f"  {tier}: unique={lim['unique']} total={lim['total']} posts={lim['posts']}"
+            )
         return 0
 
     async def _run() -> dict[str, Any]:
@@ -163,8 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             }
         elif args.t2_only:
             # T2-only: build T2 list from existing T1 cache entries
-            from cache import CACHE_DIR as _CD
-            from cache import load_entry, list_stale_t1_entries
+            from cache import load_entry
 
             t1_dir = args.cache_dir / "t1"
             t2_dir = args.cache_dir / "t2"
@@ -230,7 +229,7 @@ def print_result(result: dict[str, Any]) -> None:
 
     if tier == "t0":
         r = result["result"]
-        print(f"Tier:  T0")
+        print("Tier:  T0")
         print(f"Target: {result['target']}")
         print(f"Status: {r.get('status')}")
         print(f"Unique: {r.get('unique_count', 0)}")
@@ -247,7 +246,7 @@ def print_result(result: dict[str, Any]) -> None:
     elif tier == "t1":
         t0 = result["t0"]
         t1_results = result["t1_results"]
-        print(f"Tier:  T0 + T1")
+        print("Tier:  T0 + T1")
         print(f"Target: {result['target']}")
         print()
         print("--- T0 ---")
@@ -277,7 +276,7 @@ def print_result(result: dict[str, Any]) -> None:
     elif tier == "t2":
         t2_list = result.get("t2_list", [])
         t2_results = result.get("t2_results", [])
-        print(f"Tier:  T2")
+        print("Tier:  T2")
         print(f"Target: {result['target']}")
         print(f"T2 candidates: {len(t2_list)}")
         print(f"Dispatched:    {len(t2_results)}")

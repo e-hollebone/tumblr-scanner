@@ -59,6 +59,7 @@ END_PHRASES = [
 # CDP tab creation
 # ---------------------------------------------------------------------------
 
+
 def _extract_browser_ws(browser_ws: str) -> str:
     """
     Given a browser HTTP endpoint (e.g. http://localhost:9222),
@@ -114,9 +115,7 @@ async def _new_tab_url(browser_ws: str, target_url: str) -> tuple[str, str]:
         await create_client.stop()
 
     if not target_id:
-        raise RuntimeError(
-            f"Target.createTarget returned no targetId for {target_url}"
-        )
+        raise RuntimeError(f"Target.createTarget returned no targetId for {target_url}")
 
     # Step 4: poll /json/list for the new page's WS URL.
     # Uses urllib.request to the browser HTTP endpoint — same pattern as
@@ -135,7 +134,7 @@ async def _new_tab_url(browser_ws: str, target_url: str) -> tuple[str, str]:
                     ws_url = t.get("webSocketDebuggerUrl")
                     if ws_url:
                         return ws_url, target_id
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — poll loop: any failure means keep waiting
             pass
 
     raise RuntimeError(
@@ -146,6 +145,7 @@ async def _new_tab_url(browser_ws: str, target_url: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Tab cleanup (T0-owned lifecycle for T1 agents)
 # ---------------------------------------------------------------------------
+
 
 async def close_tab(browser_ws: str, target_id: str) -> None:
     """
@@ -168,7 +168,7 @@ async def close_tab(browser_ws: str, target_id: str) -> None:
     try:
         await client.send.Target.closeTarget(params={"targetId": target_id})
         logger.info("Closed tab targetId=%s", target_id)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — best-effort tab close, never fail the agent
         logger.warning("Failed to close tab %s: %s", target_id, exc)
     finally:
         await client.stop()
@@ -177,6 +177,7 @@ async def close_tab(browser_ws: str, target_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Page fetching
 # ---------------------------------------------------------------------------
+
 
 async def fetch_page_html(
     client: CDPClient,
@@ -192,19 +193,15 @@ async def fetch_page_html(
 
     # Navigate
     try:
-        await client.send.Page.navigate(
-            params={"url": url, "timeout": timeout_ms}
-        )
-    except Exception as exc:
+        await client.send.Page.navigate(params={"url": url, "timeout": timeout_ms})
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Page.navigate failed for %s offset %d: %s", username, offset, exc
         )
         await asyncio.sleep(2)
         try:
-            await client.send.Page.navigate(
-                params={"url": url, "timeout": timeout_ms}
-            )
-        except Exception as exc2:
+            await client.send.Page.navigate(params={"url": url, "timeout": timeout_ms})
+        except Exception as exc2:  # noqa: BLE001 — single retry already attempted, log and return empty
             logger.error("Page.navigate retry failed: %s", exc2)
             return ""
 
@@ -226,14 +223,16 @@ async def fetch_page_html(
                 last_text = new_text
                 if len(new_text) > 100:
                     break
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — content-wait loop: failures are transient
             pass
     # Log a warning if we timed out without meaningful content
     if len(last_text) <= 100:
         logger.warning(
             "Content wait timed out for %s offset %d after %.0fs — "
             "page may be slow or blocked",
-            username, offset, TIMEOUT,
+            username,
+            offset,
+            TIMEOUT,
         )
 
     # Get full HTML
@@ -246,7 +245,7 @@ async def fetch_page_html(
         )
         html = result.get("result", {}).get("value", "")
         return html
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — HTML fetch failure is non-fatal, caller handles empty
         logger.error("Failed to get page HTML for %s: %s", username, exc)
         return ""
 
@@ -254,6 +253,7 @@ async def fetch_page_html(
 # ---------------------------------------------------------------------------
 # Detection helpers
 # ---------------------------------------------------------------------------
+
 
 def detect_dead(html: str, page_text: str) -> bool:
     """Return True if the blog appears dead / private / gone."""
@@ -277,6 +277,7 @@ def detect_end_of_posts(page_text: str, html: str) -> bool:
 # Metrics wrapper
 # ---------------------------------------------------------------------------
 
+
 def compute_page_metrics(html: str, source_blog: str | None) -> dict[str, Any]:
     """
     Run the canonical extractor on page HTML and return per-page metrics.
@@ -290,6 +291,7 @@ def compute_page_metrics(html: str, source_blog: str | None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Main agent loop
 # ---------------------------------------------------------------------------
+
 
 async def run(
     browser_ws: str,
@@ -336,9 +338,7 @@ async def run(
     # Check if this username already has a fresh cache entry
     existing = load_entry(tier_dir / f"{username}.json")
     if existing and not entry_is_stale(existing, recrawl_days=recrawl_days):
-        logger.info(
-            "Skipping %s — cache is fresh (< %d days)", username, recrawl_days
-        )
+        logger.info("Skipping %s — cache is fresh (< %d days)", username, recrawl_days)
         return {
             "username": username,
             "tier": tier,
@@ -413,7 +413,7 @@ async def run(
                     }
                 )
                 page_text = text_result.get("result", {}).get("value", "")
-            except Exception:
+            except Exception:  # noqa: BLE001 — text extraction is best-effort, empty is fine
                 page_text = ""
 
             # Dead blog detection
@@ -433,14 +433,15 @@ async def run(
             page_result = compute_page_metrics(html, source_blog)
             page_usernames = page_result["usernames"]
 
-            if not page_usernames and posts_processed == 0:
-                # First page with no usernames — blog might be empty
-                if detect_end_of_posts(page_text, html):
-                    logger.info(
-                        "Blog %s has no posts (end signal on first page)", username
-                    )
-                    status = "empty"
-                    break
+            # First page with no usernames AND end-of-posts signal — blog is empty
+            if (
+                not page_usernames
+                and posts_processed == 0
+                and detect_end_of_posts(page_text, html)
+            ):
+                logger.info("Blog %s has no posts (end signal on first page)", username)
+                status = "empty"
+                break
 
             # Accumulate
             for name in page_usernames:
@@ -502,7 +503,7 @@ async def run(
             logger.debug("Sleeping %.2fs before next fetch", delay)
             await asyncio.sleep(delay)
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — top-level agent error, logged and finalized below
         logger.error("Agent error for %s: %s", username, exc)
         status = "error"
         dead_reason = str(exc)
@@ -541,7 +542,7 @@ async def run(
 
         try:
             await client.stop()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — final cleanup, non-fatal if it fails
             pass
 
     return {

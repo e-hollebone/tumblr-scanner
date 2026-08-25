@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -50,7 +49,7 @@ def _parse_iso(ts: str) -> datetime:
         # Fallback: try common formats
         for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
             try:
-                return datetime.strptime(ts, fmt)
+                return datetime.strptime(ts, fmt)  # noqa: DTZ007 — fallback: naive parse; caller normalizes tz
             except ValueError:
                 continue
         raise ValueError(f"Cannot parse timestamp: {ts}")
