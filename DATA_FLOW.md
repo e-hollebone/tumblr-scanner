@@ -63,6 +63,7 @@ run.py <target> --t0-only    → coordinator.run_t0()
 | Store | Format | Writer | Consumer | Purpose |
 |-------|--------|--------|----------|---------|
 | `cache/index.json` | JSON (atomic `.tmp`+rename) | `_write_index()` | `_index_has_fresh_entry()`, `_enqueue_if_not_indexed()` | Dedup + recrawl gate. Key=username, value={tier,status,scanned_at,usernames,dead,...} |
+| `cache/index.lock` | flock lock file (never replaced) | `_write_index()` / `_read_index()` | — | Serializes all index.json access. **Critical:** the lock is on a stable sidecar file, NOT `index.json` itself — `os.replace()` swaps `index.json`'s inode, so flocking the data file would NOT serialize concurrent writers. |
 | `cache/queue.jsonl` | JSONL, POSIX `flock` | `enqueue()`, `mark_done()` | `dequeue()`, `queue_size()` | Work queue. State: pending→in_progress→done. Startup repair resets orphans. |
 | `cache/<tier>/<user>.json` | JSON | `cache.save_entry()` | `cache.load_entry()`, staleness check | Per-blog crawl result. `scanned_at` gates recrawl. |
 | `cache/t0.json` | JSON | T0 agent | `get_t1_list_from_t0()` | Seed blog result |
@@ -183,4 +184,22 @@ Recrawl gate: `scanned_at` in index within `recrawl_days` (7) → skip.
 - No worker threads — no `Thread`, no `threading.Lock`, no `queue.Queue` in the running path
 - No probe phase — `_index_has_fresh_entry()` provides date-aware refresh without a probe mode
 - No `status: discovered/active/dead` field in index writes — the field is documented in DESIGN.md but only `status` (from agent result) is written
-- No `--queue` mode in `coordinator.py` — it lives entirely in `queue_integration.py`
+
+## 11. Contention Model (proven by test_contention.py)
+
+The index and queue are the two shared state stores. Both are protected by
+POSIX `flock`:
+
+| Store | Lock target | Mode | Verified behavior |
+|-------|-------------|------|-------------------|
+| `queue.jsonl` | the file itself | `LOCK_EX` (write), `LOCK_SH` (size) | Single-assignment: 10 concurrent `dequeue` → 10 distinct items, 0 duplicates |
+| `index.json` | **`index.lock` sidecar** (NOT the data file) | `LOCK_EX` (write), `LOCK_SH` (read) | 0 lost updates under 10-way concurrent write; read-modify-write is atomic |
+
+**Why the lock is on a sidecar, not the data file:** `index.json` is written via
+`os.replace(tmp, index.json)`, which swaps the inode. A `flock` held on the old
+`index.json` fd does NOT conflict with a `flock` on a newly-created `index.json`
+fd — they're different inodes. The dedicated `index.lock` file is never replaced,
+so its lock serializes correctly.
+
+**Test:** `test_contention.py` (gitignored — dev artifact) spawns 10 concurrent
+writers/readers and asserts 0 lost updates, 0 duplicates. Run: `python3 test_contention.py`
