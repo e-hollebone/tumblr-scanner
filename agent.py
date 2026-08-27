@@ -45,6 +45,19 @@ DEAD_PHRASES = [
     "page not found",
 ]
 
+LOGIN_WALL_PHRASES = [
+    "log in to continue",
+    "log in or sign up",
+    "this page is for humans only",
+    "please verify you're a human",
+    "tumblr.com/login",
+    "sign up for tumblr",
+    "create your account",
+    "log in to tumblr",
+    "before we go ahead",
+    "verify you're human",
+]
+
 END_PHRASES = [
     "no more posts to show",
     "you're all caught up",
@@ -54,6 +67,10 @@ END_PHRASES = [
     "this tumblr is content-free",
     "meditate for a while on this empty tumblr",
 ]
+
+
+class LoginWallDetected(Exception):
+    """Raised when a login wall is detected and the agent must pause for user auth."""
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +271,20 @@ async def fetch_page_html(
 # ---------------------------------------------------------------------------
 # Detection helpers
 # ---------------------------------------------------------------------------
+
+
+def detect_login_wall(page_text: str, html: str = "") -> bool:
+    """Return True if the page is a login wall / human verification challenge.
+
+    Checks visible page text and URL path for login-wall signals. This is
+    distinct from dead-blog detection — the blog may be perfectly fine, but
+    Tumblr is gating access behind authentication.
+    """
+    combined = (page_text + " " + html).lower()
+    for phrase in LOGIN_WALL_PHRASES:
+        if phrase in combined:
+            return True
+    return False
 
 
 def detect_dead(page_text: str) -> bool:
@@ -530,6 +561,16 @@ async def run(
                         except Exception:
                             page_text = ""
 
+                        # Login wall detection on empty HTML — check before dead-blog logic
+                        if detect_login_wall(page_text, ""):
+                            logger.warning(
+                                "LOGIN WALL DETECTED for %s (empty HTML) — Tumblr is gating access. "
+                                "Halting pipeline. Please log in to Tumblr in the Chrome window, then re-run.",
+                                username,
+                            )
+                            status = "login_wall"
+                            raise LoginWallDetected(username)
+
                         if detect_dead(page_text):
                             matched = None
                             text_lower = page_text.lower()
@@ -572,6 +613,16 @@ async def run(
                         page_text = text_result.get("result", {}).get("value", "")
                     except Exception:  # noqa: BLE001 — text extraction is best-effort
                         page_text = ""
+
+                    # Login wall detection — halt immediately, never retry through it
+                    if detect_login_wall(page_text, page_html):
+                        logger.warning(
+                            "LOGIN WALL DETECTED for %s — Tumblr is gating access. "
+                            "Halting pipeline. Please log in to Tumblr in the Chrome window, then re-run.",
+                            username,
+                        )
+                        status = "login_wall"
+                        raise LoginWallDetected(username)
 
                     # Dead blog detection
                     if detect_dead(page_text):
@@ -775,6 +826,12 @@ async def run(
         # Release tab semaphore when agent finishes (tab already closed above)
         if tab_sem:
             tab_sem.release()
+
+        if status == "login_wall":
+            logger.warning(
+                "AGENT HALTED for %s — login wall. Chrome left open for you to authenticate.",
+                username,
+            )
 
     # Final save (outside try/finally — reached after break from main loop)
     entry = {

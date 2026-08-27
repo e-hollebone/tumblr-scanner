@@ -37,6 +37,7 @@ from coordinator import (
 )
 from extractor import extract_from_html
 from queue_integration import queue_mode
+from agent import LoginWallDetected
 
 # Public API surface
 __all__ = [
@@ -248,7 +249,14 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
             )
 
-    result = asyncio.run(_run())
+    try:
+        result = asyncio.run(_run())
+    except LoginWallDetected as exc:
+        print(f"\n🛑  LOGIN WALL DETECTED — agent halted.")
+        print(f"   Open Chrome window and log in to Tumblr.")
+        print(f"   Then re-run: python3 run.py {args.target_blog} --queue")
+        print(f"   (Chrome is still open — your login state is preserved.)")
+        return 2
     print_result(result)
     return 0
 
