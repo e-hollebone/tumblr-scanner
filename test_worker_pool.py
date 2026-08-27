@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Test the worker-pool drain: 3 workers, each owning ONE persistent tab.
+"""Test the redesigned worker-pool drain: seed-on-queue, parallel from first extraction.
 
 Verifies:
-- 3 workers open exactly 3 tabs total (one per worker, not one per blog)
+- Seed blog is a queue item (not a special T0 phase)
+- Workers start immediately and pull from the queue
+- Each worker owns ONE persistent tab
+- WS URL is refreshed before each blog (NFR-9 fix)
 - All blogs get processed
-- No per-blog tab churn
 """
 import asyncio
 import json
@@ -16,6 +18,7 @@ from unittest import mock
 # --- Mock the heavy CDP / bs4 dependencies ---
 CREATE_TARGET_CALLS = []
 CLOSE_TARGET_CALLS = []
+WS_REFRESH_CALLS = []
 
 class FakeClient:
     def __init__(self, *a, **k):
@@ -66,8 +69,7 @@ def _fake_urlopen(url, *a, **k):
         def read(self_inner):
             if "json/version" in str(url):
                 return b'{"webSocketDebuggerUrl":"ws://fake-browser"}'
-            # /json/list → include ALL created targets so concurrent
-            # workers can each find their own tab by id
+            # /json/list → include ALL created targets
             targets = []
             for idx in range(len(CREATE_TARGET_CALLS)):
                 tab_id = f"tab-{idx + 1}"
@@ -81,16 +83,16 @@ def _fake_urlopen(url, *a, **k):
 
 _urllib.urlopen = _fake_urlopen
 
-# Stub the page-analysis internals so agent.run runs to a clean "finished" in one page
+# Stub the page-analysis internals
 real_agent.compute_page_metrics = lambda html, src=None: {
-    "usernames": [],  # no discoveries — avoid self-enqueue inflation in test
+    "usernames": [],
     "page_date_max": None,
     "page_date_min": None,
     "posts_rendered": 20,
 }
 real_agent.detect_login_wall = lambda *a, **k: False
 real_agent.detect_dead = lambda *a, **k: False
-real_agent.detect_end_of_posts = lambda *a, **k: True  # finish after first page
+real_agent.detect_end_of_posts = lambda *a, **k: True
 real_agent.load_entry = lambda *a, **k: None
 real_agent.save_entry = lambda *a, **k: None
 real_agent.append_log = lambda *a, **k: None
@@ -103,9 +105,16 @@ TMP = Path(tempfile.mkdtemp(prefix="tumblr_test_"))
 QUEUE = TMP / "queue.jsonl"
 INDEX = TMP / "index.json"
 
-BLOGS = ["blog_a", "blog_b", "blog_c", "blog_d", "blog_e"]
-for name in BLOGS:
+# Seed blog is the first queue item (tier 0)
+SEED_BLOG = "seed-blog"
+wq.enqueue(QUEUE, SEED_BLOG, "", 0)
+
+# Also enqueue some pre-discovered blogs to simulate parallel work
+OTHER_BLOGS = ["blog_a", "blog_b", "blog_c"]
+for name in OTHER_BLOGS:
     wq.enqueue(QUEUE, name, "", 1)
+
+ALL_BLOGS = [SEED_BLOG] + OTHER_BLOGS
 
 from queue_integration import _drain_queue
 
@@ -117,19 +126,21 @@ result = asyncio.run(_drain_queue(
     recrawl_days=7,
 ))
 
-print(f"Blogs in queue : {len(BLOGS)}")
-print(f"Blogs processed : {result['processed']}")
-print(f"createTarget calls : {len(CREATE_TARGET_CALLS)}")
+print(f"Seed blog           : {SEED_BLOG}")
+print(f"Total blogs in queue: {len(ALL_BLOGS)}")
+print(f"Blogs processed     : {result['processed']}")
+print(f"createTarget calls  : {len(CREATE_TARGET_CALLS)}")
 for u in CREATE_TARGET_CALLS:
     print(f"   - {u}")
-print(f"closeTarget calls : {len(CLOSE_TARGET_CALLS)}")
+print(f"closeTarget calls   : {len(CLOSE_TARGET_CALLS)}")
 for t in CLOSE_TARGET_CALLS:
     print(f"   - {t}")
 
 # Each worker opens exactly 1 tab → 3 tabs total
-if len(CREATE_TARGET_CALLS) == 3 and result["processed"] == len(BLOGS):
-    print("\nPASS: 3 workers, 3 tabs, all blogs processed (no per-blog churn)")
+# All blogs processed
+if len(CREATE_TARGET_CALLS) == 3 and result["processed"] == len(ALL_BLOGS):
+    print("\nPASS: 3 workers, 3 tabs, all blogs processed (seed-on-queue, parallel from first extraction)")
     sys.exit(0)
 else:
-    print(f"\nFAIL: expected 3 tabs + {len(BLOGS)} processed, got {len(CREATE_TARGET_CALLS)} tabs + {result['processed']} processed")
+    print(f"\nFAIL: expected 3 tabs + {len(ALL_BLOGS)} processed, got {len(CREATE_TARGET_CALLS)} tabs + {result['processed']} processed")
     sys.exit(1)

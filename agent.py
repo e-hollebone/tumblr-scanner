@@ -29,60 +29,10 @@ from cache import (
     load_entry,
     save_entry,
 )
+from config import DEAD_PHRASES, DELAY_MIN, DELAY_MAX, END_PHRASES, LOGIN_WALL_PHRASES
 from extractor import check_limit, extract_from_html
 
 logger = logging.getLogger("tumblr-agent")
-
-# ---------------------------------------------------------------------------
-# Dead-blog / end-of-posts detection phrase lists
-# ---------------------------------------------------------------------------
-
-DEAD_PHRASES = [
-    "this blog has been deactivated",
-    "blog has been deactivated",
-    "there's nothing here",
-    "this blog doesn't exist",
-    "page not found",
-]
-
-LOGIN_WALL_PHRASES = [
-    "log in to continue",
-    "log in or sign up",
-    "this page is for humans only",
-    "please verify you're a human",
-    "tumblr.com/login",
-    "sign up for tumblr",
-    "create your account",
-    "log in to tumblr",
-    "before we go ahead",
-    "verify you're human",
-    # Real Tumblr content-warning / human-verification wall signals:
-    "content_warning_wall",
-    "recaptcha",
-    "recaptcha.net",
-    "i am over eighteen",
-    "i am 18 or older",
-    "view this blog",
-    "this blog contains",
-    "mature content",
-    "sensitive content",
-    "are you over 18",
-    "confirm your age",
-    "you must be 18",
-    "accept the terms",
-    "view adult content",
-    "continue to blog",
-]
-
-END_PHRASES = [
-    "no more posts to show",
-    "you're all caught up",
-    "end of posts",
-    "no posts to show",
-    "this tumblr is cool, but empty",
-    "this tumblr is content-free",
-    "meditate for a while on this empty tumblr",
-]
 
 
 class LoginWallDetected(Exception):
@@ -465,8 +415,8 @@ async def run(
     unique_limit: int = 100,
     total_limit: int = 250,
     post_limit: int = 250,  # absolute post count (each page = page_size posts)
-    delay_min: float = 2.0,
-    delay_max: float = 3.0,
+    delay_min: float = DELAY_MIN,
+    delay_max: float = DELAY_MAX,
     recrawl_days: int = 7,
     source_blog: str | None = None,
     cache_dir: Path | None = None,
