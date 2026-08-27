@@ -47,6 +47,11 @@ LIMITS_BY_TIER = {0: T0_LIMITS, 1: T1_LIMITS, 2: T2_LIMITS}
 # Delay between queue drain iterations
 DRAIN_SLEEP = 0.5
 
+# Number of concurrent workers in the drain pool.
+# Each worker owns ONE tab for its entire lifetime, reusing it across
+# every blog it crawls (via agent.run's pre_existing_ws_url mechanism).
+WORKER_COUNT = 3
+
 
 def _next_tier(current: int) -> int:
     """Return the next tier for a discovered username (depth + 1)."""
@@ -231,107 +236,183 @@ async def _drain_queue(
     browser_ws: str,
     recrawl_days: int,
 ) -> dict[str, Any]:
-    """Drain the queue: dequeue → crawl → mark_done → enqueue discoveries.
+    """Drain the queue using a pool of workers.
 
-    Runs until the queue is empty.  Returns drain stats.
+    Each worker owns ONE tab for its entire lifetime, reusing it across
+    every blog it crawls (via agent.run's pre_existing_ws_url mechanism).
+    Workers dequeue independently — the flock in work_queue.py serializes
+    access. The pool runs until the queue is empty.
+
+    Returns drain stats.
     """
     processed = 0
     errors = 0
     total_enqueued = 0
     start = time.monotonic()
+    wall_halt = asyncio.Event()
 
-    logger.info("Starting queue drain (queue_size=%d)", queue_size(queue_path))
+    logger.info(
+        "Starting queue drain (queue_size=%d, workers=%d)",
+        queue_size(queue_path),
+        WORKER_COUNT,
+    )
 
-    while True:
-        item = dequeue(queue_path)
-        if item is None:
-            logger.info("Queue empty — drain complete")
-            break
+    async def _worker(worker_id: int) -> dict[str, int]:
+        """One worker: open a tab, then loop dequeue → crawl → mark_done.
 
-        username = item["username"]
-        tier = item.get("tier", 1)
-        logger.info("Processing: %s (tier=%s)", username, tier)
-
-        limits = LIMITS_BY_TIER.get(tier)
-        if limits is None:
-            logger.error("Unknown tier %s for %s — skipping", tier, username)
-            mark_done(queue_path, username)
-            errors += 1
-            processed += 1
-            time.sleep(DRAIN_SLEEP)
-            continue
-
-        kwargs = {
-            "browser_ws": browser_ws,
-            "username": username,
-            "tier": tier,
-            "unique_limit": limits["unique"],
-            "total_limit": limits["total"],
-            "post_limit": limits["posts"],
-            "delay_min": 6.7,
-            "delay_max": 10.0,
-            "recrawl_days": recrawl_days,
-            "source_blog": None,
-            "cache_dir": cache_dir,
-            "pre_existing_ws_url": None,
-        }
+        The tab is opened once and reused across every blog. It is closed
+        only when the worker exits (queue empty or wall halt).
+        """
+        my_processed = 0
+        my_errors = 0
+        my_enqueued = 0
+        ws_url: str | None = None
+        target_id: str | None = None
 
         try:
-            result = await agent_run(**kwargs)
-        except LoginWallDetected:
-            # Wall is up — halt the entire pipeline, don't churn through tabs
-            logger.warning(
-                "LOGIN WALL DETECTED for %s — halting queue drain. "
-                "Log in to Tumblr in the Chrome window, then re-run.",
-                username,
+            # Open ONE tab for this worker's entire lifetime
+            from agent import _new_tab_url, close_tab
+            ws_url, target_id = await _new_tab_url(
+                browser_ws, "https://www.tumblr.com/"
             )
-            raise
-        except Exception as exc:  # noqa: BLE001 — agent crash, log and continue
-            logger.error("Agent crashed for %s: %s", username, exc)
-            mark_done(queue_path, username)
-            errors += 1
-            processed += 1
-            time.sleep(DRAIN_SLEEP)
-            continue
+            logger.info(
+                "Worker %d: opened tab targetId=%s", worker_id, target_id
+            )
 
-        # Write to index
-        index_entry = {
-            "username": username,
-            "tier": tier,
-            "status": result.get("status", "unknown"),
-            "scanned_at": datetime.now(timezone.utc).isoformat(),
-            "unique": result.get("unique_count", 0),
-            "total": result.get("total_count", 0),
-            "posts": result.get("posts_processed", 0),
-            "usernames": result.get("usernames", []),
-            "dead": result.get("dead", False),
+            while not wall_halt.is_set():
+                item = dequeue(queue_path)
+                if item is None:
+                    break  # queue empty — worker done
+
+                username = item["username"]
+                tier = item.get("tier", 1)
+                logger.info(
+                    "Worker %d: processing %s (tier=%s)", worker_id, username, tier
+                )
+
+                limits = LIMITS_BY_TIER.get(tier)
+                if limits is None:
+                    logger.error(
+                        "Unknown tier %s for %s — skipping", tier, username
+                    )
+                    mark_done(queue_path, username)
+                    my_errors += 1
+                    my_processed += 1
+                    continue
+
+                kwargs = {
+                    "browser_ws": browser_ws,
+                    "username": username,
+                    "tier": tier,
+                    "unique_limit": limits["unique"],
+                    "total_limit": limits["total"],
+                    "post_limit": limits["posts"],
+                    "delay_min": 6.7,
+                    "delay_max": 10.0,
+                    "recrawl_days": recrawl_days,
+                    "source_blog": None,
+                    "cache_dir": cache_dir,
+                    # Reuse the worker's persistent tab
+                    "pre_existing_ws_url": ws_url,
+                }
+
+                try:
+                    result = await agent_run(**kwargs)
+                except LoginWallDetected:
+                    logger.warning(
+                        "Worker %d: LOGIN WALL DETECTED for %s — halting. "
+                        "Log in to Tumblr in the Chrome window, then re-run.",
+                        worker_id,
+                        username,
+                    )
+                    wall_halt.set()
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "Worker %d: agent crashed for %s: %s",
+                        worker_id,
+                        username,
+                        exc,
+                    )
+                    mark_done(queue_path, username)
+                    my_errors += 1
+                    my_processed += 1
+                    continue
+
+                # Write to index
+                index_entry = {
+                    "username": username,
+                    "tier": tier,
+                    "status": result.get("status", "unknown"),
+                    "scanned_at": datetime.now(timezone.utc).isoformat(),
+                    "unique": result.get("unique_count", 0),
+                    "total": result.get("total_count", 0),
+                    "posts": result.get("posts_processed", 0),
+                    "usernames": result.get("usernames", []),
+                    "dead": result.get("dead", False),
+                }
+                _write_index(index_path, username, index_entry)
+
+                # Enqueue discoveries at next tier
+                new_count = 0
+                for name in result.get("usernames", []):
+                    if name != username:
+                        next_tier = _next_tier(tier)
+                        if _enqueue_if_not_indexed(
+                            queue_path, index_path, name, next_tier, recrawl_days
+                        ):
+                            new_count += 1
+                            my_enqueued += 1
+
+                logger.info(
+                    "Worker %d: done %s status=%s unique=%d total=%d posts=%d new=%d",
+                    worker_id,
+                    username,
+                    result.get("status", "unknown"),
+                    result.get("unique_count", 0),
+                    result.get("total_count", 0),
+                    result.get("posts_processed", 0),
+                    new_count,
+                )
+
+                mark_done(queue_path, username)
+                my_processed += 1
+
+        finally:
+            # Close the worker's persistent tab only on exit
+            if target_id:
+                try:
+                    from agent import close_tab
+                    await close_tab(browser_ws, target_id)
+                    logger.info("Worker %d: closed tab targetId=%s", worker_id, target_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Worker %d: failed to close tab: %s", worker_id, exc
+                    )
+
+        return {
+            "processed": my_processed,
+            "errors": my_errors,
+            "enqueued": my_enqueued,
         }
-        _write_index(index_path, username, index_entry)
 
-        # Enqueue discoveries at next tier
-        new_count = 0
-        for name in result.get("usernames", []):
-            if name != username:
-                next_tier = _next_tier(tier)
-                if _enqueue_if_not_indexed(queue_path, index_path, name, next_tier, recrawl_days):
-                    new_count += 1
-                    total_enqueued += 1
+    # Launch the worker pool
+    worker_tasks = [
+        asyncio.create_task(_worker(i)) for i in range(WORKER_COUNT)
+    ]
+    results = await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-        logger.info(
-            "Done: %s status=%s unique=%d total=%d posts=%d new_enqueued=%d",
-            username,
-            result.get("status", "unknown"),
-            result.get("unique_count", 0),
-            result.get("total_count", 0),
-            result.get("posts_processed", 0),
-            new_count,
-        )
-
-        mark_done(queue_path, username)
-        processed += 1
-
-        # Small pause between items to avoid hammering
-        time.sleep(DRAIN_SLEEP)
+    # Aggregate stats
+    for r in results:
+        if isinstance(r, dict):
+            processed += r["processed"]
+            errors += r["errors"]
+            total_enqueued += r["enqueued"]
+        elif isinstance(r, LoginWallDetected):
+            raise
+        elif isinstance(r, Exception):
+            logger.error("Worker pool error: %s", r)
+            errors += 1
 
     elapsed = time.monotonic() - start
     logger.info(
