@@ -21,11 +21,19 @@ from pathlib import Path
 from typing import Any
 
 from agent import run as agent_run
+from agent import probe_blog
+from agent import _new_tab_url, close_tab
 from cache import (
     CACHE_DIR,
     load_entry,
     save_entry,
+    load_index,
+    save_index,
+    index_register,
+    index_should_skip,
 )
+
+from chrome_lifecycle import restart_chrome, kill_chrome
 
 logger = logging.getLogger("tumblr-coordinator")
 
@@ -34,9 +42,9 @@ DEFAULT_CDP_BROWSER = "http://localhost:9222"
 
 # Limit presets
 LIMITS = {
-    "t0": {"unique": 250, "total": 500, "posts": 500},
-    "t1": {"unique": 100, "total": 250, "posts": 250},
-    "t2": {"unique": 75, "total": 125, "posts": 125},
+    0: {"unique": 250, "total": 500, "posts": 500},
+    1: {"unique": 100, "total": 250, "posts": 250},
+    2: {"unique": 75, "total": 125, "posts": 125},
 }
 
 # Maximum concurrent agents (hard cap)
@@ -70,6 +78,10 @@ def get_t1_list_from_t0(t0_result: dict[str, Any]) -> list[str]:
 
     The T0 result contains all usernames found on the target blog.
     These become the T1 crawl list.
+
+    Deactivated usernames are NOT filtered out — they stay in the index
+    so they can be queried later. They are skipped at dispatch time
+    (no CDP tab, no page fetch) via the dead-check in run_t1's bounded().
     """
     usernames = t0_result.get("usernames", [])
     if not usernames:
@@ -119,6 +131,77 @@ def build_t2_list_from_t1(
     return t2_list
 
 
+def get_refresh_t1_list(
+    t0_result: dict[str, Any],
+    *,
+    cache_dir: Path | None = None,
+) -> list[str]:
+    """
+    Build the T1 refresh list from a T0 result.
+
+    Returns all T1 usernames from T0, minus those with a fresh cache entry.
+    Unlike the initial crawl, deactivated usernames are NOT filtered here —
+    they flow through to agent.run() which will short-circuit them via
+    the dead-check.  This keeps them in the index.
+    """
+    cache_root = cache_dir or CACHE_DIR
+    t1_dir = cache_root / "t1"
+
+    usernames = t0_result.get("usernames", [])
+    if not usernames:
+        logger.warning("T0 result has no usernames — empty refresh T1 list")
+        return []
+
+    # Remove ones with fresh T1 cache entries
+    fresh_t1: set[str] = set()
+    if t1_dir.exists():
+        for path in t1_dir.iterdir():
+            if path.suffix != ".json" or path.name.startswith("."):
+                continue
+            entry = load_entry(path)
+            if entry and not entry.get("dead", False):
+                fresh_t1.add(entry.get("username", path.stem))
+
+    refresh_list = sorted(set(usernames) - fresh_t1)
+    logger.info(
+        "T1 refresh list: %d usernames (%d already fresh, %d total from T0)",
+        len(refresh_list),
+        len(fresh_t1),
+        len(usernames),
+    )
+    return refresh_list
+
+
+def get_refresh_t2_list(
+    t1_results: list[dict[str, Any]],
+    *,
+    cache_dir: Path | None = None,
+) -> list[str]:
+    """
+    Build the T2 refresh list from T1 results.
+
+    Unlike build_t2_list_from_t1, this does NOT remove already-fresh T2
+    entries — those will be skipped by agent.run()'s cache check.  We
+    include everything so that stale T2 entries get re-scanned.
+    """
+    cache_root = cache_dir or CACHE_DIR
+
+    all_t2_candidates: set[str] = set()
+    for t1_result in t1_results:
+        if t1_result.get("status") in ("cached", "error", "dead"):
+            continue
+        usernames = t1_result.get("usernames", [])
+        all_t2_candidates.update(usernames)
+
+    refresh_list = sorted(all_t2_candidates)
+    logger.info(
+        "T2 refresh list: %d candidates (from %d T1 results)",
+        len(refresh_list),
+        len(t1_results),
+    )
+    return refresh_list
+
+
 async def run_t0(
     browser_ws: str,
     target_blog: str,
@@ -147,18 +230,18 @@ async def run_t0(
     logger.info("Starting T0 crawl for %s", target_blog)
     logger.info(
         "T0 limits: unique=%d total=%d posts=%d",
-        LIMITS["t0"]["unique"],
-        LIMITS["t0"]["total"],
-        LIMITS["t0"]["posts"],
+        LIMITS[0]["unique"],
+        LIMITS[0]["total"],
+        LIMITS[0]["posts"],
     )
 
     result = await agent_run(
         browser_ws=browser_ws,
         username=target_blog,
-        tier="t0",
-        unique_limit=LIMITS["t0"]["unique"],
-        total_limit=LIMITS["t0"]["total"],
-        post_limit=LIMITS["t0"]["posts"],
+        tier=0,
+        unique_limit=LIMITS[0]["unique"],
+        total_limit=LIMITS[0]["total"],
+        post_limit=LIMITS[0]["posts"],
         recrawl_days=recrawl_days,
         source_blog=None,
         cache_dir=cache_root,
@@ -201,34 +284,93 @@ async def run_t1_batch(
 
     async def bounded(username: str) -> dict[str, Any]:
         async with sem:
+            # Short-circuit deactivated blogs — keep in index, skip the crawl.
+            # No CDP tab, no page fetch; the username is already cached by T0
+            # and stays queryable.
+            if "deactivat" in username.lower():
+                logger.info("Skipping deactivated blog (index-only): %s", username)
+                return {
+                    "username": username,
+                    "tier": "t1",
+                    "status": "skipped",
+                    "unique_count": 0,
+                    "total_count": 0,
+                    "posts_processed": 0,
+                    "usernames": [],
+                    "all_occurrences": [],
+                    "per_page": [],
+                    "dead": True,
+                    "dead_reason": "deactivated",
+                    "source_blog": None,
+                }
+
+    running_blogs: dict[str, tuple[str, str]] = {}
+
+    async def _get_or_create_tab(username: str, target_url: str) -> tuple[str, str]:
+        """Get existing tab for a blog if one is open, otherwise create a new one."""
+        if username in running_blogs:
+            ws_url, target_id = running_blogs[username]
+            logger.info("Reusing existing tab for %s via %s", username, ws_url)
+            return ws_url, target_id
+        ws_url, target_id = await _new_tab_url(browser_ws, target_url)
+        running_blogs[username] = (ws_url, target_id)
+        logger.info(
+            "Created new tab for %s: ws=%s target_id=%s",
+            username, ws_url, target_id,
+        )
+        return ws_url, target_id
+
+    async def _release_tab(username: str) -> None:
+        """Close the tab for a blog and remove it from the running set."""
+        if username in running_blogs:
+            ws_url, target_id = running_blogs.pop(username)
+            if target_id:
+                try:
+                    await close_tab(browser_ws, target_id)
+                    logger.info(
+                        "Closed tab for %s (target_id=%s)", username, target_id
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to close tab for %s: %s", username, exc)
+
+    async def bounded(username: str) -> dict[str, Any]:
+        async with sem:
+            # Short-circuit deactivated blogs
+            if "deactivat" in username.lower():
+                logger.info("Skipping deactivated blog (index-only): %s", username)
+                return {
+                    "username": username,
+                    "tier": "t1",
+                    "status": "skipped",
+                    "unique_count": 0,
+                    "total_count": 0,
+                    "posts_processed": 0,
+                    "usernames": [],
+                    "all_occurrences": [],
+                    "per_page": [],
+                    "dead": True,
+                    "dead_reason": "deactivated",
+                    "source_blog": None,
+                }
+
             logger.info("T1 agent starting: %s", username)
             start = time.monotonic()
-            ws_url = None
-            target_id = None
+            target_url = f"https://www.tumblr.com/{username}"
+            ws_url, target_id = await _get_or_create_tab(username, target_url)
             try:
-                # T0 creates the tab — sub-agent receives the ws_url
-                target_url = f"https://www.tumblr.com/{username}"
-                logger.info("Creating T1 tab for %s", username)
-                ws_url, target_id = await agent_run._new_tab_url(browser_ws, target_url)
-                logger.info(
-                    "T1 tab created for %s: ws=%s target_id=%s",
-                    username,
-                    ws_url,
-                    target_id,
-                )
                 result = await agent_run(
                     browser_ws=browser_ws,
                     username=username,
-                    tier="t1",
-                    unique_limit=LIMITS["t1"]["unique"],
-                    total_limit=LIMITS["t1"]["total"],
-                    post_limit=LIMITS["t1"]["posts"],
+                    tier=1,
+                    unique_limit=LIMITS[1]["unique"],
+                    total_limit=LIMITS[1]["total"],
+                    post_limit=LIMITS[1]["posts"],
                     recrawl_days=recrawl_days,
                     source_blog=None,
                     cache_dir=cache_root,
                     pre_existing_ws_url=ws_url,
                 )
-            except Exception as exc:  # noqa: BLE001 — agent error is captured as error result below
+            except Exception as exc:  # noqa: BLE001
                 logger.error("T1 agent failed for %s: %s", username, exc)
                 result = {
                     "username": username,
@@ -245,24 +387,11 @@ async def run_t1_batch(
                     "source_blog": None,
                 }
             finally:
-                # T0 owns cleanup — close the tab regardless of agent outcome
-                if target_id:
-                    await agent_run.close_tab(browser_ws, target_id)
-                    logger.info(
-                        "T1 tab closed for %s (target_id=%s)", username, target_id
-                    )
-                elif ws_url:
-                    logger.warning(
-                        "T1 agent for %s had ws_url but no target_id — "
-                        "tab may not be closable",
-                        username,
-                    )
+                await _release_tab(username)
             elapsed = time.monotonic() - start
             logger.info(
                 "T1 agent done: %s status=%s (%.1fs)",
-                username,
-                result.get("status"),
-                elapsed,
+                username, result.get("status"), elapsed,
             )
             return result
 
@@ -312,36 +441,53 @@ async def run_t2_batch(
     cache_root = cache_dir or CACHE_DIR
     sem = semaphore or asyncio.Semaphore(MAX_CONCURRENT_AGENTS)
 
-    async def bounded(username: str) -> dict[str, Any]:
-        async with sem:
+    running_blogs: dict[str, tuple[str, str]] = {}
+
+    async def _get_or_create_tab(username: str, target_url: str) -> tuple[str, str]:
+        """Get existing tab for a blog if one is open, otherwise create a new one."""
+        if username in running_blogs:
+            ws_url, target_id = running_blogs[username]
+            logger.info("Reusing existing tab for %s via %s", username, ws_url)
+            return ws_url, target_id
+        ws_url, target_id = await _new_tab_url(browser_ws, target_url)
+        running_blogs[username] = (ws_url, target_id)
+        logger.info(
+            "Created new tab for %s: ws=%s target_id=%s",
+            username, ws_url, target_id,
+        )
+        return ws_url, target_id
+
+    async def _release_tab(username: str) -> None:
+        """Close the tab for a blog and remove it from the running set."""
+        if username in running_blogs:
+            ws_url, target_id = running_blogs.pop(username)
+            if target_id:
+                try:
+                    await close_tab(browser_ws, target_id)
+                    logger.info(
+                        "Closed tab for %s (target_id=%s)", username, target_id
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to close tab for %s: %s", username, exc)
+
             logger.info("T2 agent starting: %s", username)
             start = time.monotonic()
-            ws_url = None
-            target_id = None
+            target_url = f"https://www.tumblr.com/{username}"
+            ws_url, target_id = await _get_or_create_tab(username, target_url)
             try:
-                # T0 creates the tab — sub-agent receives the ws_url
-                target_url = f"https://www.tumblr.com/{username}"
-                logger.info("Creating T2 tab for %s", username)
-                ws_url, target_id = await agent_run._new_tab_url(browser_ws, target_url)
-                logger.info(
-                    "T2 tab created for %s: ws=%s target_id=%s",
-                    username,
-                    ws_url,
-                    target_id,
-                )
                 result = await agent_run(
                     browser_ws=browser_ws,
                     username=username,
-                    tier="t2",
-                    unique_limit=LIMITS["t2"]["unique"],
-                    total_limit=LIMITS["t2"]["total"],
-                    post_limit=LIMITS["t2"]["posts"],
+                    tier=2,
+                    unique_limit=LIMITS[2]["unique"],
+                    total_limit=LIMITS[2]["total"],
+                    post_limit=LIMITS[2]["posts"],
                     recrawl_days=recrawl_days,
                     source_blog=None,
                     cache_dir=cache_root,
                     pre_existing_ws_url=ws_url,
                 )
-            except Exception as exc:  # noqa: BLE001 — agent error is captured as error result below
+            except Exception as exc:  # noqa: BLE001
                 logger.error("T2 agent failed for %s: %s", username, exc)
                 result = {
                     "username": username,
@@ -358,24 +504,11 @@ async def run_t2_batch(
                     "source_blog": None,
                 }
             finally:
-                # T0 owns cleanup — close the tab regardless of agent outcome
-                if target_id:
-                    await agent_run.close_tab(browser_ws, target_id)
-                    logger.info(
-                        "T2 tab closed for %s (target_id=%s)", username, target_id
-                    )
-                elif ws_url:
-                    logger.warning(
-                        "T2 agent for %s had ws_url but no target_id — "
-                        "tab may not be closable",
-                        username,
-                    )
+                await _release_tab(username)
             elapsed = time.monotonic() - start
             logger.info(
                 "T2 agent done: %s status=%s (%.1fs)",
-                username,
-                result.get("status"),
-                elapsed,
+                username, result.get("status"), elapsed,
             )
             return result
 
@@ -449,7 +582,9 @@ async def run_full_pipeline(
         recrawl_days=recrawl_days,
     )
 
-    t0_usernames = get_t1_list_from_t0(t0_result)
+    # Build T1 list — filter out usernames that already have fresh T1
+    # cache entries to avoid re-indexing blogs unnecessarily.
+    t0_usernames = get_refresh_t1_list(t0_result, cache_dir=cache_root)
     logger.info("T1 list size: %d usernames", len(t0_usernames))
 
     if not t0_usernames:
@@ -457,8 +592,30 @@ async def run_full_pipeline(
         return {
             "target_blog": target_blog,
             "t0": t0_result,
-            "t1": {"usernames": [], "results": []},
-            "t2": {"usernames": [], "results": []},
+            "t1": {
+                "usernames": [],
+                "results": [],
+                "summary": {
+                    "total": 0,
+                    "success": 0,
+                    "cached": 0,
+                    "dead": 0,
+                    "error": 0,
+                    "elapsed_seconds": 0,
+                },
+            },
+            "t2": {
+                "usernames": [],
+                "results": [],
+                "summary": {
+                    "total": 0,
+                    "success": 0,
+                    "cached": 0,
+                    "dead": 0,
+                    "error": 0,
+                    "elapsed_seconds": 0,
+                },
+            },
             "elapsed_seconds": time.monotonic() - overall_start,
         }
 
@@ -513,7 +670,18 @@ async def run_full_pipeline(
                     "elapsed_seconds": t1_elapsed,
                 },
             },
-            "t2": {"usernames": [], "results": []},
+            "t2": {
+                "usernames": [],
+                "results": [],
+                "summary": {
+                    "total": 0,
+                    "success": 0,
+                    "cached": 0,
+                    "dead": 0,
+                    "error": 0,
+                    "elapsed_seconds": 0,
+                },
+            },
             "elapsed_seconds": time.monotonic() - overall_start,
         }
 
@@ -583,6 +751,317 @@ async def run_full_pipeline(
     }
 
 
+async def run_parallel_pipeline(
+    target_blog: str,
+    *,
+    browser_ws: str | None = None,
+    cache_dir: Path | None = None,
+    recrawl_days: int = DEFAULT_RECRAWL_DAYS,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """
+    Run the parallel pipeline: fresh Chrome, date-aware indexing, T1/T2 dispatch on-the-fly.
+
+    Three mandated changes:
+    1. Fresh Chrome restart at pipeline start
+    2. Date-aware per-blog indexing (ALL tiers) — probe page 0, compare dates, skip if no new content
+    3. Parallel T1/T2 dispatch — T2 starts as soon as T1 results arrive, not after all T1 completes
+    """
+    browser = browser_ws or DEFAULT_CDP_BROWSER
+    cache_root = cache_dir or CACHE_DIR
+    index_path = cache_root / "index.json"
+
+    logger.info("=== Parallel pipeline start ===")
+    logger.info("Target: %s", target_blog)
+    logger.info("Index: %s", index_path)
+
+    overall_start = time.monotonic()
+
+    # 1. Fresh Chrome restart
+    chrome_status = restart_chrome()
+    logger.info("Chrome restart: %s", chrome_status.get("status"))
+    if chrome_status.get("status") != "ok":
+        logger.warning("Chrome restart issue: %s — continuing anyway", chrome_status)
+
+    # 2. T0 probe — check if target blog has new content
+    t0_probe = await probe_blog(
+        browser_ws=browser,
+        username=target_blog,
+        cache_dir=cache_root,
+        index_path=index_path,
+    )
+    if t0_probe["skip"]:
+        logger.info("T0 skip: no new content since last scan")
+        return {
+            "target_blog": target_blog,
+            "status": "skipped",
+            "reason": "no_new_content",
+            "t0_probe": t0_probe,
+            "elapsed_seconds": time.monotonic() - overall_start,
+        }
+
+    # 3. T0 full crawl
+    t0_result = await run_t0(
+        browser_ws=browser,
+        target_blog=target_blog,
+        cache_dir=cache_root,
+        recrawl_days=recrawl_days,
+    )
+
+    # Register T0 in index
+    index_register(
+        index_path,
+        username=target_blog,
+        tier=0,
+        status=t0_result.get("status", "unknown"),
+        usernames=t0_result.get("usernames", []),
+        scanned_at=t0_result.get("scanned_at", ""),
+    )
+
+    # 4. Build T1 list from T0 results
+    t0_usernames = get_refresh_t1_list(t0_result, cache_dir=cache_root)
+    logger.info("T1 list size: %d usernames", len(t0_usernames))
+
+    if not t0_usernames:
+        logger.warning("No T1 usernames from T0 — pipeline ending early")
+        return {
+            "target_blog": target_blog,
+            "t0": t0_result,
+            "t1": {"usernames": [], "results": [], "summary": {"total": 0}},
+            "t2": {"usernames": [], "results": [], "summary": {"total": 0}},
+            "elapsed_seconds": time.monotonic() - overall_start,
+        }
+
+    # 5. Parallel T1/T2 dispatch
+    # T1 agents run with bounded concurrency. As each T1 completes, its usernames
+    # are immediately dispatched to T2 agents (also bounded).
+    t1_results: list[dict[str, Any]] = []
+    t2_results: list[dict[str, Any]] = []
+    t1_sem = asyncio.Semaphore(MAX_CONCURRENT_AGENTS)
+    t2_sem = asyncio.Semaphore(MAX_CONCURRENT_AGENTS)
+
+    # Queue of T1 usernames not yet dispatched
+    t1_queue: asyncio.Queue[str] = asyncio.Queue()
+    for u in t0_usernames:
+        await t1_queue.put(u)
+
+    # Track T2 dispatch tasks
+    t2_tasks: set[asyncio.Task] = set()
+
+    async def run_t1_with_t2_dispatch(username: str) -> dict[str, Any]:
+        """Run T1 agent, then immediately dispatch its usernames to T2."""
+        # Probe first
+        probe = await probe_blog(
+            browser_ws=browser,
+            username=username,
+            cache_dir=cache_root,
+            index_path=index_path,
+        )
+        if probe["skip"]:
+            logger.info("T1 skip: %s (no new content)", username)
+            return {
+                "username": username,
+                "tier": "t1",
+                "status": "skipped",
+                "unique_count": 0,
+                "total_count": 0,
+                "posts_processed": 0,
+                "usernames": [],
+                "all_occurrences": [],
+                "per_page": [],
+                "dead": False,
+                "dead_reason": "no_new_content",
+                "source_blog": target_blog,
+            }
+
+        # Full T1 crawl
+        result = await _run_single_agent(
+            browser_ws=browser,
+            username=username,
+            tier=1,
+            cache_root=cache_root,
+            recrawl_days=recrawl_days,
+            semaphore=t1_sem,
+        )
+
+        # Register in index immediately
+        index_register(
+            index_path,
+            username=username,
+            tier=1,
+            status=result.get("status", "unknown"),
+            usernames=result.get("usernames", []),
+            scanned_at=result.get("scanned_at", ""),
+        )
+
+        # Immediately dispatch T2 for each new username
+        for name in result.get("usernames", []):
+            if name == username:
+                continue
+            # Check if already in T2 queue or done
+            name_lower = name.lower()
+            if "deactivat" in name_lower:
+                continue
+            # Fire-and-forget T2 dispatch
+            task = asyncio.create_task(_run_single_agent(
+                browser_ws=browser,
+                username=name,
+                tier=2,
+                cache_root=cache_root,
+                recrawl_days=recrawl_days,
+                semaphore=t2_sem,
+            ))
+            t2_tasks.add(task)
+            task.add_done_callback(t2_tasks.discard)
+
+        return result
+
+    # Run all T1 agents (bounded by semaphore via _run_single_agent)
+    t1_tasks = [run_t1_with_t2_dispatch(u) for u in t0_usernames]
+    t1_results = await asyncio.gather(*t1_tasks, return_exceptions=True)
+
+    # Convert exceptions to error results
+    t1_processed: list[dict[str, Any]] = []
+    for username, result in zip(t0_usernames, t1_results):
+        if isinstance(result, Exception):
+            logger.error("T1 agent unexpected exception for %s: %s", username, result)
+            t1_processed.append({
+                "username": username,
+                "tier": "t1",
+                "status": "error",
+                "unique_count": 0,
+                "total_count": 0,
+                "posts_processed": 0,
+                "usernames": [],
+                "all_occurrences": [],
+                "per_page": [],
+                "dead": False,
+                "dead_reason": str(result),
+                "source_blog": target_blog,
+            })
+        else:
+            t1_processed.append(result)
+
+    # Wait for all T2 tasks to complete
+    if t2_tasks:
+        t2_raw = await asyncio.gather(*t2_tasks, return_exceptions=True)
+        for result in t2_raw:
+            if isinstance(result, Exception):
+                logger.error("T2 agent unexpected exception: %s", result)
+            elif isinstance(result, dict):
+                t2_results.append(result)
+                # Register T2 in index
+                index_register(
+                    index_path,
+                    username=result.get("username", ""),
+                    tier=2,
+                    status=result.get("status", "unknown"),
+                    usernames=result.get("usernames", []),
+                    scanned_at=result.get("scanned_at", ""),
+                )
+
+    total_elapsed = time.monotonic() - overall_start
+    logger.info(
+        "=== Parallel pipeline complete: T0=%d T1=%d T2=%d (%.1fs) ===",
+        1,
+        len(t1_processed),
+        len(t2_results),
+        total_elapsed,
+    )
+
+    return {
+        "target_blog": target_blog,
+        "status": "complete",
+        "t0": t0_result,
+        "t1": {
+            "usernames": t0_usernames,
+            "results": t1_processed,
+            "summary": {
+                "total": len(t1_processed),
+                "success": len([r for r in t1_processed if r.get("status") not in ("error",)]),
+                "skipped": len([r for r in t1_processed if r.get("status") == "skipped"]),
+                "dead": len([r for r in t1_processed if r.get("dead")]),
+                "error": len([r for r in t1_processed if r.get("status") == "error"]),
+            },
+        },
+        "t2": {
+            "results": t2_results,
+            "summary": {
+                "total": len(t2_results),
+                "success": len([r for r in t2_results if r.get("status") not in ("error",)]),
+                "dead": len([r for r in t2_results if r.get("dead")]),
+                "error": len([r for r in t2_results if r.get("status") == "error"]),
+            },
+        },
+        "elapsed_seconds": total_elapsed,
+    }
+
+
+async def _run_single_agent(
+    browser_ws: str,
+    username: str,
+    tier: int,
+    cache_root: Path,
+    recrawl_days: int,
+    semaphore: asyncio.Semaphore,
+) -> dict[str, Any]:
+    """Run a single agent with bounded concurrency and tab reuse."""
+    async with semaphore:
+        if "deactivat" in username.lower():
+            return {
+                "username": username,
+                "tier": f"t{tier}",
+                "status": "skipped",
+                "unique_count": 0,
+                "total_count": 0,
+                "posts_processed": 0,
+                "usernames": [],
+                "all_occurrences": [],
+                "per_page": [],
+                "dead": True,
+                "dead_reason": "deactivated",
+                "source_blog": None,
+            }
+
+        target_url = f"https://www.tumblr.com/{username}"
+        ws_url, target_id = await _new_tab_url(browser_ws, target_url)
+        try:
+            result = await agent_run(
+                browser_ws=browser_ws,
+                username=username,
+                tier=tier,
+                unique_limit=LIMITS[tier]["unique"],
+                total_limit=LIMITS[tier]["total"],
+                post_limit=LIMITS[tier]["posts"],
+                recrawl_days=recrawl_days,
+                source_blog=None,
+                cache_dir=cache_root,
+                pre_existing_ws_url=ws_url,
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Agent failed for %s tier %d: %s", username, tier, exc)
+            return {
+                "username": username,
+                "tier": f"t{tier}",
+                "status": "error",
+                "unique_count": 0,
+                "total_count": 0,
+                "posts_processed": 0,
+                "usernames": [],
+                "all_occurrences": [],
+                "per_page": [],
+                "dead": False,
+                "dead_reason": str(exc),
+                "source_blog": None,
+            }
+        finally:
+            try:
+                await close_tab(browser_ws, target_id)
+            except Exception:
+                pass
+
+
 def main() -> None:
     """CLI entry point."""
     import argparse
@@ -626,6 +1105,26 @@ def main() -> None:
         "--t1-only",
         action="store_true",
         help="Run T0 + T1 only, then stop (for testing through T1)",
+    )
+    parser.add_argument(
+        "--refresh-t0",
+        action="store_true",
+        help="Refresh T0 only: re-scan target blog from offset 0, stop at date cutoff",
+    )
+    parser.add_argument(
+        "--refresh-t1",
+        action="store_true",
+        help="Refresh T0 + T1: re-scan target blog, then refresh T1 blogs with date cutoff",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Full refresh: T0 → T1 → T2, all with date cutoff. Alias for --refresh-t2.",
+    )
+    parser.add_argument(
+        "--refresh-t2",
+        action="store_true",
+        help="Refresh T0 + T1 + T2: full pipeline refresh with date cutoff",
     )
 
     args = parser.parse_args()
@@ -681,6 +1180,103 @@ def main() -> None:
                 )
                 print(f"Dead:       {len(dead)}")
                 print(f"Error:      {len(error)}")
+        elif args.refresh_t0:
+            result = await run_refresh_t0(
+                browser_ws=args.browser,
+                target_blog=args.target_blog,
+                cache_dir=args.cache_dir,
+                recrawl_days=args.recrawl_days,
+            )
+            print("\n=== T0 REFRESH RESULT ===")
+            print(f"Status: {result.get('status')}")
+            print(f"Unique: {result.get('unique_count', 0)}")
+            print(f"Total:  {result.get('total_count', 0)}")
+            print(f"Posts:  {result.get('posts_processed', 0)}")
+            print(f"Dead:   {result.get('dead')}")
+            if result.get("dead_reason"):
+                print(f"Dead reason: {result['dead_reason']}")
+            print(f"Usernames found: {len(result.get('usernames', []))}")
+            print(f"Recovery attempts: {result.get('recovery_attempts', 0)}")
+            if result.get("usernames"):
+                print("First 20:", result["usernames"][:20])
+        elif args.refresh_t1:
+            t0_result = await run_refresh_t0(
+                browser_ws=args.browser,
+                target_blog=args.target_blog,
+                cache_dir=args.cache_dir,
+                recrawl_days=args.recrawl_days,
+            )
+            t1_list = get_t1_list_from_t0(t0_result)
+            if t1_list:
+                t1_results = await run_refresh_t1(
+                    browser_ws=args.browser,
+                    t0_result=t0_result,
+                    cache_dir=args.cache_dir,
+                    recrawl_days=args.recrawl_days,
+                )
+                print("\n=== T1 REFRESH RESULT ===")
+                print(f"Dispatched: {len(t1_list)}")
+                print(f"Completed:  {len(t1_results)}")
+                success = [r for r in t1_results if r.get("status") not in ("error",)]
+                dead = [r for r in t1_results if r.get("dead")]
+                error = [r for r in t1_results if r.get("status") == "error"]
+                print(f"Success:    {len(success)}")
+                print(
+                    f"Cached:     {len([r for r in t1_results if r.get('status') == 'cached'])}"
+                )
+                print(f"Dead:       {len(dead)}")
+                print(f"Error:      {len(error)}")
+            else:
+                print("\n=== T1 REFRESH: no usernames from T0 ===")
+        elif args.refresh or args.refresh_t2:
+            result = await run_refresh(
+                target_blog=args.target_blog,
+                browser_ws=args.browser,
+                cache_dir=args.cache_dir,
+                recrawl_days=args.recrawl_days,
+                verbose=args.verbose,
+            )
+            print("\n=== REFRESH RESULT ===")
+            print(f"Target: {result['target_blog']}")
+            print(f"Browser: {result['browser']}")
+            print(f"Cache: {result['cache_dir']}")
+            print(f"Recrawl: {result['recrawl_days']}d")
+            print(f"Concurrent cap: {result['concurrent_cap']}")
+            print()
+            print("--- T0 ---")
+            t0 = result["t0"]
+            print(f"Status: {t0.get('status')}")
+            print(f"Unique: {t0.get('unique_count', 0)}")
+            print(f"Total:  {t0.get('total_count', 0)}")
+            print(f"Posts:  {t0.get('posts_processed', 0)}")
+            print(f"Dead:   {t0.get('dead')}")
+            if t0.get("dead_reason"):
+                print(f"Dead reason: {t0['dead_reason']}")
+            print(f"Usernames: {len(t0.get('usernames', []))}")
+            if t0.get("usernames"):
+                print("First 20:", t0["usernames"][:20])
+            print()
+            print("--- T1 ---")
+            t1 = result["t1"]
+            s = t1["summary"]
+            print(f"Dispatched: {s['total']}")
+            print(f"Success:    {s['success']}")
+            print(f"Cached:     {s.get('cached', 0)}")
+            print(f"Dead:       {s['dead']}")
+            print(f"Error:      {s['error']}")
+            print(f"Time:       {s['elapsed_seconds']:.1f}s")
+            print()
+            print("--- T2 ---")
+            t2 = result["t2"]
+            s = t2["summary"]
+            print(f"Candidates: {len(t2['usernames'])}")
+            print(f"Dispatched: {s['total']}")
+            print(f"Success:    {s['success']}")
+            print(f"Dead:       {s['dead']}")
+            print(f"Error:      {s['error']}")
+            print(f"Time:       {s['elapsed_seconds']:.1f}s")
+            print()
+            print(f"Total time: {result['elapsed_seconds']:.1f}s")
         else:
             result = await run_full_pipeline(
                 target_blog=args.target_blog,

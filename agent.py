@@ -295,6 +295,79 @@ def compute_page_metrics(html: str, source_blog: str | None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Probe mode — lightweight date check before full crawl
+# ---------------------------------------------------------------------------
+
+
+async def probe_blog(
+    browser_ws: str,
+    username: str,
+    *,
+    cache_dir: Path | None = None,
+    index_path: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Probe a blog: fetch page 0 only, extract dates, check against index.
+
+    Returns dict with:
+        skip: bool — True if no new content (skip full crawl)
+        page_date_max: str | None — newest post date on page 0
+        page_date_min: str | None — oldest post date on page 0
+        usernames: list[str] — usernames found on page 0 (for index preview)
+    """
+    cache_root = cache_dir or CACHE_DIR
+    tab_target_id: str | None = None
+    client: CDPClient | None = None
+
+    try:
+        # Create tab
+        target_url = f"https://www.tumblr.com/{username}"
+        ws_url, tab_target_id = await _new_tab_url(browser_ws, target_url)
+        client = CDPClient(ws_url)
+        await client.start()
+
+        # Fetch page 0
+        html = await fetch_page_html(client, username, offset=0)
+
+        # Extract metrics
+        result = compute_page_metrics(html, username)
+        page_date_max = result.get("page_date_max")
+        page_date_min = result.get("page_date_min")
+        usernames = result.get("usernames", [])
+
+        # Check index for skip
+        should_skip = False
+        if index_path:
+            should_skip = index_should_skip(index_path, username, page_date_max)
+
+        return {
+            "skip": should_skip,
+            "page_date_max": page_date_max,
+            "page_date_min": page_date_min,
+            "usernames": usernames,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Probe failed for %s: %s", username, exc)
+        return {
+            "skip": False,  # don't skip on probe failure — let full crawl try
+            "page_date_max": None,
+            "page_date_min": None,
+            "usernames": [],
+        }
+    finally:
+        if client:
+            try:
+                await client.stop()
+            except Exception:
+                pass
+        if tab_target_id:
+            try:
+                await close_tab(browser_ws, tab_target_id)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Main agent loop
 # ---------------------------------------------------------------------------
 

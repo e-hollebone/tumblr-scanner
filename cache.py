@@ -140,6 +140,77 @@ def list_stale_t1_entries(
     return results
 
 
+def load_index(index_path: Path) -> dict[str, Any]:
+    """Load the index file (username -> {scanned_at, tier, status, usernames})."""
+    if not index_path.exists():
+        return {}
+    try:
+        with open(index_path) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_index(index_path: Path, index: dict[str, Any]) -> None:
+    """Save the index file atomically."""
+    _ensure_dir(index_path.parent)
+    tmp = index_path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(index, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, index_path)
+
+
+def index_register(
+    index_path: Path,
+    username: str,
+    tier: int,
+    status: str,
+    usernames: list[str],
+    scanned_at: str,
+) -> None:
+    """Register a completed blog in the index immediately upon job completion."""
+    index = load_index(index_path)
+    index[username] = {
+        "tier": tier,
+        "status": status,
+        "usernames": sorted(set(usernames)),
+        "scanned_at": scanned_at,
+    }
+    save_index(index_path, index)
+
+
+def index_should_skip(
+    index_path: Path,
+    username: str,
+    page_date_max: str | None,
+) -> bool:
+    """Check if a blog should be skipped based on index date comparison.
+
+    Returns True if the blog is already in the index AND the page's newest
+    date is not newer than the index's scanned_at (no new content).
+    """
+    if not page_date_max:
+        return False  # no date info → don't skip
+    index = load_index(index_path)
+    entry = index.get(username)
+    if not entry:
+        return False  # not in index → don't skip
+    scanned_at = entry.get("scanned_at", "")
+    if not scanned_at:
+        return False  # unknown scan date → don't skip
+    # Compare dates: skip if page's newest date <= index's scanned_at
+    try:
+        page_date = datetime.strptime(page_date_max[:10], "%Y-%m-%d").date()
+        index_date = datetime.strptime(scanned_at[:10], "%Y-%m-%d").date()
+        return page_date <= index_date
+    except (ValueError, TypeError):
+        return False
+
+
 def load_log(log_path: Path) -> list[dict[str, Any]]:
     """Load the append-only log into a list of records."""
     if not log_path.exists():

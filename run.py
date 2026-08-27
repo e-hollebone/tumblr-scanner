@@ -9,6 +9,7 @@ Usage:
     python run.py <target_blog> --t0-only   # T0 only
     python run.py <target_blog> --t1-only   # T0 + T1 only
     python run.py <target_blog> --verbose   # DEBUG logging
+    python run.py <target_blog> --queue     # queue-mode: fresh Chrome, T0 producer, drain T1/T2
 """
 
 from __future__ import annotations
@@ -28,12 +29,14 @@ from coordinator import (
     MAX_CONCURRENT_AGENTS,
     get_t1_list_from_t0,
     run_full_pipeline,
+    run_parallel_pipeline,
     run_t0,
     run_t1_batch,
     run_t2_batch,
     setup_logging,
 )
 from extractor import extract_from_html
+from queue_integration import queue_mode
 
 # Public API surface
 __all__ = [
@@ -101,6 +104,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Run T2 only (requires prior T0+T1 run producing a T2 list)",
     )
     parser.add_argument(
+        "--queue",
+        action="store_true",
+        help="Queue-mode pipeline: fresh Chrome, T0 producer, drain T1/T2 via worker loop",
+    )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Parallel pipeline: fresh Chrome, date-aware indexing, T1/T2 dispatch on-the-fly",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print plan without executing any CDP calls",
@@ -139,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                 cache_dir=args.cache_dir,
                 recrawl_days=args.recrawl_days,
             )
-            return {"tier": "t0", "result": result, "target": args.target_blog}
+            return {"tier": 0, "result": result, "target": args.target_blog}
         elif args.t1_only:
             t0_result = await run_t0(
                 browser_ws=args.browser,
@@ -192,7 +205,11 @@ def main(argv: list[str] | None = None) -> int:
 
             if not t2_list:
                 print("No T2 candidates found in cache.", file=sys.stderr)
-                return {"tier": "t2", "t2_list": [], "status": "empty"}
+                return {
+                    "tier": "t2",
+                    "t2_list": [],
+                    "status": "empty",
+                }
 
             t2_results = await run_t2_batch(
                 browser_ws=args.browser,
@@ -206,6 +223,22 @@ def main(argv: list[str] | None = None) -> int:
                 "t2_results": t2_results,
                 "target": args.target_blog,
             }
+        elif args.parallel:
+            return await run_parallel_pipeline(
+                target_blog=args.target_blog,
+                browser_ws=args.browser,
+                cache_dir=args.cache_dir,
+                recrawl_days=args.recrawl_days,
+                verbose=args.verbose,
+            )
+        elif args.queue:
+            return await queue_mode(
+                target_blog=args.target_blog,
+                browser_ws=args.browser,
+                cache_dir=args.cache_dir,
+                recrawl_days=args.recrawl_days,
+                verbose=args.verbose,
+            )
         else:
             return await run_full_pipeline(
                 target_blog=args.target_blog,
@@ -227,7 +260,7 @@ def print_result(result: dict[str, Any]) -> None:
     print()
     print("=" * 60)
 
-    if tier == "t0":
+    if tier == 0:
         r = result["result"]
         print("Tier:  T0")
         print(f"Target: {result['target']}")
@@ -243,7 +276,7 @@ def print_result(result: dict[str, Any]) -> None:
             print(f"First 20: {r['usernames'][:20]}")
         print(f"Cache: {r.get('scanned_at', 'N/A')}")
 
-    elif tier == "t1":
+    elif tier == 1:
         t0 = result["t0"]
         t1_results = result["t1_results"]
         print("Tier:  T0 + T1")
@@ -273,7 +306,7 @@ def print_result(result: dict[str, Any]) -> None:
             print(f"Total unique across T1:     {total_unique}")
             print(f"Total occurrences across T1: {total_occurrences}")
 
-    elif tier == "t2":
+    elif tier == 2:
         t2_list = result.get("t2_list", [])
         t2_results = result.get("t2_results", [])
         print("Tier:  T2")
@@ -290,12 +323,43 @@ def print_result(result: dict[str, Any]) -> None:
             total_unique = sum(r.get("unique_count", 0) for r in success)
             print(f"Total unique across T2: {total_unique}")
 
+    elif tier == "queue":
+        print("Tier:  Queue-mode (T0 producer + T1/T2 worker drain)")
+        print(f"Target: {result.get('target_blog')}")
+        print(f"Chrome: {result.get('chrome_status', 'N/A')}")
+        print(f"Queue:  {result.get('queue_path', 'N/A')}")
+        print(f"Index:  {result.get('index_path', 'N/A')}")
+        print()
+        t0 = result.get("t0")
+        if t0:
+            print("--- T0 ---")
+            print(f"Status:     {t0.get('status')}")
+            print(f"Unique:     {t0.get('unique_count', 0)}")
+            print(f"Total:      {t0.get('total_count', 0)}")
+            print(f"Posts:      {t0.get('posts_processed', 0)}")
+            print(f"Dead:       {t0.get('dead')}")
+            if t0.get("dead_reason"):
+                print(f"Dead reason: {t0['dead_reason']}")
+            print(f"Usernames:  {len(t0.get('usernames', []))}")
+            if t0.get("usernames"):
+                print(f"First 20:   {t0['usernames'][:20]}")
+            print(f"Enqueued:   {t0.get('enqueued', 0)}")
+        drain = result.get("drain", {})
+        if drain:
+            print()
+            print("--- Drain ---")
+            print(f"Processed:  {drain.get('processed', 0)}")
+            print(f"Errors:     {drain.get('errors', 0)}")
+            print(f"Elapsed:    {drain.get('elapsed_seconds', 0):.1f}s")
+            print(f"Queue final:{drain.get('queue_final', -1)}")
+        print(f"Total time: {result.get('elapsed_seconds', 0):.1f}s")
+
     else:  # full pipeline
         print(f"Target:      {result['target_blog']}")
-        print(f"Browser:     {result['browser']}")
-        print(f"Cache:       {result['cache_dir']}")
-        print(f"Recrawl:     {result['recrawl_days']}d")
-        print(f"Concurrent:  {result['concurrent_cap']}")
+        print(f"Browser:     {result.get('browser', 'N/A')}")
+        print(f"Cache:       {result.get('cache_dir', 'N/A')}")
+        print(f"Recrawl:     {result.get('recrawl_days', 'N/A')}d")
+        print(f"Concurrent:  {result.get('concurrent_cap', 'N/A')}")
         print()
 
         t0 = result["t0"]

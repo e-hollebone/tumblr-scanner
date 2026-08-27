@@ -188,12 +188,13 @@ def extract_from_html(
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Find all post containers: div with "post" in data-cell-id
-    # Criteria: tag is div AND data-cell-id contains "post"
+    # Find all post containers: div with "-post-" in data-cell-id
+    # Criteria: tag is div AND data-cell-id contains "-post-"
+    # The dash prefix/suffix avoids false positives (e.g., "poster", "postal")
     all_elements = soup.select("[data-cell-id]")
     posts = [
         el for el in all_elements
-        if el.name == "div" and "post" in el.get("data-cell-id", "")
+        if el.name == "div" and "-post-" in el.get("data-cell-id", "")
     ]
 
     results: dict[str, Any] = {
