@@ -18,8 +18,10 @@ Usage (via run.py):
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,31 +55,62 @@ def _next_tier(current: int) -> int:
     return current + 1
 
 
+def _index_lock_path(path: Path) -> Path:
+    """Dedicated lock file (never replaced) so flock serializes across writes."""
+    return path.with_suffix(".lock")
+
+
 def _read_index(path: Path) -> dict[str, Any]:
-    """Read index.json or return empty dict."""
+    """Read index.json or return empty dict. Uses LOCK_SH on a stable lock file."""
     if not path.exists():
         return {}
+    lock_path = _index_lock_path(path)
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        with open(lock_path, "a+") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            finally:
+                pass
     except (json.JSONDecodeError, OSError):
         return {}
 
 
 def _write_index(path: Path, username: str, entry: dict[str, Any]) -> None:
-    """Write or update a single entry in index.json."""
-    data = _read_index(path)
-    entry.setdefault("username", username)
-    data[username] = entry
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    tmp.replace(path)
+    """Write or update a single entry in index.json. Uses LOCK_EX on a stable lock file."""
+    import tempfile as _tf
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _index_lock_path(path)
+    with open(lock_path, "a+") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            # Read fresh from disk (never trust a pre-replace fd)
+            data: dict[str, Any] = {}
+            try:
+                with open(path, encoding="utf-8") as rf:
+                    data = json.load(rf)
+            except (json.JSONDecodeError, OSError):
+                data = {}
+            entry.setdefault("username", username)
+            data[username] = entry
+            # Unique temp file per writer — avoids cross-writer clobber on the .tmp name
+            fd, tmp_str = _tf.mkstemp(dir=str(path.parent), prefix=f"{path.stem}-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp_f:
+                    json.dump(data, tmp_f, indent=2, ensure_ascii=False)
+                    tmp_f.write("\n")
+                os.replace(tmp_str, path)
+            finally:
+                if os.path.exists(tmp_str):
+                    os.unlink(tmp_str)
+        finally:
+            pass
 
 
 def _index_has_fresh_entry(path: Path, username: str, recrawl_days: int) -> bool:
-    """Check if username already has a fresh entry in the index."""
+    """Check if username already has a fresh entry in the index. Uses LOCK_SH."""
     idx = _read_index(path)
     entry = idx.get(username)
     if not entry:

@@ -19,7 +19,9 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,32 +33,58 @@ QUEUE_PATH = CACHE_DIR / "queue.jsonl"
 INDEX_PATH = CACHE_DIR / "index.json"
 
 
+def _index_lock_path(path: Path) -> Path:
+    """Dedicated lock file (never replaced) so flock serializes across writes."""
+    return path.with_suffix(".lock")
+
+
 def _write_index(username: str, entry: dict) -> None:
-    """Write or update a single entry in index.json."""
+    """Write or update a single entry in index.json. Uses LOCK_EX on a stable lock file."""
+    import tempfile as _tf
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    data: dict = {}
-    if INDEX_PATH.exists():
+    path = INDEX_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _index_lock_path(path)
+    with open(lock_path, "a+") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
         try:
-            with open(INDEX_PATH, encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            data = {}
-    entry.setdefault("username", username)
-    data[username] = entry
-    tmp = INDEX_PATH.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    tmp.replace(INDEX_PATH)
+            # Read fresh from disk (never trust a pre-replace fd)
+            data: dict = {}
+            try:
+                with open(path, encoding="utf-8") as rf:
+                    data = json.load(rf)
+            except (json.JSONDecodeError, OSError):
+                data = {}
+            entry.setdefault("username", username)
+            data[username] = entry
+            # Unique temp file per writer — avoids cross-writer clobber on the .tmp name
+            fd, tmp_str = _tf.mkstemp(dir=str(path.parent), prefix=f"{path.stem}-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp_f:
+                    json.dump(data, tmp_f, indent=2, ensure_ascii=False)
+                    tmp_f.write("\n")
+                os.replace(tmp_str, INDEX_PATH)
+            finally:
+                if os.path.exists(tmp_str):
+                    os.unlink(tmp_str)
+        finally:
+            pass
 
 
 def _read_index(path: Path) -> dict:
-    """Read index.json. Returns {} on any failure."""
+    """Read index.json. Uses LOCK_SH on a stable lock file. Returns {} on any failure."""
     if not path.exists():
         return {}
+    lock_path = _index_lock_path(path)
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        with open(lock_path, "a+") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            finally:
+                pass
     except (json.JSONDecodeError, OSError):
         return {}
 
