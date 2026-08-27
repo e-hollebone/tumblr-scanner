@@ -56,6 +56,22 @@ LOGIN_WALL_PHRASES = [
     "log in to tumblr",
     "before we go ahead",
     "verify you're human",
+    # Real Tumblr content-warning / human-verification wall signals:
+    "content_warning_wall",
+    "recaptcha",
+    "recaptcha.net",
+    "i am over eighteen",
+    "i am 18 or older",
+    "view this blog",
+    "this blog contains",
+    "mature content",
+    "sensitive content",
+    "are you over 18",
+    "confirm your age",
+    "you must be 18",
+    "accept the terms",
+    "view adult content",
+    "continue to blog",
 ]
 
 END_PHRASES = [
@@ -202,10 +218,13 @@ async def fetch_page_html(
     username: str,
     offset: int,
     timeout_ms: int = 30000,
-) -> str:
+) -> tuple[str, str]:
     """
     Navigate to tumblr.com/<username>?offset=<N> and return the full
     page HTML once content has loaded.
+
+    Returns: (html, final_url) — final_url is the post-redirect URL,
+    used to detect Tumblr's content_warning_wall / login redirects.
     """
     url = f"https://www.tumblr.com/{username}?offset={offset}"
 
@@ -253,19 +272,28 @@ async def fetch_page_html(
             TIMEOUT,
         )
 
-    # Get full HTML
+    # Get full HTML + final URL
     try:
         result = await client.send.Runtime.evaluate(
             params={
-                "expression": "document.documentElement.outerHTML",
+                "expression": "JSON.stringify({html: document.documentElement.outerHTML, url: location.href})",
                 "returnByValue": True,
             }
         )
-        html = result.get("result", {}).get("value", "")
-        return html
+        payload = result.get("result", {}).get("value", "{}")
+        import json as _json
+
+        try:
+            data = _json.loads(payload)
+            html = data.get("html", "")
+            final_url = data.get("url", "")
+        except Exception:  # noqa: BLE001 — fallback to raw HTML if not JSON
+            html = payload
+            final_url = ""
+        return html, final_url
     except Exception as exc:  # noqa: BLE001 — HTML fetch failure is non-fatal, caller handles empty
         logger.error("Failed to get page HTML for %s: %s", username, exc)
-        return ""
+        return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -273,17 +301,29 @@ async def fetch_page_html(
 # ---------------------------------------------------------------------------
 
 
-def detect_login_wall(page_text: str, html: str = "") -> bool:
+def detect_login_wall(page_text: str, html: str = "", url: str = "") -> bool:
     """Return True if the page is a login wall / human verification challenge.
 
-    Checks visible page text and URL path for login-wall signals. This is
-    distinct from dead-blog detection — the blog may be perfectly fine, but
-    Tumblr is gating access behind authentication.
+    Checks visible page text, raw HTML, and the final URL for login-wall
+    signals. This is distinct from dead-blog detection — the blog may be
+    perfectly fine, but Tumblr is gating access behind authentication or a
+    content-warning/human-verification challenge.
+
+    Real signals observed on a clean-profile first visit:
+      - URL contains `source=content_warning_wall`
+      - Page contains a reCAPTCHA enterprise iframe
+      - Visible text asks to confirm age / view mature content / accept terms
     """
-    combined = (page_text + " " + html).lower()
+    combined = (page_text + " " + html + " " + url).lower()
     for phrase in LOGIN_WALL_PHRASES:
         if phrase in combined:
             return True
+    # URL-based signal (distinct from text — the redirect carries it)
+    if "content_warning_wall" in url.lower():
+        return True
+    # reCAPTCHA iframe presence (human verification)
+    if "recaptcha" in (html + " " + url).lower():
+        return True
     return False
 
 
@@ -362,7 +402,15 @@ async def probe_blog(
         await client.start()
 
         # Fetch page 0
-        html = await fetch_page_html(client, username, offset=0)
+        html, final_url = await fetch_page_html(client, username, offset=0)
+
+        # Login wall / content-warning wall on probe — halt
+        if detect_login_wall("", html, final_url):
+            logger.warning(
+                "LOGIN/CONTENT WALL DETECTED during probe for %s — halting. Log in, then re-run.",
+                username,
+            )
+            raise LoginWallDetected(username)
 
         # Extract metrics
         result = compute_page_metrics(html, username)
@@ -531,7 +579,8 @@ async def run(
                 break
 
             # --- Page fetch with tab recovery ---
-            page_html = None
+            page_html_str = ""
+            final_url = ""
             page_text = ""
             tab_dead = False
 
@@ -546,9 +595,9 @@ async def run(
                         recovery_attempts,
                         MAX_RECOVERY_ATTEMPTS,
                     )
-                    page_html = await fetch_page_html(client, username, offset)
+                    page_html_str, final_url = await fetch_page_html(client, username, offset)
 
-                    if not page_html:
+                    if not page_html_str:
                         # Empty HTML — could be a dead blog or a tab crash
                         try:
                             text_result = await client.send.Runtime.evaluate(
@@ -562,7 +611,7 @@ async def run(
                             page_text = ""
 
                         # Login wall detection on empty HTML — check before dead-blog logic
-                        if detect_login_wall(page_text, ""):
+                        if detect_login_wall(page_text, "", final_url):
                             logger.warning(
                                 "LOGIN WALL DETECTED for %s (empty HTML) — Tumblr is gating access. "
                                 "Halting pipeline. Please log in to Tumblr in the Chrome window, then re-run.",
@@ -615,7 +664,7 @@ async def run(
                         page_text = ""
 
                     # Login wall detection — halt immediately, never retry through it
-                    if detect_login_wall(page_text, page_html):
+                    if detect_login_wall(page_text, page_html_str, final_url):
                         logger.warning(
                             "LOGIN WALL DETECTED for %s — Tumblr is gating access. "
                             "Halting pipeline. Please log in to Tumblr in the Chrome window, then re-run.",
@@ -646,7 +695,7 @@ async def run(
                         break  # exit recovery loop — blog is dead, no retry
 
                     # Extract usernames + dates from page HTML
-                    page_result = compute_page_metrics(page_html, source_blog)
+                    page_result = compute_page_metrics(page_html_str, source_blog)
                     page_usernames = page_result["usernames"]
                     page_date_max = page_result.get("page_date_max")
                     page_date_min = page_result.get("page_date_min")
@@ -657,7 +706,7 @@ async def run(
                     if (
                         not page_usernames
                         and posts_processed == 0
-                        and detect_end_of_posts(page_text, page_html)
+                        and detect_end_of_posts(page_text, page_html_str)
                     ):
                         logger.info("Blog %s has no posts (end signal on first page)", username)
                         status = "empty"
@@ -731,7 +780,7 @@ async def run(
                         pass
                 break
 
-            if page_html is None:
+            if page_html_str is None:
                 break
 
             # --- Accumulate results ---
@@ -793,7 +842,7 @@ async def run(
                     logger.warning("on_page callback failed for %s", username)
 
             # Check if we've hit the end of posts (natural end, not date cutoff)
-            if detect_end_of_posts(page_text, page_html):
+            if detect_end_of_posts(page_text, page_html_str):
                 logger.info("End of posts for %s at offset %d", username, offset)
                 status = "finished"
                 if tab_target_id:
@@ -812,7 +861,7 @@ async def run(
             await asyncio.sleep(delay)
 
             # Check if we've hit the end of posts (natural end, not date cutoff)
-            if detect_end_of_posts(page_text, page_html):
+            if detect_end_of_posts(page_text, page_html_str):
                 logger.info("End of posts for %s at offset %d", username, offset)
                 status = "finished"
                 if tab_target_id:

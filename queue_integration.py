@@ -368,6 +368,14 @@ async def queue_mode(
                 chrome_status.get("remaining_after_kill"),
                 chrome_status.get("debug_port", "")[:40])
 
+    # Use the actual debug port Chrome bound to (may differ from args.browser
+    # if the default port was occupied and a fallback was chosen)
+    actual_browser_ws = chrome_status.get("debug_port") or browser_ws
+    # Convert ws://.../devtools/browser/XXX → http://host:port for _extract_browser_ws
+    if actual_browser_ws.startswith("ws://"):
+        actual_browser_ws = "http://" + actual_browser_ws[len("ws://"):].split("/")[0]
+    logger.info("Using browser endpoint: %s", actual_browser_ws)
+
     # Ensure cache + queue dirs exist
     cache_dir.mkdir(parents=True, exist_ok=True)
 
