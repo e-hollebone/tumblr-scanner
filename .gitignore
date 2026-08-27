@@ -36,3 +36,7 @@ Thumbs.db
 test_*
 scratch/
 tmp/
+
+# Runtime cache (crawl results, index, queue)
+cache/
+chrome_profile/
