@@ -160,11 +160,16 @@ def restart_chrome() -> dict[str, Any]:
     # Kill any leftover our-Chrome processes before launching
     kill_result = kill_chrome()
 
-    # Launch Chrome with our dedicated profile
+    # Launch Chrome in background (open -g) to prevent focus-steal flash
+    # --args passes flags to Chrome; stdout/stderr discarded
     try:
         subprocess.Popen(
             [
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "open",
+                "-g",
+                "-a",
+                "Google Chrome",
+                "--args",
                 f"--remote-debugging-port={port}",
                 f"--user-data-dir={CHROME_PROFILE_DIR}",
                 "--no-first-run",

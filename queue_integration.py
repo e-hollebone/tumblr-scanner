@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent import run as agent_run
+from agent import LoginWallDetected, run as agent_run
 from chrome_lifecycle import restart_chrome
 from work_queue import dequeue, enqueue, mark_done, startup, queue_size
 
@@ -278,6 +278,14 @@ async def _drain_queue(
 
         try:
             result = await agent_run(**kwargs)
+        except LoginWallDetected:
+            # Wall is up — halt the entire pipeline, don't churn through tabs
+            logger.warning(
+                "LOGIN WALL DETECTED for %s — halting queue drain. "
+                "Log in to Tumblr in the Chrome window, then re-run.",
+                username,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 — agent crash, log and continue
             logger.error("Agent crashed for %s: %s", username, exc)
             mark_done(queue_path, username)
@@ -383,7 +391,7 @@ async def queue_mode(
     logger.info("Step 2: T0 producer — crawling %s", target_blog)
     t0_result = await _run_t0_producer(
         target_blog=target_blog,
-        browser_ws=browser_ws,
+        browser_ws=actual_browser_ws,
         cache_dir=cache_dir,
         recrawl_days=recrawl_days,
         queue_path=QUEUE_PATH,
@@ -396,7 +404,7 @@ async def queue_mode(
         queue_path=QUEUE_PATH,
         index_path=INDEX_PATH,
         cache_dir=cache_dir,
-        browser_ws=browser_ws,
+        browser_ws=actual_browser_ws,
         recrawl_days=recrawl_days,
     )
 
