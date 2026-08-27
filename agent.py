@@ -17,6 +17,7 @@ import json
 import logging
 import random
 import time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,6 @@ from cdp_use import CDPClient
 from cache import (
     CACHE_DIR,
     append_log,
-    entry_is_stale,
     load_entry,
     save_entry,
 )
@@ -38,13 +38,11 @@ logger = logging.getLogger("tumblr-agent")
 # ---------------------------------------------------------------------------
 
 DEAD_PHRASES = [
-    "this blog is private",
     "this blog has been deactivated",
     "blog has been deactivated",
     "there's nothing here",
     "this blog doesn't exist",
     "page not found",
-    "404",
 ]
 
 END_PHRASES = [
@@ -52,6 +50,9 @@ END_PHRASES = [
     "you're all caught up",
     "end of posts",
     "no posts to show",
+    "this tumblr is cool, but empty",
+    "this tumblr is content-free",
+    "meditate for a while on this empty tumblr",
 ]
 
 
@@ -255,9 +256,14 @@ async def fetch_page_html(
 # ---------------------------------------------------------------------------
 
 
-def detect_dead(html: str, page_text: str) -> bool:
-    """Return True if the blog appears dead / private / gone."""
-    combined = (html + page_text).lower()
+def detect_dead(page_text: str) -> bool:
+    """Return True if the blog appears dead / private / gone.
+
+    Only checks the visible page text (innerText), not raw HTML — HTML
+    can contain '404' or 'page not found' in link hrefs and meta tags
+    that are not actual error signals.
+    """
+    combined = page_text.lower()
     for phrase in DEAD_PHRASES:
         if phrase in combined:
             return True
@@ -300,13 +306,14 @@ async def run(
     *,
     unique_limit: int = 100,
     total_limit: int = 250,
-    post_limit: int = 250,
-    delay_min: float = 1.0,
+    post_limit: int = 250,  # absolute post count (each page = page_size posts)
+    delay_min: float = 2.0,
     delay_max: float = 3.0,
     recrawl_days: int = 7,
     source_blog: str | None = None,
     cache_dir: Path | None = None,
     pre_existing_ws_url: str | None = None,
+    on_page: callable | None = None,
 ) -> dict[str, Any]:
     """
     Crawl a single blog from start to stop condition.
@@ -333,183 +340,318 @@ async def run(
         Results dict with cumulative totals and per-page breakdown.
     """
     cache_root = cache_dir or CACHE_DIR
-    tier_dir = cache_root / tier
+    tier_dir = cache_root / str(tier)
 
-    # Check if this username already has a fresh cache entry
+    # Check if this username already has a cache entry (for cutoff_date determination)
     existing = load_entry(tier_dir / f"{username}.json")
-    if existing and not entry_is_stale(existing, recrawl_days=recrawl_days):
-        logger.info("Skipping %s — cache is fresh (< %d days)", username, recrawl_days)
-        return {
-            "username": username,
-            "tier": tier,
-            "status": "cached",
-            "cached_entry": existing,
-        }
 
-    # Create or reuse a CDP tab for this agent
-    if pre_existing_ws_url:
-        ws_url = pre_existing_ws_url
-        logger.info("Using pre-existing tab for %s via %s", username, ws_url)
+    # Determine starting offset.
+    # For a refresh (existing cache exists but is stale), start from 0
+    # and use date cutoff to skip already-indexed posts.
+    # For a net-new blog (no cache), start from 0 with no cutoff.
+    if existing:
+        # Refresh mode: start from offset 0, stop when we reach posts
+        # older than the last scan date.
+        last_scanned_str = existing.get("scanned_at", "")
+        cutoff_date: date | None = None
+        if last_scanned_str:
+            try:
+                cutoff_date = datetime.strptime(
+                    last_scanned_str[:10], "%Y-%m-%d"
+                ).date()
+            except (ValueError, TypeError):
+                cutoff_date = None
+        logger.info(
+            "Refresh mode for %s: last scanned %s, cutoff_date=%s",
+            username,
+            last_scanned_str[:10] if last_scanned_str else "unknown",
+            cutoff_date.isoformat() if cutoff_date else "none",
+        )
     else:
-        target_url = f"https://www.tumblr.com/{username}"
-        logger.info("Creating tab for %s (%s)", username, target_url)
-        ws_url, _target_id = await _new_tab_url(browser_ws, target_url)
+        # Net-new blog: full scan, no date cutoff
+        cutoff_date = None
+        logger.info("Net-new blog %s — full scan, no date cutoff", username)
 
-    client = CDPClient(ws_url)
-    await client.start()
-    logger.info("Agent connected for %s via %s", username, ws_url)
+    page_size = 20  # Tumblr renders ~20 posts per page
 
-    # Cumulative state
+    # Cumulative state — carried across tab replacements
     all_usernames: list[str] = []  # all occurrences, in order
     unique_set: set[str] = set()
     per_page_results: list[dict[str, Any]] = []
     posts_processed = 0
+    total_posts = 0  # absolute post counter — cumulative posts seen across all pages
     status = "running"
     dead = False
     dead_reason: str | None = None
 
     offset = 0
-    page_size = 20  # Tumblr renders ~20 posts per page
+    recovery_attempts = 0
+    MAX_RECOVERY_ATTEMPTS = 3
 
-    try:
-        while True:
-            # Check limits BEFORE fetching next page
-            if check_limit(
-                unique_count=len(unique_set),
-                total_count=len(all_usernames),
-                posts_count=posts_processed,
-                unique_limit=unique_limit,
-                total_limit=total_limit,
-                post_limit=post_limit,
-            ):
-                logger.info(
-                    "Limit reached for %s: unique=%d total=%d posts=%d",
-                    username,
-                    len(unique_set),
-                    len(all_usernames),
-                    posts_processed,
-                )
-                status = "limit_reached"
-                break
+    # --- Tab lifecycle: one tab per blog, reused across pages ---
+    # Create the initial tab before entering the main loop.  The tab is
+    # reused for every page by navigating to the new offset via
+    # fetch_page_html (which calls Page.navigate internally).  Only when
+    # the tab dies mid-fetch do we close it and create a replacement.
+    # When pre_existing_ws_url is provided by the coordinator, reuse it
+    # instead of creating a second tab.
+    target_url = f"https://www.tumblr.com/{username}?offset={offset}"
+    tab_target_id: str | None = None
+    if pre_existing_ws_url:
+        ws_url = pre_existing_ws_url
+        logger.info("Reusing coordinator-provided tab for %s via %s", username, ws_url)
+        client = CDPClient(ws_url)
+        await client.start()
+        target_id = None
+        logger.info("Agent connected for %s via %s", username, ws_url)
+    else:
+        logger.info("Creating initial tab for %s", target_url)
+        ws_url, tab_target_id = await _new_tab_url(browser_ws, target_url)
+        client = CDPClient(ws_url)
+        await client.start()
+        target_id = tab_target_id
+    recovery_attempts = 0
 
-            # Fetch page
-            logger.info("Fetching %s offset=%d", username, offset)
-            html = await fetch_page_html(client, username, offset)
-            if not html:
-                dead = True
-                dead_reason = "no_html"
-                status = "dead"
-                logger.warning(
-                    "No HTML for %s at offset %d — treating as dead", username, offset
-                )
-                break
+    while True:
+        # Check limits before fetching
+        if check_limit(
+            unique_count=len(unique_set),
+            total_count=len(all_usernames),
+            posts_count=total_posts,
+            unique_limit=unique_limit,
+            total_limit=total_limit,
+            post_limit=post_limit,
+        ):
+            logger.info(
+                "Limit reached for %s: unique=%d total=%d posts=%d",
+                username,
+                len(unique_set),
+                len(all_usernames),
+                posts_processed,
+            )
+            status = "limit_reached"
+            break
 
-            # Get page text for dead/end detection
+        # --- Page fetch with tab recovery ---
+        page_html = None
+        page_text = ""
+        tab_dead = False
+
+        for recovery_round in range(MAX_RECOVERY_ATTEMPTS):
+            recovery_attempts = recovery_round + 1
             try:
-                text_result = await client.send.Runtime.evaluate(
-                    params={
-                        "expression": "document.body ? document.body.innerText : ''",
-                        "returnByValue": True,
-                    }
+                # Reuse existing tab — fetch_page_html navigates to the offset
+                logger.info(
+                    "Fetching %s offset=%d (recovery %d/%d)",
+                    username,
+                    offset,
+                    recovery_attempts,
+                    MAX_RECOVERY_ATTEMPTS,
                 )
-                page_text = text_result.get("result", {}).get("value", "")
-            except Exception:  # noqa: BLE001 — text extraction is best-effort, empty is fine
-                page_text = ""
+                page_html = await fetch_page_html(client, username, offset)
 
-            # Dead blog detection
-            if detect_dead(html, page_text):
-                dead = True
-                if "deactivated" in page_text.lower() or "deactivated" in html.lower():
-                    dead_reason = "deactivated"
-                elif "private" in page_text.lower() or "private" in html.lower():
-                    dead_reason = "private"
+                if not page_html:
+                    # Empty HTML — could be a dead blog or a tab crash
+                    try:
+                        text_result = await client.send.Runtime.evaluate(
+                            params={
+                                "expression": "document.body ? document.body.innerText : ''",
+                                "returnByValue": True,
+                            }
+                        )
+                        page_text = text_result.get("result", {}).get("value", "")
+                    except Exception:
+                        page_text = ""
+
+                    if detect_dead(page_text):
+                        matched = None
+                        text_lower = page_text.lower()
+                        for phrase in DEAD_PHRASES:
+                            if phrase in text_lower:
+                                matched = phrase
+                                break
+                        dead = True
+                        dead_reason = (
+                            f"phrase:{matched}" if matched else "dead_phrase_match"
+                        )
+                        status = "dead"
+                        logger.info(
+                            "Blog %s is dead: %s (matched=%s)",
+                            username,
+                            dead_reason,
+                            matched,
+                        )
+                    else:
+                        # No HTML and no dead signal — likely tab crash
+                        logger.warning(
+                            "No HTML for %s at offset %d — possible tab crash, "
+                            "retry %d/%d",
+                            username,
+                            offset,
+                            recovery_attempts,
+                            MAX_RECOVERY_ATTEMPTS,
+                        )
+                        tab_dead = True
+                    break  # exit recovery loop — handle outcome below
+
+                # Get page text for dead/end detection
+                try:
+                    text_result = await client.send.Runtime.evaluate(
+                        params={
+                            "expression": "document.body ? document.body.innerText : ''",
+                            "returnByValue": True,
+                        }
+                    )
+                    page_text = text_result.get("result", {}).get("value", "")
+                except Exception:  # noqa: BLE001 — text extraction is best-effort
+                    page_text = ""
+
+                # Dead blog detection
+                if detect_dead(page_text):
+                    matched = None
+                    text_lower = page_text.lower()
+                    for phrase in DEAD_PHRASES:
+                        if phrase in text_lower:
+                            matched = phrase
+                            break
+                    dead = True
+                    dead_reason = (
+                        f"phrase:{matched}" if matched else "dead_phrase_match"
+                    )
+                    status = "dead"
+                    logger.info(
+                        "Blog %s is dead: %s (matched=%s)",
+                        username,
+                        dead_reason,
+                        matched,
+                    )
+                    break  # exit recovery loop — blog is dead, no retry
+
+                # Extract usernames + dates from page HTML
+                page_result = compute_page_metrics(page_html, source_blog)
+                page_usernames = page_result["usernames"]
+                page_date_max = page_result.get("page_date_max")
+                page_date_min = page_result.get("page_date_min")
+
+                # --- Date-based cutoff for refresh mode ---
+                if cutoff_date is not None and page_date_max is not None:
+                    try:
+                        page_max_date = datetime.strptime(
+                            page_date_max[:10], "%Y-%m-%d"
+                        ).date()
+                        if page_max_date < cutoff_date:
+                            logger.info(
+                                "Date cutoff reached for %s: page newest date %s "
+                                "< cutoff %s — stopping scan",
+                                username,
+                                page_date_max,
+                                cutoff_date.isoformat(),
+                            )
+                            status = "finished"
+                            break  # exit recovery loop — done
+                    except (ValueError, TypeError):
+                        pass  # unparseable date, skip cutoff check
+
+                # First page with no usernames AND end-of-posts signal — blog is empty
+                if (
+                    not page_usernames
+                    and posts_processed == 0
+                    and detect_end_of_posts(page_text, page_html)
+                ):
+                    logger.info("Blog %s has no posts (end signal on first page)", username)
+                    status = "empty"
+                    break  # exit recovery loop
+
+                # Accumulated successfully — break recovery loop, continue main loop
+                break
+
+            except Exception as exc:  # noqa: BLE001 — tab crash during fetch
+                logger.warning(
+                    "Page fetch exception for %s offset=%d (recovery %d/%d): %s",
+                    username,
+                    offset,
+                    recovery_attempts,
+                    MAX_RECOVERY_ATTEMPTS,
+                    exc,
+                )
+                tab_dead = True
+                # Close the dead tab and create a replacement at the same offset
+                try:
+                    await client.stop()
+                except Exception:
+                    pass
+                try:
+                    await close_tab(browser_ws, tab_target_id)
+                except Exception:
+                    pass
+                await asyncio.sleep(2.0)
+                if recovery_attempts < MAX_RECOVERY_ATTEMPTS:
+                    target_url = f"https://www.tumblr.com/{username}?offset={offset}"
+                    ws_url, tab_target_id = await _new_tab_url(browser_ws, target_url)
+                    client = CDPClient(ws_url)
+                    await client.start()
+                    logger.info(
+                        "Recreated tab for %s offset=%d (recovery %d/%d)",
+                        username,
+                        offset,
+                        recovery_attempts,
+                        MAX_RECOVERY_ATTEMPTS,
+                    )
+                    continue
                 else:
-                    dead_reason = "dead_phrase_match"
-                status = "dead"
-                logger.info("Blog %s is dead: %s", username, dead_reason)
-                break
+                    dead = True
+                    dead_reason = "tab_recovery_exhausted"
+                    status = "dead"
+                    break  # exit recovery loop
 
-            # Extract usernames from page HTML using canonical extractor
-            page_result = compute_page_metrics(html, source_blog)
-            page_usernames = page_result["usernames"]
+        # --- Post-recovery handling ---
+        if dead or status in ("finished", "empty", "limit_reached"):
+            if tab_target_id:
+                try:
+                    await close_tab(browser_ws, tab_target_id)
+                except Exception:
+                    pass
+            break
 
-            # First page with no usernames AND end-of-posts signal — blog is empty
-            if (
-                not page_usernames
-                and posts_processed == 0
-                and detect_end_of_posts(page_text, html)
-            ):
-                logger.info("Blog %s has no posts (end signal on first page)", username)
-                status = "empty"
-                break
-
-            # Accumulate
-            for name in page_usernames:
-                all_usernames.append(name)
-                unique_set.add(name)
-
-            per_page_results.append(
-                {
-                    "offset": offset,
-                    "cell_count": page_result.get("cells_rendered", 0),
-                    "usernames_this_page": sorted(page_usernames),
-                    "total_this_page": len(page_usernames),
-                }
+        if tab_dead and recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
+            dead = True
+            dead_reason = "tab_recovery_exhausted"
+            status = "dead"
+            logger.error(
+                "Tab recovery exhausted for %s at offset %d after %d attempts",
+                username,
+                offset,
+                recovery_attempts,
             )
-            posts_processed += 1
+            if tab_target_id:
+                try:
+                    await close_tab(browser_ws, tab_target_id)
+                except Exception:
+                    pass
+            break
 
-            # Commit to cache after every page
-            entry = {
-                "username": username,
-                "tier": tier,
-                "source_blog": source_blog,
-                "status": status,
-                "unique_count": len(unique_set),
-                "total_count": len(all_usernames),
-                "posts_processed": posts_processed,
-                "usernames": sorted(unique_set),
-                "all_occurrences": all_usernames,
-                "per_page": per_page_results,
-                "dead": dead,
-                "dead_reason": dead_reason,
-                "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        if page_html is None:
+            break
+
+        # --- Accumulate results ---
+        for name in page_usernames:
+            all_usernames.append(name)
+            unique_set.add(name)
+
+        per_page_results.append(
+            {
+                "offset": offset,
+                "cell_count": page_result.get("posts_rendered", 0),
+                "usernames_this_page": sorted(page_usernames),
+                "total_this_page": len(page_usernames),
+                "date_min": page_date_min,
+                "date_max": page_date_max,
             }
-            save_entry(tier_dir / f"{username}.json", entry)
-            append_log(
-                cache_root / "log.json",
-                {
-                    "tier": tier,
-                    "username": username,
-                    "status": status,
-                    "unique_count": len(unique_set),
-                    "total_count": len(all_usernames),
-                    "posts_processed": posts_processed,
-                    "dead": dead,
-                    "dead_reason": dead_reason,
-                },
-            )
+        )
+        posts_processed += 1
+        total_posts += page_size
 
-            # Check if we've hit the end of posts
-            if detect_end_of_posts(page_text, html):
-                logger.info("End of posts for %s at offset %d", username, offset)
-                status = "finished"
-                break
-
-            # Move to next page
-            offset += page_size
-
-            # Random delay between fetches
-            delay = random.uniform(delay_min, delay_max)
-            logger.debug("Sleeping %.2fs before next fetch", delay)
-            await asyncio.sleep(delay)
-
-    except Exception as exc:  # noqa: BLE001 — top-level agent error, logged and finalized below
-        logger.error("Agent error for %s: %s", username, exc)
-        status = "error"
-        dead_reason = str(exc)
-
-    finally:
-        # Final save
+        # Commit to cache after every page
         entry = {
             "username": username,
             "tier": tier,
@@ -524,6 +666,7 @@ async def run(
             "dead": dead,
             "dead_reason": dead_reason,
             "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "recovery_attempts": recovery_attempts,
         }
         save_entry(tier_dir / f"{username}.json", entry)
         append_log(
@@ -537,13 +680,83 @@ async def run(
                 "posts_processed": posts_processed,
                 "dead": dead,
                 "dead_reason": dead_reason,
+                "recovery_attempts": recovery_attempts,
             },
         )
 
-        try:
-            await client.stop()
-        except Exception:  # noqa: BLE001, S110 — final cleanup, non-fatal if it fails
-            pass
+        # --- Callback: enqueue new usernames immediately (every page cycle) ---
+        if on_page:
+            try:
+                on_page(username, page_usernames, tier)
+            except Exception:  # noqa: BLE001 — callback must not break the crawl
+                logger.warning("on_page callback failed for %s", username)
+
+        # Check if we've hit the end of posts (natural end, not date cutoff)
+        if detect_end_of_posts(page_text, page_html):
+            logger.info("End of posts for %s at offset %d", username, offset)
+            status = "finished"
+            if tab_target_id:
+                try:
+                    await close_tab(browser_ws, tab_target_id)
+                except Exception:  # noqa: BLE001 — best-effort tab close, non-fatal
+                    pass
+            break
+
+        # Move to next page
+        offset += page_size
+
+        # Random delay between fetches
+        delay = random.uniform(delay_min, delay_max)
+        logger.debug("Sleeping %.2fs before next fetch", delay)
+        await asyncio.sleep(delay)
+
+        # Check if we've hit the end of posts (natural end, not date cutoff)
+        if detect_end_of_posts(page_text, page_html):
+            logger.info("End of posts for %s at offset %d", username, offset)
+            status = "finished"
+            if tab_target_id:
+                try:
+                    await close_tab(browser_ws, tab_target_id)
+                except Exception:  # noqa: BLE001 — best-effort tab close, non-fatal
+                    pass
+            break
+
+    # Final save (outside try/finally — reached after break from main loop)
+    entry = {
+        "username": username,
+        "tier": tier,
+        "source_blog": source_blog,
+        "status": status,
+        "unique_count": len(unique_set),
+        "total_count": len(all_usernames),
+        "posts_processed": posts_processed,
+        "usernames": sorted(unique_set),
+        "all_occurrences": all_usernames,
+        "per_page": per_page_results,
+        "dead": dead,
+        "dead_reason": dead_reason,
+        "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "recovery_attempts": recovery_attempts,
+    }
+    save_entry(tier_dir / f"{username}.json", entry)
+    append_log(
+        cache_root / "log.json",
+        {
+            "tier": tier,
+            "username": username,
+            "status": status,
+            "unique_count": len(unique_set),
+            "total_count": len(all_usernames),
+            "posts_processed": posts_processed,
+            "dead": dead,
+            "dead_reason": dead_reason,
+        },
+    )
+
+    try:
+        await client.stop()
+    except Exception:  # noqa: BLE001, S110 — final cleanup, non-fatal if it fails
+        pass
 
     return {
         "username": username,
