@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Lint all tumblr-scanner modules with py_compile. Fail on first error."""
+
 import py_compile
 import sys
 from pathlib import Path

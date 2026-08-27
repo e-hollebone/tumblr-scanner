@@ -33,7 +33,7 @@ from cache import (
     index_should_skip,
 )
 
-from chrome_lifecycle import restart_chrome, kill_chrome
+
 
 logger = logging.getLogger("tumblr-coordinator")
 
@@ -49,6 +49,7 @@ LIMITS = {
 
 # Maximum concurrent agents (hard cap)
 MAX_CONCURRENT_AGENTS = 3
+TAB_SEMAPHORE = asyncio.Semaphore(4)  # max 4 concurrent Chrome tabs (user limit)
 
 # Re-crawl window (days)
 DEFAULT_RECRAWL_DAYS = 7
@@ -219,13 +220,14 @@ async def run_t0(
     cache_root = cache_dir or CACHE_DIR
     t0_path = cache_root / "t0.json"
 
-    # Check if T0 is already cached and fresh
+    # Check if T0 is already cached and has usernames
     existing = load_entry(t0_path)
-    if existing and not existing.get("dead", False):
+    if existing and not existing.get("dead", False) and existing.get("usernames"):
         t0_scanned = existing.get("scanned_at", "")
         logger.info("T0 already cached (scanned %s) — re-using", t0_scanned)
-        # Still return the result so caller can build T1 list from it
         return existing
+    elif existing:
+        logger.info("T0 cache has no usernames — re-crawling")
 
     logger.info("Starting T0 crawl for %s", target_blog)
     logger.info(
@@ -777,11 +779,26 @@ async def run_parallel_pipeline(
 
     overall_start = time.monotonic()
 
-    # 1. Fresh Chrome restart
-    chrome_status = restart_chrome()
-    logger.info("Chrome restart: %s", chrome_status.get("status"))
-    if chrome_status.get("status") != "ok":
-        logger.warning("Chrome restart issue: %s — continuing anyway", chrome_status)
+    # 1. Use existing Chrome (do NOT kill — user's login session lives here)
+    # Just verify the CDP port is reachable
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{browser}/json/version", timeout=5) as resp:
+            info = {}
+            try:
+                import json
+                info = json.loads(resp.read())
+            except (json.JSONDecodeError, OSError):
+                pass
+            logger.info("Chrome connected: %s", info.get("Browser", "unknown"))
+    except (urllib.error.URLError, OSError) as exc:
+        logger.error("Chrome CDP not reachable at %s: %s", browser, exc)
+        return {
+            "target_blog": target_blog,
+            "status": "error",
+            "reason": f"Chrome CDP not reachable: {exc}",
+            "elapsed_seconds": 0,
+        }
 
     # 2. T0 probe — check if target blog has new content
     t0_probe = await probe_blog(
@@ -789,6 +806,7 @@ async def run_parallel_pipeline(
         username=target_blog,
         cache_dir=cache_root,
         index_path=index_path,
+        tab_sem=TAB_SEMAPHORE,
     )
     if t0_probe["skip"]:
         logger.info("T0 skip: no new content since last scan")
@@ -856,6 +874,7 @@ async def run_parallel_pipeline(
             username=username,
             cache_dir=cache_root,
             index_path=index_path,
+            tab_sem=TAB_SEMAPHORE,
         )
         if probe["skip"]:
             logger.info("T1 skip: %s (no new content)", username)
@@ -882,6 +901,7 @@ async def run_parallel_pipeline(
             cache_root=cache_root,
             recrawl_days=recrawl_days,
             semaphore=t1_sem,
+            tab_sem=TAB_SEMAPHORE,
         )
 
         # Register in index immediately
@@ -910,6 +930,7 @@ async def run_parallel_pipeline(
                 cache_root=cache_root,
                 recrawl_days=recrawl_days,
                 semaphore=t2_sem,
+                tab_sem=TAB_SEMAPHORE,
             ))
             t2_tasks.add(task)
             task.add_done_callback(t2_tasks.discard)
@@ -1004,6 +1025,7 @@ async def _run_single_agent(
     cache_root: Path,
     recrawl_days: int,
     semaphore: asyncio.Semaphore,
+    tab_sem: asyncio.Semaphore | None = None,
 ) -> dict[str, Any]:
     """Run a single agent with bounded concurrency and tab reuse."""
     async with semaphore:
@@ -1024,7 +1046,14 @@ async def _run_single_agent(
             }
 
         target_url = f"https://www.tumblr.com/{username}"
-        ws_url, target_id = await _new_tab_url(browser_ws, target_url)
+        if tab_sem:
+            await tab_sem.acquire()
+        try:
+            ws_url, target_id = await _new_tab_url(browser_ws, target_url)
+        finally:
+            if not tab_sem:
+                pass  # no semaphore, tab created without limit
+            # if semaphore, keep it held until tab is closed
         try:
             result = await agent_run(
                 browser_ws=browser_ws,
@@ -1060,6 +1089,8 @@ async def _run_single_agent(
                 await close_tab(browser_ws, target_id)
             except Exception:
                 pass
+            if tab_sem:
+                tab_sem.release()
 
 
 def main() -> None:

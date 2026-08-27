@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """Lint tumblr-scanner modules: py_compile for all, ruff for diagnostics."""
+
 import py_compile
 import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path("/Users/eric/Documents/tumblr-scanner")
-MODULES = ["agent.py", "cache.py", "coordinator.py", "extractor.py", "run.py", "lint_modules.py"]
+MODULES = [
+    "agent.py",
+    "cache.py",
+    "coordinator.py",
+    "extractor.py",
+    "run.py",
+    "lint_modules.py",
+]
 RUFF = "/Users/eric/.hermes/hermes-agent/venv/bin/ruff"
 
 print("=== py_compile (all modules) ===")
@@ -22,7 +30,7 @@ for name in MODULES:
 
 print("\n=== ruff check ===")
 result = subprocess.run(
-    [RUFF, "check", "--output-format=concise", ".", "--force-exit-zero"],
+    [RUFF, "check", "--output-format=concise", "."],
     cwd=str(REPO),
     capture_output=True,
     text=True,
@@ -34,7 +42,7 @@ else:
 
 print("\n=== ruff format (check only) ===")
 result = subprocess.run(
-    [RUFF, "format", "--check", ".", "--force-exit-zero"],
+    [RUFF, "format", "--check", "."],
     cwd=str(REPO),
     capture_output=True,
     text=True,

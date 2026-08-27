@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
 """Apply ruff auto-fixes to committed modules, then patch the rest manually."""
+
 import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path("/Users/eric/Documents/tumblr-scanner")
-MODULES = ["agent.py", "cache.py", "coordinator.py", "extractor.py", "run.py", "lint_batch.py", "lint_modules.py"]
+MODULES = [
+    "agent.py",
+    "cache.py",
+    "coordinator.py",
+    "extractor.py",
+    "run.py",
+    "lint_batch.py",
+    "lint_modules.py",
+]
 RUFF = "/Users/eric/.hermes/hermes-agent/venv/bin/ruff"
 
 print("=== ruff check --fix (auto-fixable only) ===")
 result = subprocess.run(
-    [RUFF, "check", "--fix", "--unsafe-fixes", "--output-format=concise", ".", "--force-exit-zero"],
+    [
+        RUFF,
+        "check",
+        "--fix",
+        "--unsafe-fixes",
+        "--output-format=concise",
+        ".",
+        "--force-exit-zero",
+    ],
     cwd=str(REPO),
     capture_output=True,
     text=True,
