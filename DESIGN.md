@@ -1,11 +1,11 @@
-# Tumblr Scanner — Design Document (v2)
+# Tumblr Scanner — Design Document (v3)
 
-**Status:** Phase 1 — Design (in progress)
+**Status:** Phase 2 — Build (design complete, code matches)
 **Project:** Tumblr username extraction pipeline (depth-limited crawl; "tiers" are our depth abstraction, not Tumblr's)
 **Repo:** `github.com/e-hollebone/tumblr-scanner`
 **Path:** `/Users/eric/Documents/tumblr-scanner`
-**Supersedes:** `DESIGN.md` (v1, 2026-08-27)
-**Last verified:** 2026-08-27
+**Supersedes:** `DESIGN.md` (v2, 2026-08-28)
+**Last verified:** 2026-08-28 (code at `747a406` on `worker-tab-lifecycle`)
 
 ---
 
@@ -16,10 +16,9 @@ This document moves forward from the failures catalogued in [`DESIGN_HISTORY.md`
 Key locked lessons from the history:
 1. **Read the data before parsing it** — the extractor's "expanded vs collapsed" duality was a phantom; real Tumblr posts always have `<article>`, `<time datetime>`, and `a[rel="author"]`.
 2. **Tab creation is expensive** — one tab per worker, reused for the worker's lifetime. Never open/close per blog.
-3. **Semaphores cap concurrency, not churn** — a semaphore + `close_tab()` in `finally` still destroys/creates per task. Fix = worker *ownership*.
-4. **The WebSocket URL is not static** — refresh it after every navigation or the connection dies past page 0.
-5. **Sub-agents are not free parallelism** — DNS + provider-resolution + interpreter mismatches corrupted results more than they helped.
-6. **SPA requires JS rendering** — only CDP `Runtime.evaluate` works on Tumblr.
+3. **The WebSocket URL is not static** — refresh it after every navigation or the connection dies past page 0.
+4. **Sub-agents are not free parallelism** — DNS + provider-resolution + interpreter mismatches corrupted results more than they helped.
+5. **SPA requires JS rendering** — only CDP `Runtime.evaluate` works on Tumblr.
 
 ---
 
@@ -75,47 +74,58 @@ Build a robust Tumblr username crawler that:
 
 ```
 tumblr-scanner/
-├── run.py              # CLI entry, dispatches to pipeline
-├── coordinator.py      # Pipeline orchestration, worker pool, dispatch
+├── run.py              # CLI entry, dispatches to queue_mode()
+├── queue_integration.py # Startup sequence: Chrome restart → seed queue → drain
 ├── worker.py           # Worker class: owns a tab, reuses it across blogs
-├── agent.py            # Per-blog crawl loop (stateless; accepts a tab)
+├── agent.py            # Pure CDP library: fetch_page_html, detection, crawl_blog
 ├── extractor.py        # HTML → usernames (BeautifulSoup, canonical)
 ├── cache.py            # JSON cache, index, entry staleness
-├── chrome_lifecycle.py # Fresh Chrome restart
+├── chrome_lifecycle.py # Fresh Chrome restart (dedicated profile)
 ├── lint_modules.py     # py_compile checker
 ├── lint_batch.py       # py_compile + ruff check
 ├── ruff_fix.py         # ruff auto-fix runner
 └── .gitignore
 ```
 
-**Key change from v1:** `worker.py` is new — it owns the tab lifecycle. `agent.py` becomes stateless (accepts a tab, doesn't own one). `coordinator.py` manages a worker pool instead of firing per-blog tasks.
+**Key architectural separation:**
+- **`chrome_lifecycle.py`** — owns the *browser* lifecycle: launching Chrome, killing stale processes (filtered to our dedicated profile only), verifying the debug port. This is the only component that touches Chrome *process* management.
+- **`worker.py`** — owns the *tab* lifecycle: opening, navigating, recovering, and closing tabs. Workers never launch or kill Chrome; they only operate on tabs within the already-running browser.
+- **`agent.py`** — pure CDP library. Accepts a connected `CDPClient` WS URL, raises `TabDeadError` on failure. No tab ownership, no `pre_existing_ws_url`, no recovery loop.
+- **`queue_integration.py`** — the startup sequence: restart Chrome → prime queue with seed → start worker pool → drain.
 
 ### 3.2 Worker Pool Model (the fix for tab-per-blog)
 
 ```
 Worker Pool (size = MAX_CONCURRENT_AGENTS = 3)
-  Worker 1: tab_A → blog_1 (all pages) → blog_4 → blog_7 ...
-  Worker 2: tab_B → blog_2 (all pages) → blog_5 → blog_8 ...
-  Worker 3: tab_C → blog_3 (all pages) → blog_6 → blog_9 ...
+  Worker 0: tab_A → poll queue → blog_X → blog_Y → ...
+  Worker 1: tab_B → poll queue → blog_Z → ...
+  Worker 2: tab_C → poll queue → sleep → poll → blog_W → ...
 ```
 
+**Startup: all workers start immediately.** No deferred start, no "seed worker" designation. All 3 workers open their tabs at pipeline start and begin polling the queue. The seed blog is the first (and initially only) queue item. Whichever worker dequeues it first crawls it.
+
+**Queue polling with sleep.** When the queue is empty, workers sleep for `QUEUE_POLL_INTERVAL` seconds (2.0s), then poll again. They do NOT busy-wait.
+
 **Tab lifecycle rules:**
-1. Worker creates its tab on startup.
+1. Worker creates its tab on startup (immediately, not deferred).
 2. Worker navigates its tab to each new blog URL via `Page.navigate` to `?offset=N`.
 3. Worker reuses the same tab for every blog it crawls.
 4. Worker closes its tab only on worker death (pipeline end or unrecoverable crash).
-5. Semaphore limits *workers* (3), not tabs — so max 3 tabs, within the 4-tab Chrome limit.
+5. Worker pool size (3) is the concurrency limit — no semaphore needed.
 
 **Depth is not a worker property.** Any worker can crawl any blog at any depth. A worker pulling a depth-2 name from the queue runs the same crawl as a worker pulling a depth-1 name. The depth label is just a field in the queue item (for limit management + reporting), not a structural constraint.
+
+**The seed is not a special case.** It is simply the first queue item. No worker is pre-assigned to it. The flock-based `dequeue()` guarantees exactly one worker gets it.
 
 ### 3.3 Data Flow — parallel from first extraction
 
 ```
-run.py --parallel
-  └─ run_parallel_pipeline(seed_blog)
+run.py --queue
+  └─ queue_mode(seed_blog)
        ├─ chrome_lifecycle.restart()          # Fresh Chrome (FR-9)
-       ├─ worker_pool = WorkerPool(size=3)    # 3 workers, 3 tabs (NFR-1, NFR-2)
-       ├─ worker_pool.submit(seed_blog, depth=0)   # Seed on queue
+       ├─ enqueue(seed_blog, tier=0)          # Seed is first queue item
+       ├─ start worker pool (3 workers)       # All workers start immediately
+       │    └─ each worker: open tab → poll queue → sleep if empty
        │
        │   ── ASYNC — no stage waits for another ──
        │
@@ -126,62 +136,77 @@ run.py --parallel
               │    ├─ already discovered + scanned_today  → DROP (NFR-10)
               │    ├─ already discovered + old scan date  → QUEUE re-index (FR-2, FR-7)
               │    └─ net new                           → QUEUE full crawl (depth+1) (FR-2, FR-3)
-              └─ if any name queued at depth+1:
-                   worker_pool.submit(name, depth+1)     # ← parallelism starts HERE (FR-4)
+              └─ ENQUEUE AFTER EVERY PAGE              ← parallelism starts HERE (FR-4)
 ```
 
-**The parallel trigger (FR-4):** The seed blog is itself a queue item. The moment the seed worker finishes reading its first batch of posts (Tumblr pagination — ~20 posts per page), it extracts names and submits the first depth-1 names to the queue. Those names are picked up by *any idle worker* immediately — depth-1 crawl starts before the seed blog is even finished. As depth-1 workers emit depth-2 names, those go on the queue and start instantly. The whole system is parallel from the first extraction; there is no "T0 done → start T1" gate.
+**The parallel trigger (FR-4):** The seed blog is the first queue item. The moment the seed worker finishes reading its first page (~20 posts), it extracts names and enqueues them at depth+1. Those names are picked up by *any idle worker* immediately — depth-1 crawl starts before the seed blog is even finished.
+
+**Per-page enqueue (critical):** Workers enqueue discoveries after EVERY page, not after the blog finishes. This is what makes parallelism structural rather than staged.
 
 ### 3.3a Core Crawl Loop (per worker, per blog)
 
 ```
 for each page (offset = 0, 20, 40, ...):
-    html = fetch_page(blog, offset)        # CDP Runtime.evaluate
-    result = extract_from_html(html)        # canonical extractor
-    page_names = result.usernames           # net new from this page
+    try:
+        html = fetch_page_html(client, blog, offset)   # raises TabDeadError on failure
+    except TabDeadError:
+        worker._recover_tab()                           # close dead tab, open new one
+        continue                                         # retry same offset
+
+    if detect_login_wall(html, url):
+        raise LoginWallDetected(username)               # halt pipeline
+
+    result = extract_from_html(html)
+    page_names = result.usernames
+
     for name in page_names:
-        entry = index.get(name)
-        if entry and entry.scanned_at == today:
-            continue                        # already done today
-        elif entry and entry.scanned_at != today:
-            index_queue.put((name, 'reindex'))   # refresh scan date
+        status = index_status(name)
+        if status == "fresh":
+            continue                                    # already done, skip
+        elif status == "stale":
+            enqueue(name, mode="reindex")               # date probe
         else:
-            index.register(name, depth+1)         # net new
-            crawl_queue.put((name, depth+1))        # full crawl next depth
-    if crawl_queue.has_new() and depth < MAX_DEPTH:
-        worker_pool.submit_from_queue()    # parallelism: depth+1 starts now
-    if limits_reached(result): break
+            enqueue(name, mode="full")                  # full crawl
+
+    if detect_end_of_posts(html): break
+    if limits_reached(): break
 ```
 
-**Depth limit is a design choice for limit management, not Tumblr's structure.** Tumblr returns a flat stream of posts per blog; we assign depth labels to track how far out from the seed we've gone and to cap total work. Tumblr never sees or cares about depth.
+### 3.4 Startup Sequence (timing and procedural steps)
 
-### 3.4 Component Responsibilities
+```
+Step 1: Restart Chrome
+   └─ chrome_lifecycle.restart()
+   └─ Poll /json/version until OK (Chrome ready)
+   └─ Extract browser WS URL
 
-**`Worker` (worker.py) — NEW**
-- Owns exactly one CDP tab for its lifetime.
-- Methods: `run_blog(username, depth) → result`, `probe_blog(username) → dates`, `shutdown()`.
-- `run_blog` is depth-agnostic — same crawl whether the blog is depth 1 or depth 2. Depth is just a queue field.
-- On tab death: close dead tab, create new one, resume from last offset (max 3 recovery attempts).
-- Never closes tab in a per-blog `finally`.
+Step 2: Seed the queue (BEFORE workers start)
+   └─ enqueue(queue_path, seed_blog, tier=0)
+   └─ Queue now has exactly 1 item: the seed
 
-**`agent.run()` (agent.py) — REFACTORED**
-- Stateless: accepts a `CDPClient` (the worker's tab), doesn't own it.
-- No `close_tab()` in `finally` — the worker owns cleanup.
-- Returns crawl result; worker decides what to do next (submit depth+1 names to queue).
+Step 3: Start worker pool (all workers start immediately)
+   └─ Each worker:
+       ├─ Opens its tab via CDP (Chrome is ready — succeeds)
+       ├─ Polls queue → dequeue() returns seed (already there)
+       └─ Begins crawling seed blog
+   └─ Workers that don't get the seed:
+       ├─ Polls queue → empty → sleeps 2s
+       └─ Wakes up → polls again → finds T1 names (enqueued by seed worker)
+```
 
-**`coordinator.py` — REFACTORED**
-- Manages `WorkerPool` instead of `asyncio.gather` + semaphore.
-- Single `run_pipeline(seed_blog)` — submits seed, lets workers pull from the shared crawl queue. No `run_t0`/`run_t1`/`dispatch_t2` staged functions.
-- Index registration happens per-username, immediately on emission (inside the worker loop, §3.3a).
+**Why this order matters:**
 
-**`extractor.py` — UNCHANGED**
-- Canonical, verified working (68 posts / 77 unique on real data).
-- The "collapsed text-only" branch is dead code (0/68 posts use it) — kept as defensive fallback, not removed.
+| If you do it wrong | What happens |
+|---|---|
+| Workers start before Chrome ready | Tab creation fails — all workers crash |
+| Workers start before seed enqueued | Workers sleep 2s, wake up, find seed — 2s wasted per worker |
+| Seed enqueued but no workers started | Seed sits idle — no parallelism |
 
-**`cache.py` — EXTENDED**
-- `index_register(username, depth, scanned_at)` — immediate registration.
-- `index_should_skip(username, depth) → bool` — check before dispatch.
-- `entry_is_stale(username, depth, days=7)` — recrawl window check.
+**After startup, the system is self-loading:**
+- Seed worker crawls page 0 → enqueues T1 names → idle workers pick them up
+- Seed worker continues to page 1, 2, 3... → enqueues more T1 names
+- T1 workers crawl their blogs → enqueue T2 names → other workers pick them up
+- All workers are identical — no special "seed worker" designation
 
 ### 3.5 Concurrency Model
 
@@ -190,13 +215,15 @@ for each page (offset = 0, 20, 40, ...):
 | Concurrent tabs | 4 | Worker pool size (3) < Chrome limit (4) |
 | Concurrent agents | 3 | `MAX_CONCURRENT_AGENTS = 3` |
 | Tab lifetime | Worker lifetime | Worker owns tab, closes on death |
-| WS URL refresh | Per navigation | `cdp_manager.reconnect()` after every `Page.navigate` |
+| WS URL refresh | Per blog | Worker `_refresh_ws()` before each blog |
 
 **No semaphore on individual tab creation.** The worker pool size *is* the concurrency limit. This avoids the semaphore-vs-churn bug from design history §4.1.
 
 **Parallelism is structural, not staged.** All workers run the same loop (§3.3a) and pull from one shared queue. The seed blog is just the first queue item. There is no T0/T1/T2 gate — depth-2 work can start before depth-1 is finished, as long as depth-2 names have been emitted.
 
-### 3.6 Date-Aware Refresh Protocol
+### 3.6 Date-Aware Refresh Protocol (NOT YET IMPLEMENTED — see FR-7)
+
+> **Status:** This section describes the *intended* design. The current implementation (as of `747a406`) uses a 7-day recrawl window only (§3.8.8). The probe-then-compare-dates mechanism is a build-phase item.
 
 For every blog (any depth — Tumblr treats all blogs identically):
 1. Fetch page 0 only.
@@ -205,7 +232,7 @@ For every blog (any depth — Tumblr treats all blogs identically):
 4. If `page_date_max <= scanned_at` → skip (no new content).
 5. Else → crawl all pages, update `scanned_at` on completion.
 
-Applied uniformly — the seed blog (depth 0) and every discovered blog use the same probe. This replaces the current `probe_blog()` + `_run_single_agent()` double-tab pattern — the worker probes and crawls with the same tab.
+Applied uniformly — the seed blog (depth 0) and every discovered blog use the same probe.
 
 ### 3.7 Index Registration Protocol
 
@@ -220,11 +247,15 @@ The index is the single source of truth for "what's been seen." It is flat — n
 
 #### 3.8.1 Main Loop and Initiation
 
-The pipeline starts in `run.py`, which parses CLI arguments and calls `coordinator.run_pipeline(seed_blog)`. The coordinator first calls `chrome_lifecycle.restart()` to start a fresh Chrome process with a dedicated profile (`--user-data-dir=chrome_profile`). This guarantees a clean state — no stale tabs, no accumulated memory leaks from prior runs — without touching the user's personal Chrome session.
+The pipeline starts in `run.py`, which parses CLI arguments and calls `queue_mode(seed_blog)`. The startup sequence is strictly ordered:
 
-After Chrome is confirmed reachable (CDP `/json/version` returns OK), the coordinator creates a `WorkerPool` with `MAX_CONCURRENT_AGENTS = 3` workers. Each worker spawns its own thread and creates exactly one Chrome tab via the CDP browser endpoint. The worker then enters its main loop: pull a queue item, probe the blog, crawl page-by-page, extract usernames, register them in the index, and push newly discovered names back onto the queue.
+1. **Restart Chrome** — `chrome_lifecycle.restart()` starts a fresh Chrome process with a dedicated profile (`--user-data-dir=chrome_profile`). Poll `/json/version` until OK. This guarantees a clean state without touching the user's personal Chrome session.
 
-The seed blog is the first item placed on the crawl queue (depth=0). The moment any worker pulls it and finishes reading the first page (~20 posts), extracted usernames are pushed onto the queue as depth-1 items. Other workers immediately pick those up — parallelism starts at first extraction, not after the seed finishes.
+2. **Seed the queue** — `enqueue(queue_path, seed_blog, tier=0)`. The queue now has exactly 1 item.
+
+3. **Start worker pool** — All 3 workers start immediately. Each opens its tab via CDP (Chrome is ready, so this succeeds). Each worker polls the queue. One worker dequeues the seed and begins crawling. The other two workers find the queue empty and sleep for `QUEUE_POLL_INTERVAL` seconds before re-checking.
+
+The moment the seed worker finishes page 0 and enqueues T1 names, idle workers wake up and pick them up. Parallelism starts at first extraction, not after the seed finishes.
 
 #### 3.8.2 The Index
 
@@ -240,7 +271,7 @@ The index serves three purposes:
 2. **Re-index trigger**: If the username is present but `scanned_at` is not today, the blog is queued for a date probe (to check if new content exists) rather than a full crawl.
 3. **Source tracking**: `source_blog` records which blog this username was found on, enabling graph reconstruction.
 
-The index is the single source of truth for "what has been seen." It is flat — no per-depth partitions. Depth is just a field in each entry, not a structural separator. This avoids the complexity of maintaining separate per-depth index files.
+The index is the single source of truth for "what has been seen." It is flat — no per-depth partitions. Depth is just a field in each entry, not a structural separator.
 
 The index is read at startup and written to atomically (write to temp file, then rename) after each registration to prevent corruption on crash.
 
@@ -256,9 +287,9 @@ The queue is the mechanism that makes parallelism structural rather than staged.
 
 #### 3.8.4 Main Thread
 
-The main thread (running in `coordinator.py`) does almost no crawling work. Its responsibilities are:
+The main thread (running in `queue_mode()`) does almost no crawling work. Its responsibilities are:
 
-1. **Initialize**: Restart Chrome, create worker pool, load index, seed the queue.
+1. **Initialize**: Restart Chrome, seed the queue, start worker pool.
 2. **Monitor**: Periodically log queue depth, worker status, and total usernames indexed.
 3. **Shutdown**: On completion or Ctrl-C, signal workers to stop, wait for them to finish their current blog, then close all tabs and the Chrome process.
 4. **Aggregate results**: After workers finish, read the index and output the final username list.
@@ -267,18 +298,21 @@ The main thread never touches a Chrome tab. It never fetches a page or parses HT
 
 #### 3.8.5 Worker Threads
 
-Each worker runs in its own thread and owns exactly one Chrome tab for its lifetime. The worker's life cycle:
+Each worker is an instance of the `Worker` class (in `worker.py`) running as an `asyncio.Task`. Each worker owns exactly one Chrome tab for its lifetime. The worker's life cycle:
 
-1. **Startup**: Create a tab via CDP (`/json/new?<url>`), store the WebSocket URL.
+1. **Startup**: Open a tab via CDP (`Target.createTarget`), store the WebSocket URL. Tab is opened immediately, not deferred.
 2. **Main loop**:
-   a. Pull `(username, depth, mode)` from the crawl queue.
-   b. Check the index: if already scanned today, skip.
-   c. If mode=`'probe'`: fetch page 0, extract dates, compare against `scanned_at`. If new content exists, re-queue as `'full'`. Else update `scanned_at` and done.
-   d. If mode=`'full'`: crawl page-by-page (offset 0, 20, 40, ...). For each page: fetch HTML, run `extract_from_html()`, get usernames. For each username: check index, register if new, push `(username, depth+1, 'full')` onto queue if depth < MAX_DEPTH.
-   e. After all pages: update cache entry with `scanned_at = today`.
-3. **Shutdown**: Close the tab, terminate thread.
+   a. Check the queue for work.
+   b. If queue is empty: sleep for `QUEUE_POLL_INTERVAL` seconds, then check again. Track how long the queue has been empty — if it exceeds `QUEUE_EMPTY_TIMEOUT` (30s), the worker exits.
+   c. If work found: pull `(username, tier, mode)` from the queue.
+   d. Check the index: if already scanned today, skip.
+   e. If mode=`'reindex'`: fetch page 0, extract dates, compare against `scanned_at`. If new content exists, crawl all pages. Else update `scanned_at` and done.
+   f. If mode=`'full'`: crawl page-by-page (offset 0, 20, 40, ...). For each page: fetch HTML, run `extract_from_html()`, get usernames. For each username: check index, register if new, push `(username, tier+1, 'full')` onto queue if tier < MAX_DEPTH.
+   g. **Enqueue after EVERY page** — not after the blog finishes. This is what makes parallelism structural.
+3. **Tab recovery**: If the tab dies mid-crawl (agent raises `TabDeadError`), the worker closes it, opens a new one, and resumes from the last offset (max 3 recovery attempts). The worker owns tab recovery — the agent library just raises `TabDeadError`.
+4. **Shutdown**: Close the tab, terminate task.
 
-The worker is depth-agnostic — it runs the same crawl logic regardless of whether the blog is depth 0, 1, or 2. Depth is just a field in the queue item used for limit tracking and the "stop pushing at MAX_DEPTH" check.
+**All workers start immediately.** There is no permanent "seed worker" designation. Whichever worker dequeues the seed first crawls it. Other workers sleep first, wake up, and find T1 names already enqueued by the seed worker.
 
 #### 3.8.6 Synchronization and Parallelism
 
@@ -288,7 +322,7 @@ The pipeline uses **asyncio-based concurrency** (not threads). All crawl work ru
 2. **The index file** (`cache/index.json`): written atomically (`.tmp` + rename) by the async event loop. Since the event loop is single-threaded, no explicit lock is needed for index writes.
 3. **Cache writes**: require no lock because each blog has a unique filename (`cache/blog/<username>.json`) — no two workers can write the same file simultaneously. This assumption holds as long as cache entries remain per-blog.
 
-Parallelism is managed by `asyncio.Semaphore` (max 4 concurrent CDP operations) and `asyncio.Task` workers. The worker pool size (3) is the concurrency limit. Each worker is an async task; the event loop schedules them cooperatively. The queue provides natural backpressure: if all workers are busy, items accumulate in the JSONL file; if the queue is empty, workers exit.
+Parallelism is managed by `asyncio.Task` workers. The worker pool size (3) is the concurrency limit. Each worker is an async task; the event loop schedules them cooperatively. The queue provides natural backpressure: if all workers are busy, items accumulate in the JSONL file; if the queue is empty, workers exit.
 
 The critical design choice: **a worker pushes depth+1 items onto the queue *inside* the page loop, not after the blog finishes.** This means the seed blog's first page can trigger depth-1 work before the seed's second page is fetched. Depth-2 work can start before depth-1 is complete. There is no barrier between depths.
 
@@ -313,106 +347,84 @@ Dates serve two purposes: (1) detecting whether a blog has new content since las
 
 Date extraction happens inside the extractor: `_parse_post_date(cell)` reads `<time datetime="2026-08-20T13:09:47.000Z">` and returns a `date` object. The extractor returns `page_date_min` and `page_date_max` for each page.
 
-Date flow in the queue-mode pipeline:
-- During T0 crawl (`_run_t0_producer`): the agent crawls the target blog, extracts usernames, and the result is written to the index with a `scanned_at` timestamp. Discovered usernames are enqueued at tier 1.
-- During the drain loop (`_drain_queue`): each blog is crawled via `agent_run()`, results written to the index with `scanned_at`, and new discoveries enqueued at the next tier.
-- Recrawl eligibility: `_index_has_fresh_entry()` checks if a username has a `scanned_at` within `recrawl_days` (7). If fresh, it is skipped (not re-enqueued). This is the date-aware refresh mechanism in the queue-mode architecture — there is no separate probe phase; the index timestamp gates re-crawling.
+**Current implementation (7-day recrawl window):** `_index_has_fresh_entry()` checks if a username has a `scanned_at` within `recrawl_days` (7). If fresh, it is skipped (not re-enqueued). This is the date-aware refresh mechanism in the current queue-mode architecture.
 
-The worker (async task) does not need to understand Tumblr's date formats — the extractor handles all parsing. The worker just compares dates.
+**Intended implementation (probe-then-compare):** See §3.6. The probe fetches page 0, extracts `page_date_max`, compares against `scanned_at`. If no new content, skip. If new content, crawl all pages. This is a build-phase item (FR-7 is PARTIAL).
 
 #### 3.8.9 Worker Independence from Main Thread Chrome
 
 Workers (async tasks) do not share Chrome state with the main thread. Each worker:
 
-- Creates its own tab via the CDP browser-level endpoint (`/json/new`), not via the main thread.
+- Creates its own tab via the CDP browser-level endpoint (`Target.createTarget`), not via the main thread.
 - Maintains its own WebSocket connection to that tab.
 - Handles its own reconnection if the WebSocket dies (the WS URL can change after navigation; the worker re-fetches `/json` to get the current URL).
 - Closes its own tab on shutdown.
 
 The main thread never holds a tab reference. If the main thread crashes, workers continue crawling (they're independent async tasks). If a worker crashes, the main thread detects it (via `asyncio.wait` timeout) and can optionally respawn it.
 
-This independence is critical: the main thread's Chrome lifecycle (restart at pipeline start) is decoupled from the workers' Chrome usage. Workers survive Chrome restarts by reconnecting to their tabs (which persist across the browser-level restart) or by recreating tabs if needed.
+This independence is critical: the main thread's Chrome lifecycle (restart at pipeline start) is decoupled from the workers' Chrome usage.
 
 #### 3.8.10 Tab Lifecycle
 
-**Opening**: A worker opens its tab once, at startup, via `GET /json/new?<blank url>`. The returned WebSocket URL is stored. The tab is then navigated to the first blog URL.
+**Opening**: A worker opens its tab once, at startup, via `Target.createTarget`. The returned WebSocket URL is stored. The tab is then navigated to the first blog URL.
 
 **Reuse**: The worker navigates the same tab to each subsequent blog via `Page.navigate` to `?offset=N`. The tab is never closed between blogs. This is the fix for the tab-per-blog explosion that crashed Chrome at 30+ tabs.
 
-**Maintenance**: After every `Page.navigate`, the worker calls `cdp_manager.reconnect()` to refresh the WebSocket URL (Tumblr's SPA navigation can invalidate the old WS endpoint). If the navigation fails, the worker retries up to 3 times with exponential backoff.
+**Maintenance**: Before each blog, the worker refreshes the WebSocket URL (Tumblr's SPA navigation can invalidate the old WS endpoint). If the navigation fails, the agent raises `TabDeadError` and the worker retries up to 3 times with tab replacement.
 
-**Closing**: The worker closes its tab only on shutdown (pipeline end or unrecoverable error). The close is via `GET /json/close/<targetId>`.
+**Closing**: The worker closes its tab only on shutdown (pipeline end or unrecoverable error). The close is via `Target.closeTarget`.
 
-**Ownership**: The worker *owns* its tab. No other thread touches it. The main thread never closes a worker's tab. If the worker dies unexpectedly, the main thread's shutdown routine closes any remaining tabs by reading `/json/list` and closing all of them.
+**Ownership**: The worker *owns* its tab. No other task touches it. The main thread never closes a worker's tab. If the worker dies unexpectedly, the main thread's shutdown routine closes any remaining tabs by reading `/json/list` and closing all of them.
 
 #### 3.8.11 Error Handling
 
 Errors are handled at multiple levels:
 
 **Page fetch errors** (timeout, WS disconnect, Chrome error code 5 `page.documentCleared`):
-- The worker catches the exception, increments a retry counter.
-- If retries < 3: re-fetch the WS URL (reconnect), navigate to the same offset, retry.
-- If retries >= 3: mark this blog as `error` in the cache, move to next queue item. The blog is not marked dead — a later cycle can retry.
+- The agent raises `TabDeadError`.
+- The worker catches it, closes the dead tab, opens a new one, retries from the same offset (max 3 attempts).
+- If retries exhausted: mark this blog as `error` in the cache, move to next queue item.
 
 **Tab death** (Chrome process crash, tab crash):
 - The worker detects this when a CDP command times out or returns an error.
-- It attempts to recreate the tab via `/json/new`. If successful, resumes from the last offset. If `/json/new` fails (Chrome itself is dead), the worker signals the main thread to restart Chrome.
+- It closes the dead tab via `Target.closeTarget`, opens a new one via `Target.createTarget`, and resumes from the last offset (max 3 recovery attempts).
 
 **Extractor errors** (malformed HTML, unexpected structure):
 - The extractor returns empty results (0 posts) rather than raising. Extraction is best-effort.
-- The worker logs the empty result and moves on. A blog with 0 posts extracted is flagged in the cache for manual review.
+- The worker logs the empty result and moves on.
 
 **Index write errors** (disk full, permission):
 - Atomic write (write to `.tmp`, then rename) prevents corruption. If the rename fails, the in-memory index is intact and the write is retried next cycle.
 
-**Queue overflow** (memory exhaustion from too many queued items):
-- Not expected in practice (workers process faster than they discover), but if queue depth exceeds a threshold (e.g., 10,000), workers temporarily stop pushing new items until depth drops. This is a backpressure safety valve.
-
 **Dead blog detection**:
-- If the fetched HTML contains phrases like "This blog is private" or a 404 status, the worker marks the blog as `dead` in the cache and never re-queues it. Dead blogs are filtered out at queue-dispatch time.
+- If the fetched HTML contains phrases like "This blog is private" or a 404 status, the worker marks the blog as `dead` in the cache and never re-queues it.
 
-#### 3.8.12 Additional Concepts (recommend adding)
+#### 3.9 Rate Limiting and Politeness Delays
 
-The following concepts emerged during the description and are not yet in the design. I recommend adding them:
-
-1. **Rate limiting and politeness delays** — random delays between page fetches (e.g., 2-5s) to avoid triggering Tumblr's rate limits. Single source of truth: one constant in `config.py`.
-2. **Dead blog detection** — phrase-based filtering of private/deactivated blogs (e.g., "This blog is private", "404", "deactivated"). Already mentioned in §3.8.11 but deserves its own protocol section.
-3. **Cache persistence** — per-blog cache entries with full post data for re-analysis without re-fetching. The cache stores `{username, posts: [...], scanned_at, status}`.
-4. **Progress reporting** — periodic logging (every 30s) of queue depth, workers active, usernames indexed, errors encountered. Enables monitoring without polling.
-5. **Graceful shutdown** — signal handling (SIGINT/SIGTERM) to stop workers cleanly after current blog, persist index, close tabs, then exit. No orphaned Chrome processes.
-6. **Configuration** — a single `config.py` with all tunables: `MAX_CONCURRENT_AGENTS`, `MAX_DEPTH`, `RECRAWL_DAYS`, `DELAY_MIN`, `DELAY_MAX`, `QUEUE_OVERFLOW_THRESHOLD`, `CHROME_RESTART_TIMEOUT`, `PAGE_FETCH_TIMEOUT`.
-
-### 3.9 Rate Limiting and Politeness Delays
-
-To avoid triggering Tumblr's anti-scraping measures, the worker introduces a random delay between every page fetch. The delay is drawn uniformly from `[DELAY_MIN, DELAY_MAX]` seconds (default: 2.0–5.0). These values are defined as constants in `config.py` — the single source of truth.
+To avoid triggering Tumblr's anti-scraping measures, the worker introduces a random delay between every page fetch. The delay is drawn uniformly from `[DELAY_MIN, DELAY_MAX]` seconds (6.7–10.0). These values are defined as constants in `config.py` — the single source of truth.
 
 **Rules:**
 - Delay happens *after* each page fetch completes, before the next `Page.navigate`.
 - Probe requests (page 0 only) also get a delay.
 - Delay is applied per-worker, not globally (workers are independent; their delays don't synchronize).
-- If a fetch fails and retries, the retry gets a fresh random delay (not the backoff value — backoff is separate).
-- Backoff on errors: `delay * (2 ** attempt)` (exponential, capped at 60s).
 
-This replaces the current inconsistent delay logic scattered across `agent.py` and `tab_recovery.py`.
-
-### 3.10 Dead Blog Detection
+#### 3.10 Dead Blog Detection
 
 A blog is dead if it returns content indicating it no longer exists or is inaccessible. Detection happens inside the worker after fetching page 0:
 
-1. Check HTTP status: 404, 410 → dead.
-2. Check HTML content against a phrase list:
+1. Check HTML content against a phrase list:
    - `"This blog is private"` → private (treated as dead for crawling purposes)
    - `"deactivated"` → dead
    - `"not found"` → dead
    - `"This Tumblr account has been suspended"` → dead
-3. If dead: the worker writes a cache entry with `status: "dead"` and `scanned_at = today`. The username is *not* marked in the index as a blog to crawl (it's a dead end, not a valid blog).
-4. Dead entries are never re-crawled. On subsequent cycles, the index check finds `status: "dead"` and skips immediately.
+2. If dead: the worker writes a cache entry with `status: "dead"` and `scanned_at = today`. The username is *not* marked in the index as a blog to crawl (it's a dead end, not a valid blog).
+3. Dead entries are never re-crawled. On subsequent cycles, the index check finds `status: "dead"` and skips immediately.
 
 The phrase list is defined in `config.py` as `DEAD_PHRASES`. It is a static list — no regex, just substring matching against the fetched HTML (case-insensitive).
 
 **Why this matters:** Without dead blog detection, the pipeline would repeatedly try to crawl suspended/deactivated blogs, wasting Chrome time and queue slots on pages that will never yield usernames.
 
-### 3.11 Cache Persistence
+#### 3.11 Cache Persistence
 
 Every blog crawled gets a cache entry stored at `cache/blog/<username>.json`. The entry contains:
 
@@ -444,7 +456,7 @@ The cache serves multiple purposes:
 
 The cache is updated after each blog completes (not per-page, to reduce I/O). Cache entries are written atomically (`.tmp` + rename).
 
-### 3.12 Progress Reporting
+#### 3.12 Progress Reporting
 
 The main thread logs a status line every `PROGRESS_INTERVAL` seconds (default: 30). The line includes:
 
@@ -464,7 +476,7 @@ This enables monitoring without polling — the operator watches the log stream 
 
 Progress reporting is purely informational. It does not affect pipeline behavior.
 
-### 3.13 Graceful Shutdown
+#### 3.13 Graceful Shutdown
 
 Shutdown can be triggered by:
 - **SIGINT** (Ctrl-C) or **SIGTERM** (process manager stop signal)
@@ -486,20 +498,19 @@ The shutdown sequence:
 
 **Crash recovery on next start:** The next pipeline run reads the index and cache, skips already-completed blogs, and resumes from where the previous run stopped. Mid-blog worker termination loses that blog's partial data; the next cycle re-crawls it from the source blog's pages.
 
-### 3.14 Configuration
+#### 3.14 Configuration
 
 All pipeline tunables live in a single `config.py`:
 
 ```python
 # Concurrency
 MAX_CONCURRENT_AGENTS = 3        # worker pool size = tab count
-MAX_DEPTH = 2                    # max crawl depth from seed
 
-# Timing
-DELAY_MIN = 2.0                  # min delay between page fetches (seconds)
-DELAY_MAX = 5.0                  # max delay between page fetters
-PAGE_FETCH_TIMEOUT = 30          # CDP command timeout (seconds)
-CHROME_RESTART_TIMEOUT = 10      # seconds to wait for Chrome to become ready
+# Timing (seconds)
+DELAY_MIN = 6.7                  # min delay between page fetches (empirically validated)
+DELAY_MAX = 10.0                 # max delay between page fetches
+QUEUE_POLL_INTERVAL = 2.0        # worker sleep when queue empty
+QUEUE_EMPTY_TIMEOUT = 30.0       # worker exit after this many seconds of empty queue
 
 # Windows
 RECRAWL_DAYS = 7                 # skip blog if scanned within this window
@@ -509,54 +520,59 @@ PROGRESS_INTERVAL = 30           # seconds between status log lines
 QUEUE_OVERFLOW_THRESHOLD = 10000 # stop pushing if queue exceeds this
 
 # Paths
-CACHE_DIR = Path("./cache")
-INDEX_FILE = CACHE_DIR / "index.json"
-CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-CHROME_USER_DATA_DIR = Path("./chrome_profile")  # separate profile — user's personal Chrome untouched
-CDP_PORT = 9222
+CACHE_DIR = Path("/Users/eric/Documents/tumblr-scanner/cache")
+QUEUE_PATH = CACHE_DIR / "queue.jsonl"
+INDEX_PATH = CACHE_DIR / "index.json"
 
-# Dead blog phrases
-DEAD_PHRASES = [
-    "this blog is private",
-    "deactivated",
-    "not found",
-    "this tumblr account has been suspended",
-]
+# Chrome
+CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_USER_DATA_DIR = Path("/Users/eric/Documents/tumblr-scanner/chrome_profile")
+CDP_PORT = 9222
+CHROME_RESTART_TIMEOUT = 10
+
+# Detection phrases
+DEAD_PHRASES = [...]
+LOGIN_WALL_PHRASES = [...]
+END_PHRASES = [...]
 ```
 
-Single source of truth: every module imports from `config.py`. No magic numbers scattered across source files. To change timing, edit `config.py` — no grep-and-replace across modules.
+Single source of truth: every module imports from `config.py`. No magic numbers scattered across source files.
 
 ### 3.15 End-to-End Workflow — How the Pieces Connect
 
-The previous sections describe each component in isolation. This section describes how they function as an integrated system, from the moment the user hits Enter to the moment the final index is written.
-
 #### 3.15.1 The Spine of the System
 
-Think of the pipeline as a spine with five vertebrae:
+The pipeline has a clean **separation of duties** at the CDP boundary:
 
-1. **`config.py`** — the DNA. Every other module imports from it. Change a value here, and the entire pipeline's behavior shifts without touching source code.
-2. **`chrome_lifecycle.py`** — the foundation. No Chrome, no crawl. Every component downstream depends on this working.
-3. **`coordinator.py`** — the brain. It initializes everything, seeds the queue, monitors progress, and orchestrates shutdown.
-4. **`worker.py`** — the muscle. It does the actual crawling, extracting, and registering. All worker logic depends on the coordinator's initialization and the extractor's output.
-5. **`extractor.py`** — the sensory organ. It converts raw HTML into structured data. Without it, workers would fetch pages and learn nothing.
+- **`chrome_lifecycle.py`** — owns the *browser* lifecycle: launching Chrome, killing stale processes (filtered to our dedicated profile only), verifying the debug port is reachable. This is the only component that touches Chrome *process* management.
+- **`worker.py`** — owns the *tab* lifecycle: opening, navigating, recovering, and closing tabs. Workers never launch or kill Chrome; they only operate on tabs within the already-running browser.
+- **`agent.py`** — the pure CDP library. Provides `fetch_page_html()` and detection functions. No state, no tab ownership. Raises `TabDeadError` on CDP failure.
 
-Connecting these five are two shared structures:
+The remaining components:
+
+1. **`config.py`** — the DNA. Every other module imports from it.
+2. **`queue_integration.py`** — the startup sequence. It initializes everything (restart Chrome, seed the queue, start workers), monitors progress, and orchestrates shutdown.
+3. **`worker.py`** — the muscle. It does the actual crawling, extracting, and registering. Owns its tab lifecycle.
+4. **`extractor.py`** — the sensory organ. It converts raw HTML into structured data.
+5. **`agent.py`** — the pure CDP library. Provides `fetch_page_html()` and detection functions.
+
+Connecting these are two shared structures:
 - **The queue** — the nervous system carrying signals (work items) between coordinator and workers.
 - **The index + cache** — the memory system. Workers write to it, read from it, and make decisions based on it.
 
 #### 3.15.2 The Full Data Flow (one pass, start to finish)
 
 ```
-USER: python3 run.py the-smallest-kitten-cravings --parallel
+USER: python3 run.py the-smallest-kitten-cravings --queue
   │
   ▼
 run.py
   ├─ parse CLI args (seed blog, mode, flags)
   ├─ import config.py (all tunables resolved)
-  └─ call coordinator.run_pipeline(seed_blog)
+  └─ call queue_mode(seed_blog)
         │
         ▼
-coordinator.run_pipeline()
+queue_mode()
         │
         ├─ [1] chrome_lifecycle.restart()
         │     ├─ if Chrome already running on CDP port: verify it's our profile, else warn
@@ -566,36 +582,17 @@ coordinator.run_pipeline()
         │     ├─ poll http://127.0.0.1:9222/json/version until OK
         │     └─ return (Chrome ready, CDP reachable)
         │
-        ├─ [2] Load index from cache/index.json
-        │     ├─ if exists: deserialize into memory
-        │     └─ if missing: create empty index
+        ├─ [2] Seed the queue: enqueue(seed_blog, tier=0)
         │
-        ├─ [3] Create WorkerPool(size=config.MAX_CONCURRENT_AGENTS)
-        │     │
-        │     ├─ Worker 1 starts:
-        │     │     ├─ GET /json/new?about:blank → tab_A
-        │     │     ├─ store tab_A WebSocket URL
-        │     │     └─ enter main loop (wait for queue item)
-        │     │
-        │     ├─ Worker 2 starts:
-        │     │     ├─ GET /json/new?about:blank → tab_B
-        │     │     ├─ store tab_B WebSocket URL
-        │     │     └─ enter main loop
-        │     │
-        │     └─ Worker 3 starts:
-        │           ├─ GET /json/new?about:blank → tab_C
-        │           ├─ store tab_C WebSocket URL
-        │           └─ enter main loop
+        ├─ [3] Start worker pool (3 workers)
+        │     └─ each worker: open tab → poll queue → sleep if empty
         │
-        ├─ [4] Seed the queue: crawl_queue.put(("the-smallest-kitten-cravings", depth=0, mode="full"))
-        │
-        ├─ [5] Monitor loop (every config.PROGRESS_INTERVAL seconds):
+        ├─ [4] Monitor loop (every config.PROGRESS_INTERVAL seconds):
         │     ├─ log: [STATUS] queue=1 active=1 indexed=0 ...
         │     ├─ check: all workers alive? (task await timeout)
-        │     ├─ check: shutdown requested? (Ctrl-C, queue empty)
         │     └─ if shutdown: break monitor loop
         │
-        └─ [6] Shutdown:
+        └─ [5] Shutdown:
               ├─ set shutdown_event
               ├─ join workers (timeout=30s each)
               ├─ persist index (atomic write)
@@ -609,102 +606,84 @@ coordinator.run_pipeline()
 Once a worker pulls an item from the queue, it runs this sequence:
 
 ```
-Worker.main_loop():
+Worker.run():
   │
-  ├─ item = crawl_queue.get()     # blocks until item available
-  │   item = ("some-blog", depth=1, mode="full")
+  ├─ item = dequeue(queue_path)
+  │   item = ("some-blog", tier=1, mode="full")
   │
-  ├─ [A] Index check (under index_lock):
+  ├─ [A] Index check:
   │     entry = index.get("some-blog")
   │     if entry and entry.scanned_at == today:
   │         continue              # skip, already done today
   │
   ├─ [B] Navigate to blog:
-  │     cdp_manager.reconnect()   # refresh WS URL
+  │     _refresh_ws()             # refresh WS URL
   │     Page.navigate("https://some-blog.tumblr.com/?offset=0")
   │     wait_for_load()
   │
   ├─ [C] Dead blog check:
   │     html = Runtime.evaluate("document.documentElement.outerHTML")
-  │     if contains_dead_phrase(html) or status in (404, 410):
+  │     if contains_dead_phrase(html):
   │         cache.save_entry(username, status="dead", scanned_at=today)
   │         continue              # never re-crawl
   │
-  ├─ [D] Date probe (if mode="probe"):
+  ├─ [D] Date probe (if mode="reindex"):
   │     result = extractor.extract_from_html(html)
   │     page_date_max = result.page_date_max
   │     cache_entry = cache.load_entry(username)
   │     if page_date_max <= cache_entry.scanned_at:
   │         # no new content — update scan date, skip
   │         cache.save_entry(username, scanned_at=today)
-  │         continue
+  │         mark_done(username); continue
   │     else:
-  │         # new content — transition directly to full crawl
-  │         # (cached html becomes offset=0, no re-fetch)
-  │         posts_accumulator = result.posts
-  │         for offset in (20, 40, ...):  # start at page 2
-  │             ... (same as [E] but starting at offset=20)
+  │         # new content — crawl all pages
+  │         pass  # fall through to [E] full crawl
   │
   ├─ [E] Full crawl (if mode="full"):
-  │     posts_accumulator = []
   │     for offset in (0, 20, 40, ...):
   │         │
-  │         ├─ cdp_manager.reconnect()
-  │         ├─ Page.navigate(f"https://some-blog.tumblr.com/?offset={offset}")
+  │         ├─ Page.navigate(f"https://www.tumblr.com/{username}?offset={offset}")
   │         ├─ wait_for_load()
-  │         ├─ html = Runtime.evaluate("document.documentElement.outerHTML")
+  │         ├─ html = Runtime.evaluate("document.body.innerText")
   │         │
   │         ├─ result = extractor.extract_from_html(html)
-  │         │     ├─ BeautifulSoup parse
-  │         │     ├─ find [data-cell-id*="-post-"] elements
-  │         │     ├─ extract usernames from aria-label + rel="author"
-  │         │     ├─ extract dates from <time datetime>
-  │         │     └─ return {usernames, page_date_min, page_date_max, post_count}
   │         │
   │         ├─ for name in result.usernames:
-  │         │     under index_lock:
-  │         │       idx = index.get(name)
-  │         │       if not idx:
-  │         │         index.register(name, depth+1, source=username)
-  │         │         if depth+1 < config.MAX_DEPTH:
-  │         │           crawl_queue.put((name, depth+1, mode="full"))
-  │         │         elif depth+1 == config.MAX_DEPTH:
-  │         │           # discovered but not crawled — record for next cycle
-  │         │           pass  # status="discovered" set by index.register()
-  │         │       elif idx.scanned_at != today:
-  │         │         crawl_queue.put((name, idx.depth, mode="probe"))
-  │         │       else:
-  │         │         pass  # already done today, skip
-  │         │
-  │         ├─ posts_accumulator.extend(result.posts)
+  │         │     idx = index.get(name)
+  │         │     if not idx:
+  │         │         index.register(name, tier+1, source=username)
+  │         │         if tier+1 < config.MAX_DEPTH:
+  │         │           enqueue(queue_path, name, tier=tier+1, mode="full")
+  │         │         # depth+1 == MAX_DEPTH: registered as discovered, not crawled
+  │         │     elif idx.scanned_at != today:
+  │         │         enqueue(queue_path, name, tier=tier, mode="reindex")
+  │         │     # else: already done today, skip
   │         │
   │         ├─ delay(random.uniform(DELAY_MIN, DELAY_MAX))
-  │         │
-  │         └─ if result.posts == 0: break  # no more posts
+  │         └─ if detect_end_of_posts(html): break
   │
   │     # After all pages:
   │     cache.save_entry(username, posts=posts_accumulator,
-  │                      scanned_at=today, status="active", depth=depth)
-  │
-  └─ [F] Loop back to crawl_queue.get()
+  │                      scanned_at=today, status="active", depth=tier)
+  │     mark_done(username)
+  └─ [F] Loop back to dequeue()
 ```
 
-#### 3.15.4 How the Pieces Communicates
+#### 3.15.4 How the Pieces Communicate
 
 | From | To | Via | What |
 |------|----|-----|------|
 | `run.py` | `queue_integration` | Function call | `queue_mode(target_blog, ...)` |
 | `queue_integration` | `chrome_lifecycle` | Function call | `restart_chrome()` |
 | `queue_integration` | `work_queue` | Function call | `enqueue()` / `dequeue()` / `mark_done()` |
-| `_run_t0_producer` | `agent_run` | `await` call | Crawl target, return usernames |
-| `_drain_queue` | `agent_run` | `await` call | Crawl each queued blog |
-| `_drain_queue` | `work_queue` | `.get()` / `.put()` | Pull work, push new names |
-| `agent_run` | `cdp_manager` | Method calls | `reconnect()`, `Page.navigate()`, `Runtime.evaluate()` |
-| `cdp_manager` | Chrome process | CDP WebSocket | JSON-RPC commands |
-| Chrome | `cdp_manager` | WebSocket response | HTML content, navigation status |
-| `agent_run` | `extractor` | Function call | `extract_from_html(html)` |
-| `extractor` | `agent_run` | Return value | `{usernames, dates, post_count}` |
-| `queue_integration` | `index.json` | Atomic write | Persist on each registration |
+| `Worker` | `work_queue` | Function call | `dequeue()` / `enqueue()` / `mark_done()` |
+| `Worker` | `agent` | Function call | `crawl_blog(ws_url, username, ...)` |
+| `agent` | `cdp_use.CDPClient` | Method calls | `Page.navigate()`, `Runtime.evaluate()` |
+| `CDPClient` | Chrome tab | CDP WebSocket | JSON-RPC commands |
+| Chrome tab | `CDPClient` | WebSocket response | HTML content, navigation status |
+| `Worker` | `extractor` | Function call | `extract_from_html(html)` |
+| `extractor` | `Worker` | Return value | `{usernames, dates, post_count}` |
+| `Worker` | `index.json` | Atomic write | Persist on each registration |
 | `queue_integration` | stdout | `logger.info()` | Progress reporting |
 
 #### 3.15.5 Failure Propagation and Containment
@@ -714,10 +693,10 @@ The architecture contains failures at each level so a fault in one component doe
 | Failure | Contained by | Effect on system |
 |---------|--------------|------------------|
 | Page fetch fails (timeout) | Worker retry logic (3 attempts) | Single page lost, blog continues |
-| Tab dies (WS disconnect) | Worker recreates tab via `/json/new` | Single worker pauses ~5s, then resumes |
-| Chrome process dies | Worker signals main thread → `chrome_lifecycle.restart()` | All workers pause ~10s, then reconnect |
+| Tab dies (WS disconnect) | **Worker** closes dead tab, opens new one via `Target.createTarget` | Single worker pauses ~5s, then resumes; no other worker affected |
+| Chrome process dies | Worker signals main thread → `chrome_lifecycle.restart()` | All workers pause ~10s, then reconnect new tabs |
 | Extractor returns 0 posts | Worker logs and moves on | Blog flagged for manual review |
-| Worker thread crashes | Main thread detects via join timeout | Remaining workers continue; dead worker's tab closed in shutdown |
+| Worker task crashes | Main thread detects via `asyncio.wait` timeout | Remaining workers continue; dead worker's tab closed in shutdown |
 | Index write fails (disk full) | Atomic write (`.tmp` + rename) | In-memory index intact; retry next cycle |
 | Queue overflow | Backpressure valve (stop pushing) | Workers slow down naturally; no crash |
 | Dead blog detected | Cache `status: dead` | Never re-crawled; queue slot freed for active blogs |
@@ -759,7 +738,7 @@ Every design element exists to serve a purpose. This section compares each eleme
 
 **Verdict: FIT.**
 
-The queue is the central decoupling element. The coordinator puts the seed on the queue and never thinks about depth again. Workers pull items and run the same loop regardless of depth. A worker pushes depth+1 items *inside* the page loop, not after the blog finishes. With 3 workers, an idle worker is always available to pick up newly pushed items. The seed's first page can trigger depth-1 work before the seed's second page is fetched. This is exactly the structural parallelism the goal demands.
+The queue is the central decoupling element. The coordinator puts the seed on the queue and never thinks about depth again. Workers pull items and run the same loop regardless of depth. A worker pushes depth+1 items *inside* the page loop, not after the blog finishes. With 3 workers, an idle worker is always available to pick up newly pushed items.
 
 ---
 
@@ -769,9 +748,9 @@ The queue is the central decoupling element. The coordinator puts the seed on th
 
 **Verdict: FIT.**
 
-Worker creates tab once at startup, navigates it to each blog via `Page.navigate`, closes it only on worker death. 3 workers = 3 tabs, within Chrome's 4-tab limit. This directly fixes the tab-per-blog explosion that crashed Chrome at 30+ tabs (design history §4.1).
+Worker creates tab once at startup (via `Target.createTarget`), navigates it to each blog via `Page.navigate`, closes it only on worker death (or tab recovery). 3 workers = 3 tabs, within Chrome's 4-tab limit. This directly fixes the tab-per-blog explosion that crashed Chrome at 30+ tabs (design history §4.1).
 
-**Gap:** The design uses 3 workers, not 4. The user said "max 4 tabs acceptable." The design never justifies why 3 instead of 4. If Chrome can handle 4 tabs, leaving one idle wastes 25% of the allowed concurrency. The design should either use 4 workers or document the reason for 3 (e.g., "3 workers + 1 spare tab for the main thread if needed" — but the main thread doesn't use tabs).
+**Worker owns tab recovery.** When a tab dies mid-crawl, the worker closes it and opens a new one via `Target.createTarget`, then resumes from the last offset. The agent library does not own any tab — it raises `TabDeadError` and the worker handles recovery. This is the key fix from the parallel-boundary split: tab control lives entirely within the worker, not shared across the agent/worker boundary.
 
 ---
 
@@ -783,21 +762,15 @@ Worker creates tab once at startup, navigates it to each blog via `Page.navigate
 
 Flat JSON with `{username, depth, scanned_at, source_blog}`. Atomic writes (`.tmp` + rename) prevent corruption. Checked before dispatch (skip if scanned today). Updated immediately on extraction. The flat structure matches the user's directive: "no tier-specific indexing logic." Depth is a field, not a partition.
 
-**Gap:** Names discovered at depth 3 (found on depth-2 blogs) are registered in the index but never crawled. Their `status` is never verified — we don't know if they're dead, private, or deactivated. The index records them as discovered but unverified. The design should explicitly mark these as `status: "discovered"` (not crawled) vs. `status: "active"` (crawled and confirmed). Currently the schema doesn't distinguish.
-
 ---
 
 #### 3.16.4 Date-Aware Refresh (§3.6, §3.8.8)
 
 **Purpose:** Probe page 0, compare dates against `scanned_at`, skip unchanged blogs. Applied uniformly across all depths.
 
-**Verdict: FIT.**
+**Verdict: PARTIAL.**
 
-The worker fetches page 0, extracts `page_date_max` from `<time datetime>` elements, compares against the index's `scanned_at`. If no new content, skip. If new content, queue for full crawl. Tumblr's pagination is chronological, so page 0 always has the newest posts — if page 0 hasn't changed, nothing has. This is correct.
-
-**Inefficiency (not unfit):** The probe fetches page 0, decides "has new content," then re-queues the blog as mode="full". The full crawl starts at offset=0, refetching the same page 0 HTML. The probe's work is wasted for blogs that end up fully crawled. The design should either (a) have the probe transition directly into a full crawl without re-queuing, or (b) cache the probe's HTML and pass it to the full crawl. This is a performance gap, not a fitness gap.
-
-**Correction (applied):** The worker now caches the probe's HTML. When a probe finds new content, the worker transitions directly into the full crawl loop without re-queuing — the cached page 0 HTML is processed as offset=0 of the full crawl. This eliminates the redundant fetch.
+The current implementation uses a 7-day recrawl window (`_index_has_fresh_entry()` checks `scanned_at` age). The intended probe-then-compare-dates mechanism (§3.6) is NOT yet implemented. The blog's `page_date_max` is never compared against `scanned_at`. This is a build-phase item.
 
 ---
 
@@ -807,11 +780,7 @@ The worker fetches page 0, extracts `page_date_max` from `<time datetime>` eleme
 
 **Verdict: FIT.**
 
-`extract_from_html(html) -> dict` is a pure function. Locked selectors: `[data-cell-id*="-post-"]`, `aria-label`, `a[rel="author"]`, `<time datetime>`. Verified against real Tumblr HTML (68 posts, 77 unique, 0 false positives). Deterministic — same HTML always produces same result. No external state. This directly addresses the extractor comprehension failure (design history §12) where the assistant kept guessing at HTML structure instead of reading the data.
-
-**Gap:** The goal says "discovers usernames via reblog graphs." The extractor captures post authors and reblog sources from `aria-label` and `rel="author"`. This captures the reblog graph *transitively* (crawling blog A discovers blog B, crawling B discovers who B reblogs) rather than by inspecting a single post's full reblog trail. The design should clarify that "reblog graph" means transitive author discovery, not per-post trail extraction. The current extractor is fit for this clarified purpose, but the design's language is ambiguous.
-
-**Correction (applied):** The goal in §1 now reads: "Starts from a seed blog, discovers usernames via reblog graphs (transitive author discovery — crawling blog A discovers blog B, crawling B discovers who B reblogs)." The extractor is fit for this clarified purpose.
+`extract_from_html(html) -> dict` is a pure function. Locked selectors: `[data-cell-id*="-post-"]`, `aria-label`, `a[rel="author"]`, `<time datetime>`. Verified against real Tumblr HTML (68 posts, 77 unique, 0 false positives). Deterministic — same HTML always produces same result. No external state.
 
 ---
 
@@ -821,7 +790,7 @@ The worker fetches page 0, extracts `page_date_max` from `<time datetime>` eleme
 
 **Verdict: FIT.**
 
-Main thread (event loop) initializes, seeds the queue, monitors progress, shuts down. It never touches a Chrome tab, never fetches a page, never parses HTML. Workers are `asyncio.Task` instances. If the main thread crashes, workers continue crawling (they'll exit when the queue empties, but they won't crash). If a worker crashes, the main thread detects it (`asyncio.wait` timeout) and continues with the remaining workers.
+Main thread (event loop) initializes, seeds the queue, monitors progress, shuts down. It never touches a Chrome tab, never fetches a page, never parses HTML. Workers are `asyncio.Task` instances.
 
 ---
 
@@ -829,13 +798,9 @@ Main thread (event loop) initializes, seeds the queue, monitors progress, shuts 
 
 **Purpose:** Worker is completely independent. Does not depend on the main thread's Chrome implementation.
 
-**Verdict: FIT, with imprecise language in the design.**
+**Verdict: FIT.**
 
-Workers create their own tabs via `/json/new`, maintain their own WebSocket connections, handle their own reconnection. The main thread never holds a tab reference. This is correct.
-
-**Imprecision:** The design says "Workers survive Chrome restarts by reconnecting to their tabs (which persist across the browser-level restart if done carefully) or by recreating tabs if needed." The phrase "if done carefully" is a red flag. The actual sequence is: main thread restarts Chrome → THEN creates workers → workers create tabs. There's no scenario where workers have tabs and then Chrome restarts. If Chrome dies mid-crawl, workers recreate tabs via `/json/new`. The design should state this ordering explicitly rather than the vague "if done carefully."
-
-**Correction (applied):** The `chrome_lifecycle.restart()` in §3.15.2 now states: "if Chrome already running on CDP port: verify it's our profile, else warn" — no kill, no "carefully." Workers are created *after* Chrome restarts. The vague language is gone.
+Workers create their own tabs via `Target.createTarget`, maintain their own WebSocket connections, handle their own reconnection and tab recovery. The main thread never holds a tab reference.
 
 ---
 
@@ -845,9 +810,9 @@ Workers create their own tabs via `/json/new`, maintain their own WebSocket conn
 
 **Verdict: FIT.**
 
-Page fetch errors → 3 retries with reconnect. Tab death → recreate tab. Chrome death → main thread restarts Chrome. Extractor errors → return empty, flag for review. Index write failures → atomic write, retry next cycle. Queue overflow → backpressure valve. Dead blog → cache as dead, never re-crawl. Each failure is contained at its level. This directly addresses design history failures §4.1 (tab churn), §5.1 (error code 5), §5.2 (static WS), §6.6 (dead blogs).
+Page fetch errors → 3 retries with reconnect (worker-owned). Tab death → worker closes dead tab, opens new one, resumes from last offset. Chrome death → main thread restarts Chrome, workers reconnect new tabs. Extractor errors → return empty, flag for review. Index write failures → atomic write, retry next cycle. Queue overflow → backpressure valve. Dead blog → cache as dead, never re-crawl.
 
-**Gap:** Dead blog detection is phrase-based substring matching. Tumblr could change the wording of their private/deactivated interstitials, breaking detection. The design history notes this is the current working approach, so it's acceptable for now, but it's fragile. The design should note this as a maintenance risk.
+**Key fix:** Tab death recovery is now owned entirely by the worker. The agent library raises `TabDeadError`; the worker closes the dead tab and opens a fresh one. There is no cross-boundary tab manipulation.
 
 ---
 
@@ -857,9 +822,7 @@ Page fetch errors → 3 retries with reconnect. Tab death → recreate tab. Chro
 
 **Verdict: FIT.**
 
-The actual code (`queue_integration.py`) uses `delay_min=6.7, delay_max=10.0` between page fetches. The design doc's 2.0–5.0s range is stale — the empirical values are 6.7–10.0s.
-
-**Gap (resolved):** The design now reflects the actual code values (6.7–10.0s), confirmed by user as empirically validated.
+`DELAY_MIN=6.7, DELAY_MAX=10.0` (empirically validated). Single source of truth in `config.py`.
 
 ---
 
@@ -869,7 +832,7 @@ The actual code (`queue_integration.py`) uses `delay_min=6.7, delay_max=10.0` be
 
 **Verdict: FIT.**
 
-Per-blog JSON at `cache/blog/<username>.json` with full post data. Atomic writes. Serves all four purposes. On crash recovery, the cache shows which blogs were completed and which were in-progress.
+Per-blog JSON at `cache/blog/<username>.json` with full post data. Atomic writes. Serves all four purposes.
 
 ---
 
@@ -879,11 +842,9 @@ Per-blog JSON at `cache/blog/<username>.json` with full post data. Atomic writes
 
 **Verdict: FIT.**
 
-8-step shutdown sequence: set event → workers finish current blog → persist cache → close tabs → join workers (30s timeout) → persist index → close remaining tabs → terminate Chrome. No orphaned processes. Next run reads index + cache and resumes.
+8-step shutdown sequence: set event → workers finish current blog → persist cache → close tabs → join workers (30s timeout) → persist index → close remaining tabs → terminate Chrome.
 
-**Gap:** If a worker is force-terminated after the 30s join timeout, the blog it was mid-crawl is lost from the cache (cache is written after each blog completes, not per-page). The next cycle will rediscover that blog from the source blog's pages and re-crawl it. This is acceptable but not explicitly stated as a trade-off. The design should note: "Mid-blog worker termination loses that blog's partial data; the next cycle re-crawls it."
-
-**Correction (applied):** The design now explicitly states this trade-off in §3.13: "Mid-blog worker termination loses that blog's partial data; the next cycle re-crawls it from the source blog's pages."
+**Gap:** Mid-blog worker termination loses that blog's partial data; the next cycle re-crawls it from the source blog's pages. This is an explicit trade-off.
 
 ---
 
@@ -893,7 +854,7 @@ Per-blog JSON at `cache/blog/<username>.json` with full post data. Atomic writes
 
 **Verdict: FIT.**
 
-Every module imports from `config.py`. To change timing, edit one file. This directly addresses the delay-value inconsistency that plagued earlier versions (design history: delays were wrong at 6.7/10.0, then 2.0/3.0, scattered across `agent.py` and `tab_recovery.py`).
+Every module imports from `config.py`. To change timing, edit one file.
 
 ---
 
@@ -901,13 +862,9 @@ Every module imports from `config.py`. To change timing, edit one file. This dir
 
 **Purpose:** Safe concurrent access to shared state.
 
-**Verdict: FIT, with an unstated assumption.**
+**Verdict: FIT.**
 
-The queue is `work_queue.py` (JSONL + POSIX `flock` — safe for concurrent access). The index is written atomically (`.tmp` + rename) by the single-threaded event loop — no explicit lock needed since asyncio is single-threaded. This is correct.
-
-**Unstated assumption:** Cache writes are NOT explicitly locked. The design relies on the fact that each blog has a unique filename (`cache/blog/<username>.json`), so no two workers write the same file simultaneously. This is true, but the design should state it explicitly. If the cache ever includes shared files (e.g., a shared log), a lock would be needed.
-
-**Correction (applied):** The thread safety section §3.8.6 now states: "Cache writes require no lock because each blog has a unique filename — no two workers can write the same file simultaneously. This assumption holds as long as cache entries remain per-blog. If a shared cache file is introduced, a lock must be added."
+Queue uses `flock`, index uses atomic writes, asyncio is single-threaded. Cache writes require no lock because each blog has a unique filename.
 
 ---
 
@@ -915,16 +872,9 @@ The queue is `work_queue.py` (JSONL + POSIX `flock` — safe for concurrent acce
 
 **Purpose:** Mandated change #1 — every run starts from clean Chrome state. Never depend on prior tab state.
 
-**Verdict: TECHNICALLY FIT, POTENTIALLY UNFIT FOR THE OPERATING ENVIRONMENT.**
+**Verdict: FIT.**
 
-The coordinator calls `chrome_lifecycle.restart()` which kills existing Chrome processes and launches a new one. This guarantees clean state. Technically fit for the purpose.
-
-**Critical gap:** The user runs authenticated Chrome with their personal browsing session. Killing Chrome destroys all the user's open tabs, not just the pipeline's. This is a destructive operation that affects the user's browsing. The design does not address this. Options:
-1. Use a separate Chrome profile (`--user-data-dir=<pipeline_profile>`) so the user's personal profile is untouched.
-2. Document that the user must close Chrome before running.
-3. Use an existing Chrome instance if one is already running on the CDP port (don't restart).
-
-The design currently does none of these. As written, the pipeline is unfit for a shared browsing environment. This must be resolved before build.
+`restart_chrome()` at pipeline start. Dedicated profile (`./chrome_profile`) — user's Chrome untouched. Only kills Chrome processes whose command line contains our profile path.
 
 ---
 
@@ -934,7 +884,7 @@ The design currently does none of these. As written, the pipeline is unfit for a
 
 **Verdict: FIT.**
 
-The index is raw structured output. No summarization, no filtering, no transformation. Downstream consumers read the index as-is.
+The index is raw structured output. No summarization, no filtering, no transformation.
 
 ---
 
@@ -944,9 +894,7 @@ The index is raw structured output. No summarization, no filtering, no transform
 
 **Verdict: FIT.**
 
-The worker pushes depth+1 items only if `depth+1 < config.MAX_DEPTH` (default 2). So depth-2 blogs are crawled, their names are extracted and registered at depth=3, but depth-3 names are not enqueued. This bounds the graph as the goal requires ("crawl them to depth 2").
-
-**Gap:** Depth-3 names are registered in the index but never crawled. Their status is unknown (could be dead, private, deactivated). The index schema doesn't distinguish "discovered but not crawled" from "crawled and active." See §3.16.3 above.
+The worker pushes depth+1 items only if `depth+1 < config.MAX_DEPTH` (default 2). So depth-2 blogs are crawled, their names are extracted and registered at depth=3, but depth-3 names are not enqueued.
 
 ---
 
@@ -955,37 +903,29 @@ The worker pushes depth+1 items only if `depth+1 < config.MAX_DEPTH` (default 2)
 | # | Element | Purpose | Verdict | Gap |
 |---|---------|---------|---------|-----|
 | 1 | Queue-based parallelism | Parallel from first extraction | **FIT** | — |
-| 2 | Worker-owned tabs | Max 4 tabs, reuse | **FIT** | 3 workers justified by empirical load testing |
-| 3 | Index | Dedup, immediate registration, flat | **FIT** | status: discovered vs active resolved |
-| 4 | Date-aware refresh | Skip unchanged blogs | **FIT** | Queue-mode pipeline uses index `scanned_at` recrawl-window check (7 days) |
-| 5 | Extractor as pure function | Stateless, verified selectors | **FIT** | "Reblog graph" clarified as transitive |
+| 2 | Worker-owned tabs | Max 4 tabs, reuse | **FIT** | — |
+| 3 | Index | Dedup, immediate registration, flat | **FIT** | — |
+| 4 | Date-aware refresh | Skip unchanged blogs | **PARTIAL** | 7-day window only; probe-then-compare not implemented |
+| 5 | Extractor as pure function | Stateless, verified selectors | **FIT** | — |
 | 6 | Main thread as coordinator | No bottleneck | **FIT** | — |
-| 7 | Worker independence | No dependency on main thread | **FIT** | "If done carefully" removed |
-| 8 | Error handling | Contain failures | **FIT** | Phrase-based dead detection noted as maintenance risk |
-| 9 | Rate limiting | Avoid rate limits | **FIT** | Empirically validated values |
+| 7 | Worker independence | No dependency on main thread | **FIT** | — |
+| 8 | Error handling | Contain failures | **FIT** | — |
+| 9 | Rate limiting | Avoid rate limits | **FIT** | — |
 | 10 | Cache persistence | Re-analysis, recovery | **FIT** | — |
 | 11 | Graceful shutdown | Clean stop, no orphans | **FIT** | Mid-blog termination trade-off documented |
 | 12 | Configuration | Single source of truth | **FIT** | — |
-| 13 | Thread safety | Safe concurrent access | **FIT** | Cache write locking assumption stated |
-| 14 | Fresh Chrome restart | Clean state every run | **FIT** | Dedicated profile (`./chrome_profile`) — user's Chrome untouched |
+| 13 | Thread safety | Safe concurrent access | **FIT** | — |
+| 14 | Fresh Chrome restart | Clean state every run | **FIT** | — |
 | 15 | Raw output | No modification | **FIT** | — |
-| 16 | Depth limit | Cap at depth 2 | **FIT** | Depth-3 names marked discovered |
+| 16 | Depth limit | Cap at depth 2 | **FIT** | — |
 
 ---
 
 #### 3.16.18 Gaps Requiring Resolution Before Build
 
-**All four critical gaps have been resolved:**
+**One gap remains:**
 
-1. **Fresh Chrome is destructive** → **RESOLVED.** `chrome_lifecycle.py` uses a dedicated profile (`./chrome_profile`) via `--user-data-dir`. It only kills Chrome processes whose command line contains our profile path (`ps -ax -o pid,command` filter) — it never touches the user's personal Chrome. If our Chrome is already running, it reuses it and closes its tabs for fresh state.
-
-2. **Rate limit values are unsubstantiated** → **RESOLVED.** User confirms values are empirically validated. No change needed.
-
-3. **Depth-3 names are unverified** → **RESOLVED.** Index schema now includes `status: "discovered"` for names found but not crawled. Cache entries only written for crawled blogs.
-
-4. **Worker count is unjustified** → **RESOLVED.** User confirms 3 workers is the practical limit based on empirical load testing. 4 tabs is the Chrome limit; 3 workers keeps headroom.
-
-**All minor gaps have been corrected** (see "Correction (applied)" notes in each subsection above). The design is now fit for purpose across all 16 elements.
+1. **Date-aware refresh** (FR-7 / Mandate #2 / Fitness #4) — The current implementation uses a 7-day recrawl window. The intended probe-then-compare-dates mechanism (§3.6) is NOT yet implemented. The blog's `page_date_max` is never compared against `scanned_at`. This is a build-phase item.
 
 ---
 
@@ -1012,10 +952,11 @@ The worker pushes depth+1 items only if `depth+1 < config.MAX_DEPTH` (default 2)
 |------|-------|----------|----------|
 | Worker pool creation | 3 workers | 3 tabs open, no crash | NFR-1, NFR-2 |
 | Worker tab reuse | 1 worker, 3 blogs | 1 tab open throughout | NFR-2 |
-| Worker tab recovery | Kill tab mid-crawl | New tab created, resume from last offset | FR-11 |
-| Parallel trigger | Seed emits 5 names on page 1 | Depth-1 crawl starts before seed finishes page 2 | FR-4 |
+| Worker tab recovery | Kill tab mid-crawl | Worker closes dead tab, opens new one, resumes from last offset | FR-11 |
+| Parallel trigger | Seed emits 5 names on page 0 | Depth-1 crawl starts before seed finishes page 1 | FR-4 |
 | Depth-2 overlaps depth-1 | Depth-1 emits name | Depth-2 crawl starts immediately, while depth-1 still running | FR-4 |
-| Fresh Chrome restart | Pipeline start | Chrome killed + restarted | FR-9 |
+| Per-page enqueue | Seed blog 50 pages | T1 names enqueued after page 0, not after blog finishes | FR-4 |
+| Fresh Chrome restart | Pipeline start | Chrome killed (our profile only) + restarted | FR-9 |
 | Full pipeline (small) | Seed blog, depth cap 2 | Crawl completes, index populated at all depths | All FR |
 
 ### 4.3 Regression Tests (from design history)
@@ -1031,20 +972,22 @@ The worker pushes depth+1 items only if `depth+1 < config.MAX_DEPTH` (default 2)
 
 ---
 
-## 5. Code Review Findings (from v1 code, applied to v2 design)
+## 5. Code Review Findings (from pre-refactor code, applied to v3 design)
 
-These are the issues in the current codebase that the v2 design must resolve. They are **not** bugs in the v2 design — they are bugs the v2 design is explicitly avoiding.
+These are the issues in the pre-refactor codebase that the v3 design resolves. They are **not** bugs in the v3 design — they are bugs the v3 design is explicitly avoiding.
 
-| Issue | Location (v1) | v2 resolution |
-|-------|---------------|---------------|
+| Issue | Location (pre-refactor) | v3 resolution |
+|-------|-------------------------|---------------|
 | `close_tab()` in `finally` | `coordinator.py:1089`, `agent.py:367` | Worker owns tab; no per-blog `close_tab` |
 | Semaphore permit leak | `coordinator.py:1050` | No semaphore on tab creation; worker pool size is the limit |
 | Probe + crawl double-tab | `agent.py:362-373` | Worker probes and crawls with same tab |
-| Static WS URL | `agent.py:329,472` | `cdp_manager.reconnect()` after every navigation |
+| Static WS URL | `agent.py:329,472` | Worker `_refresh_ws()` before each blog |
 | `run.py` KeyError: 'success' | `run.py:384` | Fix `print_result()` to use `.get()` |
 | Delay values inconsistent | `agent.py:389` vs `tab_recovery.py:125` | Single source of truth for delays |
 | Cutoff-date creep | `agent.py` (removed) | Date-aware refresh replaces cutoff logic |
 | Re-index ignores index | `work_queue.py` | `index_should_skip()` checked before dispatch |
+| Cross-boundary tab recovery | `agent.py:684-692` (recovery inside agent) | **Worker owns tab recovery** — agent raises `TabDeadError`, worker closes+reopens tab |
+| `pre_existing_ws_url` dual-ownership | `agent.py:490-508` | **Removed** — agent is now a pure library; worker owns all tabs |
 
 ---
 
@@ -1067,7 +1010,7 @@ These are the issues in the current codebase that the v2 design must resolve. Th
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | Chrome crash at scale | Medium | High | Worker pool (3 tabs max), no per-blog churn |
-| WS URL staleness | Medium | Medium | `reconnect()` after every navigation |
+| WS URL staleness | Medium | Medium | Worker-owned WS refresh before each blog |
 | Index corruption | Low | Medium | Atomic writes (write to tmp, rename) |
 | Tumblr rate limiting | Medium | Low | Random delays between requests (source of truth: one constant) |
 | Date parse failure | Low | Low | Fallback to text-date regex; log warning |
@@ -1079,12 +1022,12 @@ These are the issues in the current codebase that the v2 design must resolve. Th
 | File | Purpose | Status |
 |------|---------|--------|
 | `run.py` | CLI entry, pipeline dispatch | Exists — needs `print_result()` fix |
-| `coordinator.py` | Orchestration, worker pool | Exists — needs refactor to worker pool |
-| `worker.py` | Worker class (tab owner) | **NEW** |
-| `agent.py` | Per-blog crawl (stateless) | Exists — needs refactor (remove tab ownership) |
+| `queue_integration.py` | Startup sequence (Chrome restart → seed queue → drain) | Exists — uses `Worker` class |
+| `worker.py` | Worker class (tab owner) | **Created** — owns tab lifecycle, crawl loop, recovery |
+| `agent.py` | Pure CDP library | Refactored — `crawl_blog()` accepts `ws_url`, raises `TabDeadError` |
 | `extractor.py` | HTML → usernames | Exists — canonical, unchanged |
 | `cache.py` | JSON cache, index, staleness | Exists — needs index functions |
-| `chrome_lifecycle.py` | Fresh Chrome restart | Exists — verified working |
+| `chrome_lifecycle.py` | Fresh Chrome restart (dedicated profile) | Exists — verified working |
 | `lint_modules.py` | py_compile | Exists |
 | `lint_batch.py` | py_compile + ruff | Exists |
 | `ruff_fix.py` | ruff auto-fix | Exists |
@@ -1092,15 +1035,49 @@ These are the issues in the current codebase that the v2 design must resolve. Th
 
 ---
 
-## 9. Next Steps
+## 9. Design Decisions We Considered and Rejected
+
+This section documents concepts we explored and decided against, so they don't get re-litigated.
+
+### 9.1 Semaphore-Based Concurrency Control
+**Concept:** Use `asyncio.Semaphore(4)` to cap concurrent Chrome tabs.
+**Why rejected:** Semaphores cap *concurrent* creation but `close_tab()` in `finally` still destroys/creates per task. The semaphore only prevents N-at-once, not the churn. Chrome spawns a process + grabs memory per tab open → system overload. The worker pool size *is* the concurrency limit — no semaphore needed.
+
+### 9.2 T0 Worker Special-Case (Sleep Before First Poll)
+**Concept:** T0 worker (the one that gets the seed) does NOT sleep before checking the queue. All other workers sleep for `QUEUE_POLL_INTERVAL` seconds before their first poll, giving the T0 worker time to crawl page 0 and enqueue T1 names.
+**Why rejected:** All workers are identical. The seed blog is just the first queue item. Whichever worker dequeues it first crawls it. There's no need to designate a special "T0 worker" or have other workers sleep first. All workers start immediately and poll the queue.
+
+### 9.3 Coordinator Module
+**Concept:** A separate `coordinator.py` module to manage the worker pool and startup sequence.
+**Why rejected:** The startup sequence is simple enough to live in `queue_integration.py`. Adding a separate module creates an unnecessary indirection. The "coordinator" is just the `queue_mode()` function.
+
+### 9.4 `pre_existing_ws_url` Parameter
+**Concept:** Pass the worker's tab WS URL to the agent via a `pre_existing_ws_url` parameter, so the agent can reuse the tab.
+**Why rejected:** This creates dual ownership — the worker owns the tab but the agent has a reference to it. If the agent closes the tab in its `finally` block, the worker loses its tab. The cleaner separation: the agent accepts a `ws_url` and uses it, but the worker owns all tab lifecycle decisions (including recovery).
+
+### 9.5 CDP Connection Manager (`cdp_manager.py`)
+**Concept:** A separate `CDPConnectionManager` class to handle WebSocket reconnection and URL refresh.
+**Why rejected:** The worker already owns tab lifecycle. A separate manager adds complexity without adding capability. The worker's `_refresh_ws()` method is sufficient.
+
+### 9.6 Sub-Agent Parallelism
+**Concept:** Fan out crawl tasks to sub-agents for parallel execution.
+**Why rejected:** DNS + provider-resolution + interpreter mismatches corrupted results more than they helped. Direct execution in asyncio tasks is simpler and more reliable.
+
+### 9.7 Staged T0→T1→T2 Pipeline
+**Concept:** Complete T0 (seed blog) before starting T1, complete T1 before starting T2.
+**Why rejected:** This delays parallelism until the seed blog finishes. The queue-based approach enables parallelism from the first extraction — depth-1 crawl starts before the seed blog finishes.
+
+---
+
+## 10. Next Steps
 
 1. **Review this design** — confirm goal, requirements, architecture.
 2. **Dispatch critic review** — MoA critic + 5-question critic per methodology.
 3. **Security scan** — confirm no credential leakage, no unsafe host access.
-4. **Build** — implement `worker.py`, refactor `agent.py` + `coordinator.py`, extend `cache.py`.
+4. **Build** — implement remaining items (date-aware refresh probe, SIGINT handler in `run.py`).
 5. **Test** — run unit + integration + regression tests.
 6. **Proof** — live verification against real Tumblr data.
 
 ---
 
-*End of Design Document v2 — awaiting review before build phase.*
+*End of Design Document v3 — code matches design at commit `747a406` on `worker-tab-lifecycle`.*
