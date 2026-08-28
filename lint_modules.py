@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 REPO = Path("/Users/eric/Documents/tumblr-scanner")
-MODULES = ["agent.py", "cache.py", "coordinator.py", "extractor.py", "run.py"]
+MODULES = ["agent.py", "cache.py", "extractor.py", "run.py"]
 
 for name in MODULES:
     path = REPO / name

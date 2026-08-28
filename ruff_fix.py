@@ -9,7 +9,6 @@ REPO = Path("/Users/eric/Documents/tumblr-scanner")
 MODULES = [
     "agent.py",
     "cache.py",
-    "coordinator.py",
     "extractor.py",
     "run.py",
     "lint_batch.py",
