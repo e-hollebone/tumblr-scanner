@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""
+Pre-commit hook — runs verify_diff.py against staged changes.
+
+Install (one-time, repo-local):
+    git config core.hooksPath .githooks
+
+This does NOT touch your global git hooks.
+"""
+
+import subprocess
+import sys
+
+result = subprocess.run(
+    ["python3", "verify_diff.py"],
+    cwd=".",
+)
+
+if result.returncode != 0:
+    print("\n⛔ Commit blocked by verify_diff.py — see violations above.")
+    print("   If this is a false positive, update .verify_blocklist or fix the drift.")
+    sys.exit(1)
+
+sys.exit(0)

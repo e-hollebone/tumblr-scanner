@@ -5,11 +5,14 @@ Tumblr multi-tier username crawler — CLI entry point.
 Delegates to queue_integration.queue_mode() (the only production path).
 
 Usage:
-    python run.py <target_blog>              # full T0 → T1 → T2 pipeline
-    python run.py <target_blog> --t0-only   # T0 only
-    python run.py <target_blog> --t1-only   # T0 + T1 only
-    python run.py <target_blog> --verbose   # DEBUG logging
-    python run.py <target_blog> --queue     # queue-mode: fresh Chrome, T0 producer, drain T1/T2
+    python run.py <target_blog>                  # queue-mode: fresh Chrome, T0 producer, drain T1/T2
+    python run.py <target_blog> --cache-dir DIR  # custom cache root (default: ./cache)
+    python run.py <target_blog> --t0-only        # T0 only
+    python run.py <target_blog> --t1-only        # T0 + T1 only
+    python run.py <target_blog> --t2-only        # T2 only (requires prior T0+T1 run)
+    python run.py <target_blog> --verbose        # DEBUG logging
+    python run.py <target_blog> --dry-run         # print plan, no CDP calls
+    python run.py <target_blog> --parallel       # parallel pipeline
 """
 
 from __future__ import annotations

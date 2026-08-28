@@ -1,0 +1,18 @@
+# Dropped symbols/concepts — do NOT reintroduce.
+# verify_diff.py flags any added line containing these patterns.
+#
+# Lines starting with # are comments. One pattern per line.
+# Patterns are case-sensitive substrings matched against added diff lines.
+
+recrawl_days
+RECRAWL_DAYS
+entry_is_stale
+list_stale_t1_entries
+_index_has_fresh_entry
+DEFAULT_RECRAWL_DAYS
+age_days
+three-way
+fresh → drop
+scan_window_days
+recrawl window
+7-day threshold
