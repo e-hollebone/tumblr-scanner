@@ -190,7 +190,8 @@ async def _drain_queue(
             errors += r["errors"]
             total_enqueued += r["enqueued"]
         elif isinstance(r, LoginWallDetected):
-            raise
+            # Re-raise the caught login-wall signal to halt the pipeline.
+            raise r
         elif isinstance(r, Exception):
             logger.error("Worker pool error: %s", r)
             errors += 1

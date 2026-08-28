@@ -111,10 +111,13 @@ def enqueue(
     username: str,
     state: str = "",
     tier: int = 1,
+    mode: str = "full",
 ) -> None:
     """
     Append a pending item to the queue if the username is not already present
     (in the queue, or in the index unless the index entry is still fresh).
+
+    mode: "full" for a full crawl, "reindex" for a date-probe + conditional crawl.
     """
     username = username.strip().lower()
     if not username:
@@ -139,6 +142,7 @@ def enqueue(
                     "username": username,
                     "state": state,
                     "tier": tier,
+                    "mode": mode,
                 },
             )
         finally:

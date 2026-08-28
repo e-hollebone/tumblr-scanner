@@ -183,32 +183,33 @@ def index_register(
     save_index(index_path, index)
 
 
-def index_should_skip(
+def index_status(
     index_path: Path,
     username: str,
-    page_date_max: str | None,
-) -> bool:
-    """Check if a blog should be skipped based on index date comparison.
+    recrawl_days: int,
+) -> str:
+    """Three-way index status for a username.
 
-    Returns True if the blog is already in the index AND the page's newest
-    date is not newer than the index's scanned_at (no new content).
+    Returns:
+        "fresh" — in index, scanned within recrawl_days → skip (DROP)
+        "stale" — in index, scanned before recrawl_days → reindex (date probe)
+        "new"   — not in index → full crawl
     """
-    if not page_date_max:
-        return False  # no date info → don't skip
     index = load_index(index_path)
     entry = index.get(username)
     if not entry:
-        return False  # not in index → don't skip
+        return "new"
     scanned_at = entry.get("scanned_at", "")
     if not scanned_at:
-        return False  # unknown scan date → don't skip
-    # Compare dates: skip if page's newest date <= index's scanned_at
+        return "new"
     try:
-        page_date = datetime.strptime(page_date_max[:10], "%Y-%m-%d").date()
-        index_date = datetime.strptime(scanned_at[:10], "%Y-%m-%d").date()
-        return page_date <= index_date
+        scanned_dt = datetime.fromisoformat(scanned_at)
+        age_days = (datetime.now(timezone.utc) - scanned_dt).total_seconds() / 86400
+        if age_days < recrawl_days:
+            return "fresh"
+        return "stale"
     except (ValueError, TypeError):
-        return False
+        return "new"
 
 
 def load_log(log_path: Path) -> list[dict[str, Any]]:

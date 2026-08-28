@@ -75,6 +75,12 @@ CHROME_USER_DATA_DIR = Path("/Users/eric/Documents/tumblr-scanner/chrome_profile
 CDP_PORT = 9222
 CHROME_RESTART_TIMEOUT = 10
 
+# Default CDP browser HTTP endpoint (read from /json/version at runtime).
+DEFAULT_CDP_BROWSER = f"http://localhost:{CDP_PORT}"
+
+# Default recrawl window (days) used when --recrawl-days is not given.
+DEFAULT_RECRAWL_DAYS = 7
+
 # ---------------------------------------------------------------------------
 # Extraction / Detection phrases
 # ---------------------------------------------------------------------------

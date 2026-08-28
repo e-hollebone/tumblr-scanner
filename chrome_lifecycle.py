@@ -160,16 +160,16 @@ def restart_chrome() -> dict[str, Any]:
     # Kill any leftover our-Chrome processes before launching
     kill_result = kill_chrome()
 
-    # Launch Chrome in background (open -g) to prevent focus-steal flash
-    # --args passes flags to Chrome; stdout/stderr discarded
+    # Launch Chrome directly (NOT via `open -g` — on macOS `open -g -a ...
+    # --args` silently drops the --args, so the debug port never opens).
+    # subprocess.Popen already backgrounds the process (parent doesn't wait),
+    # and we pass the binary path + flags explicitly so the debug port binds.
+    from config import CHROME_PATH
+
     try:
         subprocess.Popen(
             [
-                "open",
-                "-g",
-                "-a",
-                "Google Chrome",
-                "--args",
+                CHROME_PATH,
                 f"--remote-debugging-port={port}",
                 f"--user-data-dir={CHROME_PROFILE_DIR}",
                 "--no-first-run",
@@ -179,36 +179,54 @@ def restart_chrome() -> dict[str, Any]:
             stderr=subprocess.DEVNULL,
         )
         # Give Chrome a moment to start and open the debug port
-        time.sleep(2.0)
-        # Verify the debug port is listening
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/json/version", timeout=5
-            ) as resp:
-                info: dict[str, Any] = {}
-                try:
+        # Poll for the port with a deadline — Chrome 152 on macOS takes
+        # ~3-4s to bind the debug port; a fixed 2s sleep races it.
+        port_ready = False
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=2
+                ) as resp:
                     info = json.loads(resp.read())
-                except (json.JSONDecodeError, OSError):
-                    pass
-                return {
-                    "killed": kill_result["killed"],
-                    "remaining_after_kill": kill_result["remaining"],
-                    "restarted": True,
-                    "reused": False,
-                    "debug_port": info.get("webSocketDebuggerUrl", ""),
-                    "port": port,
-                    "status": "ok",
-                }
-        except (urllib.error.URLError, OSError):
-            return {
-                "killed": kill_result["killed"],
-                "remaining_after_kill": kill_result["remaining"],
-                "restarted": True,
-                "reused": False,
-                "debug_port": "",
-                "port": port,
-                "status": "no_debug_port",
-            }
+                    if info.get("webSocketDebuggerUrl"):
+                        port_ready = True
+                        break
+            except (urllib.error.URLError, OSError):
+                pass
+
+        if port_ready:
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=5
+                ) as resp:
+                    info: dict[str, Any] = {}
+                    try:
+                        info = json.loads(resp.read())
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                    return {
+                        "killed": kill_result["killed"],
+                        "remaining_after_kill": kill_result["remaining"],
+                        "restarted": True,
+                        "reused": False,
+                        "debug_port": info.get("webSocketDebuggerUrl", ""),
+                        "port": port,
+                        "status": "ok",
+                    }
+            except (urllib.error.URLError, OSError):
+                pass
+
+        return {
+            "killed": kill_result["killed"],
+            "remaining_after_kill": kill_result["remaining"],
+            "restarted": True,
+            "reused": False,
+            "debug_port": "",
+            "port": port,
+            "status": "no_debug_port",
+        }
     except (OSError, FileNotFoundError) as exc:
         return {
             "killed": kill_result["killed"],

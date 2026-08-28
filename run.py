@@ -21,38 +21,10 @@ from pathlib import Path
 from typing import Any
 
 # Local imports — submodules we just wrote
-from coordinator import (
-    CACHE_DIR,
-    DEFAULT_CDP_BROWSER,
-    DEFAULT_RECRAWL_DAYS,
-    LIMITS,
-    MAX_CONCURRENT_AGENTS,
-    get_t1_list_from_t0,
-    run_full_pipeline,
-    run_parallel_pipeline,
-    run_t0,
-    run_t1_batch,
-    run_t2_batch,
-    setup_logging,
-)
-from extractor import extract_from_html
-from queue_integration import queue_mode
 from agent import LoginWallDetected
-
-# Public API surface
-__all__ = [
-    "CACHE_DIR",
-    "DEFAULT_CDP_BROWSER",
-    "DEFAULT_RECRAWL_DAYS",
-    "LIMITS",
-    "MAX_CONCURRENT_AGENTS",
-    "extract_from_html",
-    "run_full_pipeline",
-    "run_t0",
-    "run_t1_batch",
-    "run_t2_batch",
-    "setup_logging",
-]
+from cache import CACHE_DIR
+from config import DEFAULT_CDP_BROWSER, DEFAULT_RECRAWL_DAYS, MAX_CONCURRENT_AGENTS
+from queue_integration import queue_mode
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,8 +99,31 @@ def main(argv: list[str] | None = None) -> int:
         print("\nError: target_blog is required", file=sys.stderr)
         return 1
 
-    setup_logging(args.verbose)
-    print(f"Verbose:  {args.verbose}")  # DEBUG
+    from logging import DEBUG, INFO, basicConfig
+
+    basicConfig(
+        level=DEBUG if args.verbose else INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    # Signal handling — graceful shutdown on Ctrl-C / SIGTERM.
+    import signal as _signal
+
+    _cancel_requested = {"flag": False}
+
+    def _request_shutdown(signum, frame):
+        _cancel_requested["flag"] = True
+        print(
+            "\n\n⚠️  Shutdown requested (SIGINT/SIGTERM). "
+            "Finishing current blog, then exiting cleanly...",
+            file=sys.stderr,
+        )
+
+    try:
+        _signal.signal(_signal.SIGINT, _request_shutdown)
+        _signal.signal(_signal.SIGTERM, _request_shutdown)
+    except ValueError:
+        pass
 
     if args.dry_run:
         print("=== DRY RUN ===")
@@ -137,125 +132,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cache:        {args.cache_dir}")
         print(f"Recrawl:      {args.recrawl_days}d")
         print(f"Concurrent:   {MAX_CONCURRENT_AGENTS}")
-        print()
-        print("Limits:")
-        for tier, lim in LIMITS.items():
-            print(
-                f"  {tier}: unique={lim['unique']} total={lim['total']} posts={lim['posts']}"
-            )
         return 0
 
     async def _run() -> dict[str, Any]:
-        if args.t0_only:
-            result = await run_t0(
-                browser_ws=args.browser,
-                target_blog=args.target_blog,
-                cache_dir=args.cache_dir,
-                recrawl_days=args.recrawl_days,
-            )
-            return {"tier": 0, "result": result, "target": args.target_blog}
-        elif args.t1_only:
-            t0_result = await run_t0(
-                browser_ws=args.browser,
-                target_blog=args.target_blog,
-                cache_dir=args.cache_dir,
-                recrawl_days=args.recrawl_days,
-            )
-            t1_list = get_t1_list_from_t0(t0_result)
-            t1_results = await run_t1_batch(
-                browser_ws=args.browser,
-                t1_usernames=t1_list,
-                cache_dir=args.cache_dir,
-                recrawl_days=args.recrawl_days,
-            )
-            return {
-                "tier": "t1",
-                "t0": t0_result,
-                "t1_results": t1_results,
-                "t1_list_size": len(t1_list),
-                "target": args.target_blog,
-            }
-        elif args.t2_only:
-            # T2-only: build T2 list from existing T1 cache entries
-            from cache import load_entry
-
-            t1_dir = args.cache_dir / "t1"
-            t2_dir = args.cache_dir / "t2"
-
-            # Gather T1 usernames from fresh cache entries
-            t1_candidates: set[str] = set()
-            if t1_dir.exists():
-                for path in t1_dir.iterdir():
-                    if path.suffix != ".json" or path.name.startswith("."):
-                        continue
-                    entry = load_entry(path)
-                    if entry and not entry.get("dead", False):
-                        t1_candidates.add(entry.get("username", path.stem))
-
-            # Build T2 list (same logic as build_t2_list_from_t1 but in CLI)
-            fresh_t2: set[str] = set()
-            if t2_dir.exists():
-                for path in t2_dir.iterdir():
-                    if path.suffix != ".json" or path.name.startswith("."):
-                        continue
-                    entry = load_entry(path)
-                    if entry and not entry.get("dead", False):
-                        fresh_t2.add(entry.get("username", path.stem))
-
-            t2_list = sorted(t1_candidates - fresh_t2)
-
-            if not t2_list:
-                print("No T2 candidates found in cache.", file=sys.stderr)
-                return {
-                    "tier": "t2",
-                    "t2_list": [],
-                    "status": "empty",
-                }
-
-            t2_results = await run_t2_batch(
-                browser_ws=args.browser,
-                t2_usernames=t2_list,
-                cache_dir=args.cache_dir,
-                recrawl_days=args.recrawl_days,
-            )
-            return {
-                "tier": "t2",
-                "t2_list": t2_list,
-                "t2_results": t2_results,
-                "target": args.target_blog,
-            }
-        elif args.parallel:
-            return await run_parallel_pipeline(
-                target_blog=args.target_blog,
-                browser_ws=args.browser,
-                cache_dir=args.cache_dir,
-                recrawl_days=args.recrawl_days,
-                verbose=args.verbose,
-            )
-        elif args.queue:
-            return await queue_mode(
-                target_blog=args.target_blog,
-                browser_ws=args.browser,
-                cache_dir=args.cache_dir,
-                recrawl_days=args.recrawl_days,
-                verbose=args.verbose,
-            )
-        else:
-            return await run_full_pipeline(
-                target_blog=args.target_blog,
-                browser_ws=args.browser,
-                cache_dir=args.cache_dir,
-                recrawl_days=args.recrawl_days,
-                verbose=args.verbose,
-            )
+        # The only production path is queue-mode: fresh Chrome, seed-on-queue,
+        # worker pool drains T1/T2 in parallel from first extraction.
+        return await queue_mode(
+            target_blog=args.target_blog,
+            browser_ws=args.browser,
+            cache_dir=args.cache_dir,
+            recrawl_days=args.recrawl_days,
+            verbose=args.verbose,
+        )
 
     try:
         result = asyncio.run(_run())
-    except LoginWallDetected as exc:
-        print(f"\n🛑  LOGIN WALL DETECTED — agent halted.")
-        print(f"   Open Chrome window and log in to Tumblr.")
+    except LoginWallDetected:
+        print("\n🛑  LOGIN WALL DETECTED — agent halted.")
+        print("   Open the Chrome window and log in to Tumblr.")
         print(f"   Then re-run: python3 run.py {args.target_blog} --queue")
-        print(f"   (Chrome is still open — your login state is preserved.)")
+        print("   (Chrome is still open — your login state is preserved.)")
         return 2
     print_result(result)
     return 0
@@ -410,16 +306,6 @@ def print_result(result: dict[str, Any]) -> None:
 
     print("=" * 60)
     print()
-
-
-def run_target_blog(target_blog: str, **kwargs: Any) -> dict[str, Any]:
-    """Programmatic entry point — run full pipeline for a target blog."""
-    return asyncio.run(
-        run_full_pipeline(
-            target_blog=target_blog,
-            **kwargs,
-        )
-    )
 
 
 if __name__ == "__main__":
