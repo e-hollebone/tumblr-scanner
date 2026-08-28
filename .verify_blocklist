@@ -3,7 +3,10 @@
 #
 # Lines starting with # are comments. One pattern per line.
 # Patterns are case-sensitive substrings matched against added diff lines.
+#
+# Each group maps to a specific NFR / design history section / user directive.
 
+# ── NFR-11: 7-day recrawl window was dropped (user directive) ──
 recrawl_days
 RECRAWL_DAYS
 entry_is_stale
@@ -11,8 +14,28 @@ list_stale_t1_entries
 _index_has_fresh_entry
 DEFAULT_RECRAWL_DAYS
 age_days
-three-way
-fresh → drop
 scan_window_days
 recrawl window
 7-day threshold
+three-way
+fresh → drop
+
+# ── NFR-4: no GUI focus steal — Chrome must NOT be launched via open -g ──
+# (open -g both drops --args AND activates the app, stealing focus)
+# Pattern "-g" catches all forms: "open -g", ["open","-g"], etc.
+-g
+
+# ── NFR-8: stable selectors only — these CSS classes are unstable ──
+# (verified against real Tumblr HTML 2026-08-20; will break on markup change)
+BSUG4
+f1x2m
+rZlUD
+.F4Tcn
+
+# ── NFR-6: no inline python ──
+python -c
+
+# ── Deleted functions (renamed/removed in refactor) ──
+# index_status() is now two-way (new/stale); "fresh" return was removed
+index_should_skip
+_enqueue_if_not_indexed
