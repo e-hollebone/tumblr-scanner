@@ -1,9 +1,8 @@
-"""
-Cache layer — JSON files, no database.
+"""Cache layer - JSON files, no database.
 
 Each blog/username entry is a JSON object with a scanned_at date.
-Re-crawl eligibility: entries older than RECRAWL_DAYS (default 7)
-are eligible for re-crawl. Newly discovered names always crawl.
+Index membership (new vs already-indexed) governs dedup - there is NO
+recrawl-window/age check. Newly discovered names always crawl.
 
 Layout:
     cache/
@@ -19,12 +18,9 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-# Default re-crawl window: 7 days
-RECRAWL_DAYS = 7
 
 # Cache root — kept inside the scanner work dir, simple and searchable
 CACHE_DIR = Path("/Users/eric/Documents/tumblr-scanner/cache")
@@ -53,29 +49,6 @@ def _parse_iso(ts: str) -> datetime:
             except ValueError:
                 continue
         raise ValueError(f"Cannot parse timestamp: {ts}")
-
-
-def entry_is_stale(entry: dict[str, Any], *, recrawl_days: int = RECRAWL_DAYS) -> bool:
-    """
-    Return True if the entry is older than recrawl_days and should be
-    eligible for re-crawl.
-
-    A missing or unparseable scanned_at means the entry is stale
-    (treat as unknown age → re-crawl).
-    """
-    ts = entry.get("scanned_at")
-    if not ts:
-        return True
-    try:
-        scanned = _parse_iso(ts)
-    except (ValueError, TypeError):
-        return True
-    # Normalize naive datetimes to UTC so the comparison with the
-    # (always-aware) cutoff doesn't raise TypeError.
-    if scanned.tzinfo is None:
-        scanned = scanned.replace(tzinfo=timezone.utc)
-    cutoff = datetime.now(scanned.tzinfo or timezone.utc) - timedelta(days=recrawl_days)
-    return scanned < cutoff
 
 
 def load_entry(path: Path) -> dict[str, Any] | None:
@@ -114,30 +87,6 @@ def append_log(log_path: Path, record: dict[str, Any]) -> None:
         os.write(fd, line.encode("utf-8"))
     finally:
         os.close(fd)
-
-
-def list_stale_t1_entries(
-    tier_dir: Path, *, recrawl_days: int = RECRAWL_DAYS
-) -> list[tuple[str, dict[str, Any]]]:
-    """
-    Return list of (username, entry) for T1 entries that are stale
-    (older than recrawl_days) and thus eligible for re-crawl.
-
-    Also returns entries that have no scanned_at (unknown age).
-    """
-    results: list[tuple[str, dict[str, Any]]] = []
-    if not tier_dir.exists():
-        return results
-    for path in sorted(tier_dir.iterdir()):
-        if path.suffix != ".json" or path.name.startswith("."):
-            continue
-        entry = load_entry(path)
-        if entry is None:
-            continue
-        username = entry.get("username") or path.stem
-        if entry_is_stale(entry, recrawl_days=recrawl_days):
-            results.append((username, entry))
-    return results
 
 
 def load_index(index_path: Path) -> dict[str, Any]:
@@ -186,30 +135,21 @@ def index_register(
 def index_status(
     index_path: Path,
     username: str,
-    recrawl_days: int,
 ) -> str:
-    """Three-way index status for a username.
+    """Two-way index status for a username.
+
+    There is no recrawl-window/age check. Index membership alone governs
+    dedup (per user directive - the 7-day concept was dropped).
 
     Returns:
-        "fresh" — in index, scanned within recrawl_days → skip (DROP)
-        "stale" — in index, scanned before recrawl_days → reindex (date probe)
+        "stale" — in index, scanned before today → reindex (date probe)
         "new"   — not in index → full crawl
     """
     index = load_index(index_path)
     entry = index.get(username)
     if not entry:
         return "new"
-    scanned_at = entry.get("scanned_at", "")
-    if not scanned_at:
-        return "new"
-    try:
-        scanned_dt = datetime.fromisoformat(scanned_at)
-        age_days = (datetime.now(timezone.utc) - scanned_dt).total_seconds() / 86400
-        if age_days < recrawl_days:
-            return "fresh"
-        return "stale"
-    except (ValueError, TypeError):
-        return "new"
+    return "stale"
 
 
 def load_log(log_path: Path) -> list[dict[str, Any]]:

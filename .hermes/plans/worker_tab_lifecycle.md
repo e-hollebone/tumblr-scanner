@@ -16,7 +16,7 @@
 ## Steps
 
 ### 1. Create `worker.py` — the Worker class
-- Init: `(browser_ws, cache_dir, index_path, recrawl_days)`
+- Init: `(browser_ws, cache_dir, index_path, wall_halt)`
 - Opens its own tab via `_new_tab_url` at startup
 - `run_blog(username, tier, mode)` — crawl loop:
   - Calls `agent.probe_blog` for reindex mode

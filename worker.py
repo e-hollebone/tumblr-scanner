@@ -39,14 +39,12 @@ class Worker:
         browser_ws: str,
         cache_dir: Path,
         index_path: Path,
-        recrawl_days: int,
         wall_halt: asyncio.Event,
     ) -> None:
         self.worker_id = worker_id
         self.browser_ws = browser_ws
         self.cache_dir = cache_dir
         self.index_path = index_path
-        self.recrawl_days = recrawl_days
         self.wall_halt = wall_halt
 
         self.ws_url: str | None = None
@@ -217,7 +215,7 @@ class Worker:
                 mode = item.get("mode", "full")
 
                 # NFR-10: index check at dispatch time
-                idx_status = index_status(self.index_path, username, self.recrawl_days)
+                idx_status = index_status(self.index_path, username)
                 if idx_status == "fresh":
                     logger.info(
                         "Worker %d: %s already indexed — skipping",
@@ -274,7 +272,7 @@ class Worker:
                         if name != seed:
                             nt = _next_tier(t)
                             action = _enqueue_by_status(
-                                queue_path, self.index_path, name, nt, self.recrawl_days
+                                queue_path, self.index_path, name, nt
                             )
                             if action in ("reindex", "full"):
                                 enqueued += 1

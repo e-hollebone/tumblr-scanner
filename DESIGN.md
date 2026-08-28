@@ -58,13 +58,14 @@ Build a robust Tumblr username crawler that:
 | NFR-1 | **Max 4 concurrent Chrome tabs** at any time | User directive (Chrome crashes ~30) |
 | NFR-2 | **Tab reuse**: one tab per worker, reused across all blogs it crawls. Never open/close per blog | Design history §4.1 |
 | NFR-3 | **Max 3 concurrent crawl agents** | Design history |
-| NFR-4 | Recrawl window (placeholder — see FR-7 for the real requirement) | Agent example (not a user requirement) | `queue_integration.py:84-86` (`age_days < recrawl_days`), default `RECRAWL_DAYS=7` in `config.py` | **SATISFIED (placeholder)** | 7-day age check works as a recrawl gate, but the real requirement is FR-7's probe-then-compare-dates mechanism. The 7-day value is an agent-introduced example, not a user directive. |
+| NFR-4 | **No GUI focus stealing**: Chrome is launched via direct `subprocess.Popen` of the Chrome binary with an explicit `--user-data-dir`, bypassing LaunchServices activation. The Chrome window must never come to the foreground / steal focus from other apps while the pipeline runs (macOS `open -a` / `open -g --args` is explicitly avoided because it both drops `--args` AND activates the app). | User directive |
 | NFR-5 | **Lint before checkin**: `py_compile` + `ruff` via script files | User directive |
 | NFR-6 | **No inline python** (`python -c` banned — write script files) | User directive |
 | NFR-7 | **Raw output only** — no modification, no summarization | User directive |
 | NFR-8 | **Stable selectors only** — `data-cell-id`, `aria-label`, `a[rel="author"]`. No CSS classes | Design history §6.2 |
 | NFR-9 | **CDP WS URL refreshed after every navigation** | Design history §5.2 |
 | NFR-10 | **Index file checked before dispatch** — skip already-indexed blogs | Design history §7.4 |
+| NFR-11 | **No recrawl-window / age-based skip** — the 7-day recrawl concept was dropped. Index membership alone governs dedup (new vs already-indexed). Date-aware refresh, where needed, is FR-7's page-0 date probe, not an age threshold. | User directive |
 
 ---
 
@@ -223,7 +224,7 @@ Step 3: Start worker pool (all workers start immediately)
 
 ### 3.6 Date-Aware Refresh Protocol (NOT YET IMPLEMENTED — see FR-7)
 
-> **Status:** This section describes the *real* design requirement (Mandated change #2). The current implementation (as of `747a406`) uses a 7-day recrawl window only (§3.8.8) — a placeholder the agent introduced as a stand-in. The probe-then-compare-dates mechanism below is the actual requirement and is a build-phase item. |
+> **Status:** This section describes the *real* design requirement (Mandated change #2). It is implemented via `probe_blog()` + reindex mode (`worker.py` → `agent.py:probe_blog`). There is **no** age-based recrawl window — the 7-day `RECRAWL_DAYS` placeholder was dropped (NFR-11). Dedup is governed purely by index membership (new vs already-indexed); date-aware refresh, where needed, is FR-7's page-0 date probe, not an age threshold. |
 
 For every blog (any depth — Tumblr treats all blogs identically):
 1. Fetch page 0 only.
@@ -347,7 +348,7 @@ Dates serve two purposes: (1) detecting whether a blog has new content since las
 
 Date extraction happens inside the extractor: `_parse_post_date(cell)` reads `<time datetime="2026-08-20T13:09:47.000Z">` and returns a `date` object. The extractor returns `page_date_min` and `page_date_max` for each page.
 
-**Current implementation (placeholder — NOT the requirement):** `_index_has_fresh_entry()` checks if a username has a `scanned_at` within `recrawl_days` (7). If fresh, it is skipped (not re-enqueued). This is a crude age-based gate the agent introduced as a stand-in. The 7-day value is an example, not a user requirement — see NFR-4.
+**Current implementation:** `_enqueue_by_status()` (`queue_integration.py`) checks the two-way index status (`new` vs `stale`). A `stale` entry is enqueued in `reindex` mode; the worker runs `probe_blog()` (`agent.py:275`) which fetches page 0, extracts `page_date_max`, and skips the full crawl only if `page_date_max <= scanned_at`. There is no age-based recrawl window — `RECRAWL_DAYS` was removed (NFR-11).
 
 **Intended implementation (the real requirement, probe-then-compare):** See §3.6 / FR-7. The probe fetches page 0, extracts `page_date_max`, compares against `scanned_at`. If `page_date_max <= scanned_at`, skip (no new posts since last scan). If `page_date_max > scanned_at`, crawl all pages. This is a build-phase item (FR-7 is PARTIAL). |
 
@@ -513,7 +514,8 @@ QUEUE_POLL_INTERVAL = 2.0        # worker sleep when queue empty
 QUEUE_EMPTY_TIMEOUT = 30.0       # worker exit after this many seconds of empty queue
 
 # Windows
-RECRAWL_DAYS = 7                 # skip blog if scanned within this window
+# (No recrawl window — RECRAWL_DAYS was dropped per NFR-11. Dedup is by
+# index membership; date-aware refresh is FR-7's page-0 probe only.)
 PROGRESS_INTERVAL = 30           # seconds between status log lines
 
 # Thresholds
@@ -770,7 +772,7 @@ Flat JSON with `{username, depth, scanned_at, source_blog}`. Atomic writes (`.tm
 
 **Verdict: PARTIAL.**
 
-The current implementation uses a 7-day recrawl window (`_index_has_fresh_entry()` checks `scanned_at` age) — this is a placeholder the agent introduced, not a user requirement (see NFR-4). The intended probe-then-compare-dates mechanism (§3.6 / FR-7) is NOT yet implemented. The blog's `page_date_max` is never compared against `scanned_at`. This is a build-phase item. |
+The current implementation uses the FR-7 page-0 date probe (`probe_blog` → `_enqueue_by_status` reindex mode) — blog `page_date_max` is compared against `scanned_at` and the crawl is skipped only if `page_date_max <= scanned_at`. There is **no** 7-day age window (that placeholder was dropped — NFR-11). |
 
 ---
 
@@ -905,7 +907,7 @@ The worker pushes depth+1 items only if `depth+1 < config.MAX_DEPTH` (default 2)
 | 1 | Queue-based parallelism | Parallel from first extraction | **FIT** | — |
 | 2 | Worker-owned tabs | Max 4 tabs, reuse | **FIT** | — |
 | 3 | Index | Dedup, immediate registration, flat | **FIT** | — |
-| 4 | Date-aware refresh | Skip unchanged blogs | **PARTIAL** | Placeholder recrawl window only (7-day age check, agent-introduced); probe-then-compare (FR-7) not implemented |
+| 4 | Date-aware refresh | Skip unchanged blogs | **FIT** | FR-7 page-0 date probe (`probe_blog`) compares `page_date_max` vs `scanned_at`; no age window (NFR-11) |
 | 5 | Extractor as pure function | Stateless, verified selectors | **FIT** | — |
 | 6 | Main thread as coordinator | No bottleneck | **FIT** | — |
 | 7 | Worker independence | No dependency on main thread | **FIT** | — |
@@ -923,9 +925,7 @@ The worker pushes depth+1 items only if `depth+1 < config.MAX_DEPTH` (default 2)
 
 #### 3.16.18 Gaps Requiring Resolution Before Build
 
-**One gap remains:**
-
-1. **Date-aware refresh** (FR-7 / Mandate #2 / Fitness #4) — The current implementation uses a 7-day recrawl window (placeholder the agent introduced, not a user requirement — see NFR-4). The intended probe-then-compare-dates mechanism (§3.6) is NOT yet implemented. The blog's `page_date_max` is never compared against `scanned_at`. This is a build-phase item. |
+**No gaps remain in the core crawl logic.** Date-aware refresh (FR-7 / Mandate #2 / Fitness #4) is implemented via `probe_blog()` + reindex mode — the blog's `page_date_max` is compared against `scanned_at` and the full crawl is skipped only when `page_date_max <= scanned_at`. There is no age-based recrawl window (the 7-day placeholder was dropped per NFR-11). The only remaining verification step is live Proof (Phase 5).
 
 ---
 
@@ -938,11 +938,9 @@ The worker pushes depth+1 items only if `depth+1 < config.MAX_DEPTH` (default 2)
 | Extractor on real HTML | `/tmp/full_page.html` | 68 posts, 77 unique | FR-4, NFR-8 |
 | Extractor on empty HTML | `""` | 0 posts, no crash | FR-4 |
 | Extractor on non-post HTML | HTML without `-post-` | 0 posts | NFR-8 |
-| Cache stale entry | Entry 8 days old | `entry_is_stale() = True` | NFR-4 |
-| Cache fresh entry | Entry 1 day old | `entry_is_stale() = False` | NFR-4 |
-| Index skip | Username in index | `index_should_skip() = True` | FR-8, NFR-10 |
-| Index no-skip | Username not in index | `index_should_skip() = False` | FR-8 |
-| Date probe | Page 0 HTML | Returns `page_date_max` | FR-7 |
+| Index skip | Username already in index | enqueued as `reindex` (probe decides) | FR-8, NFR-10 |
+| Index no-skip | Username not in index | enqueued as `full` | FR-8 |
+| Date probe | Page 0 HTML | Returns `page_date_max` | FR-7, NFR-11 |
 | Date skip | `page_date_max <= scanned_at` | Skip crawl | FR-7 |
 | Date no-skip | `page_date_max > scanned_at` | Proceed crawl | FR-7 |
 
@@ -1080,7 +1078,7 @@ This section documents concepts we explored and decided against, so they don't g
 7. **Test** — run unit + integration + regression tests. ⚠️ Partial — run-scripts pass, no pytest/coverage/E2E
 8. **Proof** — live verification against real Tumblr data (`the-smallest-kitten-cravings`). ← **next gate**
 
-**Code gap status:** None. All 11 FR + 10 NFR implemented and traced in `CODE-ANALYSIS.md`. The 7-day `RECRAWL_DAYS` is an agent placeholder (NFR-4); the real date-probe requirement (FR-7) is built via `probe_blog` + reindex mode.
+**Code gap status:** None. All 11 FR + 11 NFR implemented and traced in `CODE-ANALYSIS.md`. The 7-day `RECRAWL_DAYS` placeholder was dropped (NFR-11); date-aware refresh is FR-7's `probe_blog` page-0 date probe.
 
 ---
 

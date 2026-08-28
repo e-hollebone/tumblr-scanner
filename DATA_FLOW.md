@@ -62,7 +62,7 @@ run.py <target> --t0-only    → coordinator.run_t0()
 
 | Store | Format | Writer | Consumer | Purpose |
 |-------|--------|--------|----------|---------|
-| `cache/index.json` | JSON (atomic `.tmp`+rename) | `_write_index()` | `_index_has_fresh_entry()`, `_enqueue_if_not_indexed()` | Dedup + recrawl gate. Key=username, value={tier,status,scanned_at,usernames,dead,...} |
+| `cache/index.json` | JSON (atomic `.tmp`+rename) | `_write_index()` | `index_status()` (`cache.py`), `_enqueue_by_status()` (`queue_integration.py`) | Dedup gate. Key=username, value={tier,status,scanned_at,usernames,dead,...}. Two-way status: new (full crawl) vs stale (reindex probe). No age-based recrawl. |
 | `cache/index.lock` | flock lock file (never replaced) | `_write_index()` / `_read_index()` | — | Serializes all index.json access. **Critical:** the lock is on a stable sidecar file, NOT `index.json` itself — `os.replace()` swaps `index.json`'s inode, so flocking the data file would NOT serialize concurrent writers. |
 | `cache/queue.jsonl` | JSONL, POSIX `flock` | `enqueue()`, `mark_done()` | `dequeue()`, `queue_size()` | Work queue. State: pending→in_progress→done. Startup repair resets orphans. |
 | `cache/<tier>/<user>.json` | JSON | `cache.save_entry()` | `cache.load_entry()`, staleness check | Per-blog crawl result. `scanned_at` gates recrawl. |
@@ -81,7 +81,7 @@ Output: { usernames[], unique_count, total_count, posts_processed,
 │  agent_run(username, tier)                         │
 │                                                    │
 │  1. Check cache/<tier>/<user>.json                 │
-│     if fresh (< recrawl_days): return cached       │
+│     if already in index: enqueue as reindex (probe decides)       │
 │                                                    │
 │  2. Acquire tab_sem (asyncio.Semaphore 4)          │
 │     Create CDP tab via Target.createTarget         │
@@ -152,7 +152,7 @@ Output: { usernames[], unique_count, total_count, posts_processed,
 
 Per-blog stop: any of unique/total/post limit reached, tab death (3 retries exhausted), or no more pages.
 
-Recrawl gate: `scanned_at` in index within `recrawl_days` (7) → skip.
+Dedup gate: username already in index → enqueue as reindex (FR-7 probe decides skip-or-crawl). No age-based recrawl.
 
 ---
 
@@ -180,9 +180,9 @@ Recrawl gate: `scanned_at` in index within `recrawl_days` (7) → skip.
 
 ## 10. What Does NOT Exist (verified absent)
 
-- No separate `config.py` — tunables hardcoded in `queue_integration.py` and `coordinator.py`
+- No separate `config.py` — tunables hardcoded in `queue_integration.py` and `coordinator.py` (NOTE: `coordinator.py` is dead code, not imported at runtime)
 - No worker threads — no `Thread`, no `threading.Lock`, no `queue.Queue` in the running path
-- No probe phase — `_index_has_fresh_entry()` provides date-aware refresh without a probe mode
+- No age-based recrawl gate — FR-7 `probe_blog()` provides date-aware refresh via the page-0 date probe (no `_index_has_fresh_entry()` 7-day window)
 - No `status: discovered/active/dead` field in index writes — the field is documented in DESIGN.md but only `status` (from agent result) is written
 
 ## 11. Contention Model (proven by test_contention.py)

@@ -91,42 +91,25 @@ def _write_index(path: Path, username: str, entry: dict[str, Any]) -> None:
             pass
 
 
-def _index_has_fresh_entry(path: Path, username: str, recrawl_days: int) -> bool:
-    """Check if username already has a fresh entry in the index. Uses LOCK_SH."""
-    idx = _read_index(path)
-    entry = idx.get(username)
-    if not entry:
-        return False
-    scanned_at = entry.get("scanned_at", "")
-    if not scanned_at:
-        return False
-    try:
-        scanned_dt = datetime.fromisoformat(scanned_at)
-        age_days = (datetime.now(timezone.utc) - scanned_dt).total_seconds() / 86400
-        return age_days < recrawl_days
-    except (ValueError, TypeError):
-        return False
-
-
 def _enqueue_by_status(
     queue_path: Path,
     index_path: Path,
     username: str,
     tier: int,
-    recrawl_days: int,
 ) -> str:
-    """Enqueue a username based on its three-way index status.
+    """Enqueue a username based on its two-way index status.
 
-    Returns the action taken: "fresh" (dropped), "reindex" (date probe enqueued),
-    or "full" (full crawl enqueued).
+    Returns the action taken: "reindex" (date probe enqueued) or
+    "full" (full crawl enqueued). Names already in the index are
+    enqueued as "reindex" (FR-7 date probe decides skip-or-crawl);
+    names not in the index are enqueued as "full".
     """
-    status = index_status(index_path, username, recrawl_days)
-    if status == "fresh":
-        logger.debug("Skipping enqueue of %s — fresh index entry exists", username)
-        return "fresh"
+    status = index_status(index_path, username)
     if queue_size(queue_path) >= QUEUE_OVERFLOW_THRESHOLD:
-        logger.warning("Queue overflow (%d >= %d) — skipping enqueue of %s",
-                       queue_size(queue_path), QUEUE_OVERFLOW_THRESHOLD, username)
+        logger.warning(
+            "Queue overflow (%d >= %d) — skipping enqueue of %s",
+            queue_size(queue_path), QUEUE_OVERFLOW_THRESHOLD, username,
+        )
         return "fresh"
     if status == "stale":
         enqueue(queue_path, username, state="", tier=tier, mode="reindex")
@@ -149,7 +132,6 @@ async def _drain_queue(
     index_path: Path,
     cache_dir: Path,
     browser_ws: str,
-    recrawl_days: int,
 ) -> dict[str, Any]:
     """Drain the queue using a pool of workers. Parallel from first extraction.
 
@@ -181,7 +163,6 @@ async def _drain_queue(
                 browser_ws=browser_ws,
                 cache_dir=cache_dir,
                 index_path=index_path,
-                recrawl_days=recrawl_days,
                 wall_halt=wall_halt,
             ).run(queue_path)
         )
@@ -224,7 +205,6 @@ async def queue_mode(
     target_blog: str,
     browser_ws: str,
     cache_dir: Path,
-    recrawl_days: int,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Run the queue-mode pipeline: fresh Chrome, worker pool, parallel from first extraction.
@@ -269,7 +249,6 @@ async def queue_mode(
         index_path=INDEX_PATH,
         cache_dir=cache_dir,
         browser_ws=actual_browser_ws,
-        recrawl_days=recrawl_days,
     )
 
     total_elapsed = time.monotonic() - overall_start
@@ -280,7 +259,6 @@ async def queue_mode(
         "target_blog": target_blog,
         "browser": browser_ws,
         "cache_dir": str(cache_dir),
-        "recrawl_days": recrawl_days,
         "chrome_status": chrome_status,
         "queue_path": str(QUEUE_PATH),
         "index_path": str(INDEX_PATH),

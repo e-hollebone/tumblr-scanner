@@ -204,9 +204,11 @@ def restart_chrome() -> dict[str, Any]:
     kill_result = kill_chrome()
 
     # Launch Chrome directly (NOT via `open -g` — on macOS `open -g -a ...
-    # --args` silently drops the --args, so the debug port never opens).
-    # subprocess.Popen already backgrounds the process (parent doesn't wait),
-    # and we pass the binary path + flags explicitly so the debug port binds.
+    # --args` silently drops the --args, so the debug port never opens, AND
+    # it activates the app, stealing GUI focus. NFR-4 requires no focus
+    # steal, so we call the binary directly via subprocess.Popen with an
+    # explicit --user-data-dir. subprocess.Popen backgrounds the process
+    # (parent doesn't wait) and does not activate the GUI app.)
     from config import CHROME_PATH
 
     try:

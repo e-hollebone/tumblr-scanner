@@ -43,7 +43,6 @@ from config import (
     DELAY_MIN,
     END_PHRASES,
     LOGIN_WALL_PHRASES,
-    RECRAWL_DAYS,
 )
 from extractor import check_limit, extract_from_html
 
@@ -315,7 +314,7 @@ async def probe_blog(
 
         should_skip = False
         if index_path:
-            status = index_status(index_path, username, RECRAWL_DAYS)
+            status = index_status(index_path, username)
             should_skip = status == "fresh"
 
         return {

@@ -146,7 +146,6 @@ async def produce_target(target: str, browser_ws: str) -> int:
         post_limit=500,
         delay_min=2.0,
         delay_max=3.0,
-        recrawl_days=7,
         source_blog=None,
         cache_dir=CACHE_DIR,
         pre_existing_ws_url=None,

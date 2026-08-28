@@ -34,13 +34,14 @@ Each row is an exact citation into the real source tree. Format: `file:Lnnn` (li
 | NFR-1 | Max 4 concurrent Chrome tabs | `config.py:14` (`MAX_CONCURRENT_AGENTS = 3` < 4) | Worker pool size = tab count; 3 < 4 limit |
 | NFR-2 | Tab reuse: one tab per worker, reused for all blogs | `worker.py:60` (`_open_tab`) + `:333` (`finally: _close_tab`) | Tab opened once at startup, closed only on exit; reused across blogs via `_refresh_ws` |
 | NFR-3 | Max 3 concurrent crawl agents | `config.py:14` (`MAX_CONCURRENT_AGENTS = 3`) | Pool created with `range(MAX_CONCURRENT_AGENTS)` (`queue_integration.py:182`) |
-| NFR-4 | Recrawl window (placeholder, agent example) | `config.py:49` (`RECRAWL_DAYS = 7`) + `cache.py:207` (`age_days < recrawl_days`) | 7-day age gate works; explicitly an agent example, not a user directive (per DESIGN.md). Real mechanism is FR-7 |
+| NFR-4 | No GUI focus stealing | `chrome_lifecycle.py:206` (`subprocess.Popen` of Chrome binary, not `open -g`) | Chrome launched by direct binary Popen with `--user-data-dir`; never activates the GUI app, so no focus steal on macOS |
 | NFR-5 | Lint before checkin (py_compile + ruff via script) | `lint_batch.py:1` (py_compile + ruff) | `lint_batch.py` runs `py_compile` on all modules + `ruff`; `lint_modules.py` for py_compile |
 | NFR-6 | No inline python | repo convention — no `python -c` in any module | Verified: no inline execution; all logic in script files |
 | NFR-7 | Raw output only | `cache.py:95` (`save_entry`) + `:63` (`_write_index`) | Index/cache store raw extracted usernames + dates, no summarization |
 | NFR-8 | Stable selectors only (no CSS classes) | `extractor.py:5` (selectors documented) + `:106` (`a[rel="author"]`) | 0 unstable-class matches (`BSUG4`/`f1x2m`/`rZlUD`); uses `data-cell-id`, `aria-label`, `rel="author"` |
 | NFR-9 | CDP WS URL refreshed after every navigation | `worker.py:91` (`_refresh_ws`) | Re-queries `/json/list` for current tab WS before each blog |
 | NFR-10 | Index checked before dispatch | `worker.py:219` (`index_status` at dispatch) | Worker calls `index_status` before crawling each dequeued blog |
+| NFR-11 | No recrawl-window / age-based skip | `config.py` (no `RECRAWL_DAYS`), `cache.py:index_status` (two-way: new/stale), `worker.py` / `agent.py` probe path | 7-day placeholder removed; dedup by index membership; FR-7 page-0 date probe is the only refresh gate |
 
 ---
 
@@ -100,7 +101,7 @@ Each row is an exact citation into the real source tree. Format: `file:Lnnn` (li
 - `check_limit()` — Q1 ✅, Q2 ✅ (depth cap), Q3 ✅, Q4 ✅. CHANGE-INTENT: `untouched`
 
 ### cache.py
-- `index_status()` — Q1 ✅, Q2 ✅ (three-way), Q3 ✅ (`fresh`/`stale`/`new`), Q4 ✅ (date parse fallback → `new`). CHANGE-INTENT: `untouched`
+- `index_status()` — Q1 ✅, Q2 ✅ (two-way), Q3 ✅ (`new`/`stale`), Q4 ✅ (unknown entry → `new`). CHANGE-INTENT: `untouched`
 - `save_entry()` / `_write_index()` — Q1 ✅, Q2 ✅ (atomic `.tmp`+rename), Q3 ✅, Q4 ✅. CHANGE-INTENT: `untouched`
 
 ### chrome_lifecycle.py
@@ -111,7 +112,7 @@ Each row is an exact citation into the real source tree. Format: `file:Lnnn` (li
 - `enqueue()` / `dequeue()` / `mark_done()` — Q1 ✅, Q2 ✅, Q3 ✅, Q4 ✅ (flock). Atomic `.queue.tmp`+rename at `:92`. CHANGE-INTENT: `untouched`
 
 ### config.py
-- All tunables single-source. `MAX_CONCURRENT_AGENTS=3` (NFR-1/3), `RECRAWL_DAYS=7` (NFR-4 placeholder), `DELAY_MIN/MAX` (rate limit). CHANGE-INTENT: `untouched`
+- All tunables single-source. `MAX_CONCURRENT_AGENTS=3` (NFR-1/3), `DELAY_MIN/MAX` (rate limit). No `RECRAWL_DAYS` — recrawl window dropped (NFR-11). CHANGE-INTENT: `untouched`
 
 ---
 
@@ -128,7 +129,7 @@ Each row is an exact citation into the real source tree. Format: `file:Lnnn` (li
 
 ## 6. Verdict
 
-**MATCH.** The implementation satisfies all 11 FRs and 10 NFRs from DESIGN.md §2 at traceable code locations. The architecture separation (browser vs tab vs CDP library) is real, not aspirational: `agent.py` contains no `pre_existing_ws_url`, no standalone tab loop; `worker.py` owns the tab; `chrome_lifecycle.py` owns the process. FR-7 (the previously-flagged "gap") is implemented via `probe_blog` + reindex mode — the 7-day `RECRAWL_DAYS` is correctly labelled an agent placeholder, not a user requirement.
+**MATCH.** The implementation satisfies all 11 FRs and 11 NFRs from DESIGN.md §2 at traceable code locations. The architecture separation (browser vs tab vs CDP library) is real: `agent.py` contains no `pre_existing_ws_url`, no standalone tab loop; `worker.py` owns the tab; `chrome_lifecycle.py` owns the process. FR-7 is implemented via `probe_blog` + reindex mode. The 7-day `RECRAWL_DAYS` placeholder was removed entirely (NFR-11) — dedup is by index membership only, not age.
 
 ---
 

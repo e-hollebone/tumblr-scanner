@@ -41,12 +41,14 @@ T2_LIMITS = {"unique": 75, "total": 125, "posts": 125}
 
 LIMITS_BY_TIER = {0: T0_LIMITS, 1: T1_LIMITS, 2: T2_LIMITS}
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- # noqa
 # Windows
 # ---------------------------------------------------------------------------
 
-# Skip re-crawl if scanned within this many days.
-RECRAWL_DAYS = 7
+# NOTE: There is NO recrawl-window requirement. The user dropped the 7-day
+# recrawl concept. Index membership alone governs dedup (new vs already-
+# indexed). Date-aware refresh, where needed, is FR-7's page-0 date probe —
+# not an age-based skip. Do not reintroduce RECRAWL_DAYS.
 
 # Progress log interval (seconds).
 PROGRESS_INTERVAL = 30
@@ -77,9 +79,6 @@ CHROME_RESTART_TIMEOUT = 10
 
 # Default CDP browser HTTP endpoint (read from /json/version at runtime).
 DEFAULT_CDP_BROWSER = f"http://localhost:{CDP_PORT}"
-
-# Default recrawl window (days) used when --recrawl-days is not given.
-DEFAULT_RECRAWL_DAYS = 7
 
 # ---------------------------------------------------------------------------
 # Extraction / Detection phrases

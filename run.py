@@ -2,7 +2,7 @@
 """
 Tumblr multi-tier username crawler — CLI entry point.
 
-Delegates to coordinator.run_full_pipeline() or sub-commands.
+Delegates to queue_integration.queue_mode() (the only production path).
 
 Usage:
     python run.py <target_blog>              # full T0 → T1 → T2 pipeline
@@ -23,7 +23,7 @@ from typing import Any
 # Local imports — submodules we just wrote
 from agent import LoginWallDetected
 from cache import CACHE_DIR
-from config import DEFAULT_CDP_BROWSER, DEFAULT_RECRAWL_DAYS, MAX_CONCURRENT_AGENTS
+from config import DEFAULT_CDP_BROWSER, MAX_CONCURRENT_AGENTS
 from queue_integration import queue_mode
 
 
@@ -48,12 +48,6 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=CACHE_DIR,
         help=f"Cache root directory (default: {CACHE_DIR})",
-    )
-    parser.add_argument(
-        "--recrawl-days",
-        type=int,
-        default=DEFAULT_RECRAWL_DAYS,
-        help=f"Re-crawl window in days (default: {DEFAULT_RECRAWL_DAYS})",
     )
     parser.add_argument(
         "--verbose",
@@ -139,7 +133,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Target:       {args.target_blog}")
         print(f"Browser:      {args.browser}")
         print(f"Cache:        {args.cache_dir}")
-        print(f"Recrawl:      {args.recrawl_days}d")
         print(f"Concurrent:   {MAX_CONCURRENT_AGENTS}")
         return 0
 
@@ -150,7 +143,6 @@ def main(argv: list[str] | None = None) -> int:
             target_blog=args.target_blog,
             browser_ws=args.browser,
             cache_dir=args.cache_dir,
-            recrawl_days=args.recrawl_days,
             verbose=args.verbose,
         )
 
@@ -271,7 +263,6 @@ def print_result(result: dict[str, Any]) -> None:
         print(f"Target:      {result['target_blog']}")
         print(f"Browser:     {result.get('browser', 'N/A')}")
         print(f"Cache:       {result.get('cache_dir', 'N/A')}")
-        print(f"Recrawl:     {result.get('recrawl_days', 'N/A')}d")
         print(f"Concurrent:  {result.get('concurrent_cap', 'N/A')}")
         print()
 

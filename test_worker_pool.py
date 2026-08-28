@@ -123,7 +123,6 @@ result = asyncio.run(_drain_queue(
     index_path=INDEX,
     cache_dir=TMP,
     browser_ws="http://localhost:9222",
-    recrawl_days=7,
 ))
 
 print(f"Seed blog           : {SEED_BLOG}")
