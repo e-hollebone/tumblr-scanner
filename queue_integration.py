@@ -24,20 +24,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent import LoginWallDetected, run as agent_run
+from agent import LoginWallDetected
+from cache import index_status
 from chrome_lifecycle import restart_chrome
 from config import (
-    DELAY_MIN,
-    DELAY_MAX,
     INDEX_PATH,
-    LIMITS_BY_TIER,
     MAX_CONCURRENT_AGENTS,
-    QUEUE_EMPTY_TIMEOUT,
     QUEUE_PATH,
-    QUEUE_POLL_INTERVAL,
-    RECRAWL_DAYS,
 )
-from work_queue import dequeue, enqueue, mark_done, queue_size
+from work_queue import enqueue, queue_size
 
 logger = logging.getLogger("queue-pipeline")
 
@@ -111,20 +106,29 @@ def _index_has_fresh_entry(path: Path, username: str, recrawl_days: int) -> bool
         return False
 
 
-def _enqueue_if_not_indexed(
+def _enqueue_by_status(
     queue_path: Path,
     index_path: Path,
     username: str,
     tier: int,
     recrawl_days: int,
-) -> bool:
-    """Enqueue username if not already in index with a fresh entry."""
-    if _index_has_fresh_entry(index_path, username, recrawl_days):
+) -> str:
+    """Enqueue a username based on its three-way index status.
+
+    Returns the action taken: "fresh" (dropped), "reindex" (date probe enqueued),
+    or "full" (full crawl enqueued).
+    """
+    status = index_status(index_path, username, recrawl_days)
+    if status == "fresh":
         logger.debug("Skipping enqueue of %s — fresh index entry exists", username)
-        return False
-    enqueue(queue_path, username, state="", tier=tier)
-    logger.info("Enqueued %s (tier=%s)", username, tier)
-    return True
+        return "fresh"
+    if status == "stale":
+        enqueue(queue_path, username, state="", tier=tier, mode="reindex")
+        logger.info("Enqueued %s (tier=%s, mode=reindex)", username, tier)
+        return "reindex"
+    enqueue(queue_path, username, state="", tier=tier, mode="full")
+    logger.info("Enqueued %s (tier=%s, mode=full)", username, tier)
+    return "full"
 
 
 def _next_tier(current: int) -> int:
@@ -161,151 +165,21 @@ async def _drain_queue(
         MAX_CONCURRENT_AGENTS,
     )
 
-    async def _worker(worker_id: int) -> dict[str, int]:
-        """One worker: open a tab, refresh WS per blog, loop dequeue → crawl → mark_done.
+    # Launch the worker pool — each Worker instance owns its own tab
+    from worker import Worker
 
-        The tab is opened once and reused across every blog. It is closed
-        only when the worker exits (queue empty-timeout or wall halt).
-        """
-        my_processed = 0
-        my_errors = 0
-        my_enqueued = 0
-        ws_url: str | None = None
-        target_id: str | None = None
-        empty_since: float | None = None
-
-        try:
-            # Open ONE tab for this worker's entire lifetime
-            from agent import _new_tab_url, close_tab
-
-            ws_url, target_id = await _new_tab_url(browser_ws, "https://www.tumblr.com/")
-            logger.info("Worker %d: opened tab targetId=%s", worker_id, target_id)
-
-            while not wall_halt.is_set():
-                item = dequeue(queue_path)
-                if item is None:
-                    # Queue empty — track how long it's been empty
-                    if empty_since is None:
-                        empty_since = time.monotonic()
-                        logger.info("Worker %d: queue empty, polling...", worker_id)
-                    elif time.monotonic() - empty_since > QUEUE_EMPTY_TIMEOUT:
-                        logger.info("Worker %d: queue empty timeout — exiting", worker_id)
-                        break
-                    await asyncio.sleep(QUEUE_POLL_INTERVAL)
-                    continue
-
-                # Got work — reset empty timer
-                empty_since = None
-
-                username = item["username"]
-                tier = item.get("tier", 1)
-                logger.info("Worker %d: processing %s (tier=%s)", worker_id, username, tier)
-
-                limits = LIMITS_BY_TIER.get(tier)
-                if limits is None:
-                    logger.error("Unknown tier %s for %s — skipping", tier, username)
-                    mark_done(queue_path, username)
-                    my_errors += 1
-                    my_processed += 1
-                    continue
-
-                # Refresh WS URL before each blog (NFR-9: static WS bug fix)
-                # Re-query /json/list for the current page WS URL
-                try:
-                    from agent import _extract_browser_ws
-                    fresh_ws = await _refresh_ws_url(browser_ws, target_id)
-                    if fresh_ws:
-                        ws_url = fresh_ws
-                except Exception:
-                    pass  # Keep existing WS URL on refresh failure
-
-                kwargs = {
-                    "browser_ws": browser_ws,
-                    "username": username,
-                    "tier": tier,
-                    "unique_limit": limits["unique"],
-                    "total_limit": limits["total"],
-                    "post_limit": limits["posts"],
-                    "delay_min": DELAY_MIN,
-                    "delay_max": DELAY_MAX,
-                    "recrawl_days": recrawl_days,
-                    "source_blog": None,
-                    "cache_dir": cache_dir,
-                    "pre_existing_ws_url": ws_url,
-                }
-
-                try:
-                    result = await agent_run(**kwargs)
-                except LoginWallDetected:
-                    logger.warning(
-                        "Worker %d: LOGIN WALL DETECTED for %s — halting. "
-                        "Log in to Tumblr in the Chrome window, then re-run.",
-                        worker_id,
-                        username,
-                    )
-                    wall_halt.set()
-                    raise
-                except Exception as exc:
-                    logger.error("Worker %d: agent crashed for %s: %s", worker_id, username, exc)
-                    mark_done(queue_path, username)
-                    my_errors += 1
-                    my_processed += 1
-                    continue
-
-                # Write to index
-                index_entry = {
-                    "username": username,
-                    "tier": tier,
-                    "status": result.get("status", "unknown"),
-                    "scanned_at": datetime.now(timezone.utc).isoformat(),
-                    "unique": result.get("unique_count", 0),
-                    "total": result.get("total_count", 0),
-                    "posts": result.get("posts_processed", 0),
-                    "usernames": result.get("usernames", []),
-                    "dead": result.get("dead", False),
-                }
-                _write_index(index_path, username, index_entry)
-
-                # Enqueue discoveries at next tier
-                new_count = 0
-                for name in result.get("usernames", []):
-                    if name != username:
-                        next_t = _next_tier(tier)
-                        if _enqueue_if_not_indexed(queue_path, index_path, name, next_t, recrawl_days):
-                            new_count += 1
-                            my_enqueued += 1
-
-                logger.info(
-                    "Worker %d: done %s status=%s unique=%d new=%d",
-                    worker_id,
-                    username,
-                    result.get("status", "unknown"),
-                    result.get("unique_count", 0),
-                    new_count,
-                )
-
-                mark_done(queue_path, username)
-                my_processed += 1
-
-        finally:
-            # Close the worker's persistent tab only on exit
-            if target_id:
-                try:
-                    from agent import close_tab
-                    await close_tab(browser_ws, target_id)
-                    logger.info("Worker %d: closed tab targetId=%s", worker_id, target_id)
-                except Exception as exc:
-                    logger.warning("Worker %d: failed to close tab: %s", worker_id, exc)
-
-        return {
-            "processed": my_processed,
-            "errors": my_errors,
-            "enqueued": my_enqueued,
-        }
-
-    # Launch the worker pool
     worker_tasks = [
-        asyncio.create_task(_worker(i)) for i in range(MAX_CONCURRENT_AGENTS)
+        asyncio.create_task(
+            Worker(
+                worker_id=i,
+                browser_ws=browser_ws,
+                cache_dir=cache_dir,
+                index_path=index_path,
+                recrawl_days=recrawl_days,
+                wall_halt=wall_halt,
+            ).run(queue_path)
+        )
+        for i in range(MAX_CONCURRENT_AGENTS)
     ]
     results = await asyncio.gather(*worker_tasks, return_exceptions=True)
 
@@ -336,26 +210,6 @@ async def _drain_queue(
         "elapsed_seconds": elapsed,
         "queue_final": queue_size(queue_path),
     }
-
-
-async def _refresh_ws_url(browser_ws: str, target_id: str) -> str | None:
-    """Re-query /json/list for the current WS URL of target_id.
-
-    NFR-9: The WS URL can change after navigation (SPA route changes,
-    execution context swaps). Must refresh before each blog.
-    """
-    import urllib.request
-
-    base = browser_ws.replace("ws://", "http://").rstrip("/")
-    try:
-        with urllib.request.urlopen(f"{base}/json/list", timeout=5) as resp:
-            targets = json.loads(resp.read())
-        for t in targets:
-            if t.get("type") == "page" and t.get("id") == target_id:
-                return t.get("webSocketDebuggerUrl")
-    except Exception:
-        pass
-    return None
 
 
 async def queue_mode(
