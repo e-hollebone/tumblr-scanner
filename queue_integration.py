@@ -34,7 +34,8 @@ from config import (
     QUEUE_PATH,
 )
 from work_queue import cleanup as queue_cleanup
-from work_queue import enqueue, queue_size
+from work_queue import active_count, enqueue, queue_size
+from eventlog import info as ev, warn as ev_warn, error as ev_err
 
 logger = logging.getLogger("queue-pipeline")
 
@@ -152,6 +153,14 @@ async def _drain_queue(
         queue_size(queue_path),
         MAX_CONCURRENT_AGENTS,
     )
+    ev("coordinator", "drain_start", workers=MAX_CONCURRENT_AGENTS, queue_size=queue_size(queue_path))
+
+    # Shared "worker busy" signals: coordinator must NOT declare the crawl
+    # done while any worker is mid-crawl. active_count() alone can miss the
+    # in_progress window between dequeue and mark_done (and that is exactly
+    # what caused an early drain_complete in a prior run), so workers
+    # advertise their crawl state explicitly via these events.
+    busy_events = [asyncio.Event() for _ in range(MAX_CONCURRENT_AGENTS)]
 
     # Launch the worker pool — each Worker instance owns its own tab
     from worker import Worker
@@ -164,10 +173,38 @@ async def _drain_queue(
                 cache_dir=cache_dir,
                 index_path=index_path,
                 wall_halt=wall_halt,
+                busy_event=busy_events[i],
             ).run(queue_path)
         )
         for i in range(MAX_CONCURRENT_AGENTS)
     ]
+
+    # Coordinator-owned shutdown: workers wait indefinitely for queue items
+    # (they never self-kill on an empty queue). The coordinator decides when
+    # the whole crawl is done — when the queue has been empty for a grace
+    # period AND no worker is mid-crawl. Set wall_halt to release all workers.
+    DRAIN_IDLE_GRACE = 15.0
+    idle_since: float | None = None
+    while not wall_halt.is_set():
+        await asyncio.sleep(2.0)
+        qsize = active_count(queue_path)
+        crawling = any(e.is_set() for e in busy_events)
+        if qsize == 0 and not crawling:
+            if idle_since is None:
+                idle_since = time.monotonic()
+            elif time.monotonic() - idle_since >= DRAIN_IDLE_GRACE:
+                logger.info(
+                    "Coordinator: queue empty for %.0fs — crawl complete, halting workers",
+                    time.monotonic() - idle_since,
+                )
+                wall_halt.set()
+                break
+        else:
+            idle_since = None
+
+    elapsed = time.monotonic() - start
+    ev("coordinator", "drain_complete", processed=processed, errors=errors, new_enqueued=total_enqueued, elapsed_seconds=round(elapsed, 1))
+
     results = await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     # Aggregate stats
@@ -221,6 +258,7 @@ async def queue_mode(
     logger.info("=== Queue-mode pipeline: %s ===", target_blog)
     logger.info("Step 1: Restarting Chrome for fresh state")
     chrome_status = restart_chrome()
+    ev("pipeline", "chrome_restart", reused=chrome_status.get("reused"), killed=chrome_status.get("killed"), port=chrome_status.get("port"), login_wall=chrome_status.get("login_wall"))
     if chrome_status.get("status") not in ("ok",):
         logger.warning("Chrome restart status: %s — continuing anyway", chrome_status)
     logger.info(
@@ -237,9 +275,20 @@ async def queue_mode(
 
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # Step 0: Repair the queue before seeding. A prior run that died on the
+    # login wall (or crashed) leaves items stuck in "in_progress" with no
+    # index entry. cleanup() resets those to pending so workers can retry
+    # them. Without this, seeding T0 dedupes against the orphan and the run
+    # finds an empty pending queue → all workers idle forever.
+    repaired = queue_cleanup(QUEUE_PATH)
+    if repaired:
+        logger.info("Step 0: repaired %d stale queue entries", repaired)
+        ev("pipeline", "queue_repaired", entries=repaired)
+
     # Step 2: Seed the queue with the target blog (tier 0)
     logger.info("Step 2: Seeding queue with %s", target_blog)
     enqueue(QUEUE_PATH, target_blog, state="", tier=0)
+    ev("pipeline", "seed_queue", blog=target_blog, tier=0)
     logger.info("Queue seeded: %s (tier=0)", target_blog)
 
     # Step 3: Drain queue — workers start immediately, parallel from first extraction
