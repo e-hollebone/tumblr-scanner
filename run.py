@@ -99,11 +99,20 @@ def main(argv: list[str] | None = None) -> int:
         print("\nError: target_blog is required", file=sys.stderr)
         return 1
 
+    import logging
     from logging import DEBUG, INFO, basicConfig
+    from logging.handlers import RotatingFileHandler
+
+    log_path = Path.home() / ".hermes" / "logs" / "tumblr-scanner.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     basicConfig(
         level=DEBUG if args.verbose else INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3),
+            logging.StreamHandler(),
+        ],
     )
 
     # Signal handling — graceful shutdown on Ctrl-C / SIGTERM.

@@ -30,8 +30,10 @@ from chrome_lifecycle import restart_chrome
 from config import (
     INDEX_PATH,
     MAX_CONCURRENT_AGENTS,
+    QUEUE_OVERFLOW_THRESHOLD,
     QUEUE_PATH,
 )
+from work_queue import cleanup as queue_cleanup
 from work_queue import enqueue, queue_size
 
 logger = logging.getLogger("queue-pipeline")
@@ -122,6 +124,10 @@ def _enqueue_by_status(
     if status == "fresh":
         logger.debug("Skipping enqueue of %s — fresh index entry exists", username)
         return "fresh"
+    if queue_size(queue_path) >= QUEUE_OVERFLOW_THRESHOLD:
+        logger.warning("Queue overflow (%d >= %d) — skipping enqueue of %s",
+                       queue_size(queue_path), QUEUE_OVERFLOW_THRESHOLD, username)
+        return "fresh"
     if status == "stale":
         enqueue(queue_path, username, state="", tier=tier, mode="reindex")
         logger.info("Enqueued %s (tier=%s, mode=reindex)", username, tier)
@@ -204,6 +210,7 @@ async def _drain_queue(
         total_enqueued,
         elapsed,
     )
+    queue_cleanup(queue_path)
     return {
         "processed": processed,
         "errors": errors,

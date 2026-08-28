@@ -193,6 +193,7 @@ class Worker:
         processed = 0
         errors = 0
         enqueued = 0
+        consecutive_empty = 0
 
         try:
             await self._open_tab()
@@ -282,6 +283,18 @@ class Worker:
                     result = await self._crawl_with_recovery(
                         username, tier, mode, _enqueue_page
                     )
+                    if not result.get("usernames"):
+                        consecutive_empty += 1
+                        if consecutive_empty >= 3:
+                            logger.error(
+                                "Worker %d: %d consecutive blogs yielded 0 usernames — "
+                                "Tumblr markup may have changed. Halting pipeline.",
+                                self.worker_id, consecutive_empty,
+                            )
+                            self.wall_halt.set()
+                            return {"processed": processed, "errors": errors, "enqueued": enqueued}
+                    else:
+                        consecutive_empty = 0
                 except LoginWallDetected:
                     logger.warning(
                         "Worker %d: LOGIN WALL DETECTED for %s — halting. "

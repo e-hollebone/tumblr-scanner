@@ -56,7 +56,7 @@ PROGRESS_INTERVAL = 30
 # ---------------------------------------------------------------------------
 
 # Stop pushing new items to the queue if it exceeds this depth.
-QUEUE_OVERFLOW_THRESHOLD = 10_000
+QUEUE_OVERFLOW_THRESHOLD = 2_500
 
 # ---------------------------------------------------------------------------
 # Paths

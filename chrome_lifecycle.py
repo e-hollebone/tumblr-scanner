@@ -109,12 +109,53 @@ def _find_available_port() -> int:
     return CHROME_DEBUG_PORT
 
 
+def _probe_login_wall(port: int) -> bool:
+    """Probe a fresh Chrome tab on ``port`` for a login wall.
+
+    Navigates to tumblr.com and checks the final URL for a login redirect.
+    Returns True if the login wall is up (so the operator knows immediately).
+    """
+    import urllib.request as _ur
+    try:
+        ws_url, tab_id = None, None
+        with _ur.urlopen(f"http://127.0.0.1:{port}/json/new?https://www.tumblr.com/", timeout=5) as resp:
+            info = json.loads(resp.read())
+            tab_id = info.get("id")
+            ws_url = info.get("webSocketDebuggerUrl")
+        if not tab_id:
+            return False
+        try:
+            with _ur.urlopen(f"http://127.0.0.1:{port}/json/get", timeout=5) as resp:
+                targets = json.loads(resp.read())
+                for t in targets:
+                    if t.get("id") == tab_id:
+                        final_url = t.get("url", "")
+                        if "login" in final_url.lower() or "signup" in final_url.lower():
+                            return True
+                        return False
+        except Exception:
+            return False
+        return False
+    except Exception:
+        return False
+    finally:
+        if tab_id:
+            try:
+                _ur.urlopen(f"http://127.0.0.1:{port}/json/close/{tab_id}", timeout=5)
+            except Exception:
+                pass
+
+
 def restart_chrome() -> dict[str, Any]:
     """Restart Chrome with our dedicated profile. Never touches other Chrome.
 
     If our Chrome is already running with our profile, reuses it (closes
     all tabs for fresh state). If the default debug port is in use by
     another process, tries fallback ports.
+
+    After restart, probes the new Chrome to verify login state is preserved.
+    If the probe hits a login wall, the status includes ``login_wall: True``
+    so the operator knows immediately instead of discovering it mid-crawl.
 
     Returns status dict with the actual port used.
     """
@@ -148,6 +189,7 @@ def restart_chrome() -> dict[str, Any]:
                         pass
         except Exception:
             pass
+        login_wall = _probe_login_wall(port)
         return {
             "killed": 0,
             "remaining_after_kill": 0,
@@ -155,6 +197,7 @@ def restart_chrome() -> dict[str, Any]:
             "reused": True,
             "port": port,
             "status": "ok",
+            "login_wall": login_wall,
         }
 
     # Kill any leftover our-Chrome processes before launching
@@ -197,6 +240,7 @@ def restart_chrome() -> dict[str, Any]:
                 pass
 
         if port_ready:
+            login_wall = _probe_login_wall(port)
             try:
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/json/version", timeout=5
@@ -214,6 +258,7 @@ def restart_chrome() -> dict[str, Any]:
                         "debug_port": info.get("webSocketDebuggerUrl", ""),
                         "port": port,
                         "status": "ok",
+                        "login_wall": login_wall,
                     }
             except (urllib.error.URLError, OSError):
                 pass
