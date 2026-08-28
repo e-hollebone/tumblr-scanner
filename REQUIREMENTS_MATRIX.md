@@ -19,7 +19,7 @@
 | FR-4 | Parallelism starts the moment the first usernames are extracted — depth-1 crawl begins immediately, depth-2 begins as depth-1 emits names. No stage waits for the previous stage to finish. | User directive | `queue_integration.py:282` (seed is first queue item), `:214` (workers start immediately), `:185` (discoveries enqueued per-blog) | **SATISFIED** | Seed blog is a queue item; workers pull from the queue immediately. Tested: `test_parallel_fr4.py` — 2 blogs processed (seed + discovery). |
 | FR-5 | Extract usernames from each page: blog owner + reblog sources + original posters | Core task | `extractor.py:78-152` (`_extract_usernames_from_post`), `:92-112` (aria-label + author links) | **SATISFIED** | Locked selectors capture all three roles. |
 | FR-6 | Deduplicate usernames; skip already-cached fresh entries | Design history §7.3 | `queue_integration.py:67` (`_index_has_fresh_entry`), `:97` (`_enqueue_if_not_indexed`) | **SATISFIED** | Index checked before enqueue; fresh entries skipped. |
-| FR-7 | Date-aware refresh: probe page 0, compare dates against `scanned_at`, skip if no new content | Mandated change #2 | `queue_integration.py:67-89` (`_index_has_fresh_entry` checks `scanned_at` age) | **PARTIAL** | Recrawl window exists (7-day threshold), but there is NO probe-then-compare-dates mechanism. The design wants: probe page 0 → extract `page_date_max` → compare against `scanned_at` → skip if `page_date_max <= scanned_at`. The code only checks if `scanned_at` is older than 7 days. |
+| FR-7 | Date-aware refresh: probe page 0, extract `page_date_max` (newest post date), compare against `scanned_at` (when we last crawled), skip if `page_date_max <= scanned_at` | Mandated change #2 | `queue_integration.py:67-89` (`_index_has_fresh_entry` checks `scanned_at` age) | **PARTIAL** | Recrawl window exists (7-day threshold placeholder the agent introduced, not a user requirement), but there is NO probe-then-compare-dates mechanism. The mandate requires: probe page 0 → extract `page_date_max` → compare against `scanned_at` → skip if `page_date_max <= scanned_at`. The code only checks if `scanned_at` is older than 7 days. |
 | FR-8 | Register every extracted username in an index file immediately upon job completion | Mandated change #2 | `queue_integration.py:41` (`_write_index`), called at `:185` after each blog | **SATISFIED** | Index written per-blog, atomically (`.tmp` + rename). |
 | FR-9 | Fresh Chrome restart at pipeline start | Mandated change #1 | `queue_integration.py:282` (`restart_chrome()`) | **SATISFIED** | Chrome restarted before workers start. |
 | FR-10 | Detect dead/deactivated blogs and cache them as dead (never re-crawl) | Design history §6.6 | `agent.py:170` (`detect_dead`), `config.py:106` (`DEAD_PHRASES`), status written to index at `:178` | **SATISFIED** | Dead detection on page text only (not raw HTML), status cached. |
@@ -34,7 +34,7 @@
 | NFR-1 | Max 4 concurrent Chrome tabs at any time | User directive | `config.py:23` (`MAX_CONCURRENT_AGENTS = 3`) | **SATISFIED** | 3 workers = 3 tabs, within Chrome's 4-tab limit. |
 | NFR-2 | Tab reuse: one tab per worker, reused across all blogs. Never open/close per blog. | Design history §4.1 | `worker.py:60` (`_open_tab`), `worker.py:100` (`_close_tab` in `finally`) | **SATISFIED** | Worker owns tab for its lifetime. Tested: 3 workers open 3 tabs for N blogs. |
 | NFR-3 | Max 3 concurrent crawl agents | Design history | `config.py:23` (`MAX_CONCURRENT_AGENTS = 3`) | **SATISFIED** | Worker pool size is the concurrency limit. |
-| NFR-4 | 7-day recrawl window | User directive | `queue_integration.py:84-86` (`age_days < recrawl_days`), default `RECRAWL_DAYS=7` in `config.py` | **SATISFIED** | Recrawl window enforced at enqueue time. |
+| NFR-4 | Recrawl window (placeholder — see FR-7 for the real requirement) | Agent example (not a user requirement) | `queue_integration.py:84-86` (`age_days < recrawl_days`), default `RECRAWL_DAYS=7` in `config.py` | **SATISFIED (placeholder)** | 7-day age check works as a recrawl gate, but the real requirement is FR-7's probe-then-compare-dates mechanism. The 7-day value is an agent-introduced example, not a user directive. |
 | NFR-5 | Lint before checkin (`py_compile` + `ruff` via script files) | User directive | — | **PROCESS** | Not verifiable in code. `lint_modules.py` and `lint_batch.py` exist but are not enforced pre-commit. |
 | NFR-6 | No inline python (`python -c` banned) | User directive | — | **PROCESS** | Not verifiable in code. |
 | NFR-7 | Raw output only — no modification, no summarization | User directive | `extractor.py` returns raw usernames; `PROMO_JUNK = set()` (filter emptied) | **SATISFIED** | Index stores raw extracted names, no transformation. |
@@ -64,7 +64,7 @@
 | # | Mandate | Code Location | Verdict | Proof / Gap |
 |---|---------|---------------|---------|-------------|
 | 1 | Fresh Chrome restart at every pipeline start | `queue_integration.py:282` (`restart_chrome()`) | **SATISFIED** | Chrome restarted before workers start. |
-| 2 | Date-aware per-blog indexing (ALL tiers) — probe page 0, compare dates vs `scanned_at`, skip if no new content | `queue_integration.py:67-89` (recrawl window only) | **PARTIAL** | Recrawl window exists. No date-probe comparison. The blog's `page_date_max` is never compared against `scanned_at`. |
+| 2 | Date-aware per-blog indexing (ALL tiers) — probe page 0, extract `page_date_max`, compare dates vs `scanned_at`, skip if `page_date_max <= scanned_at` | `queue_integration.py:67-89` (recrawl window placeholder only) | **PARTIAL** | Recrawl window exists (7-day placeholder, agent-introduced). No date-probe comparison. The blog's `page_date_max` is never compared against `scanned_at`. |
 | 3 | Parallel T1/T2 dispatch — T2 starts as T1 streams in, not after all T1 completes | `queue_integration.py:282-290` (seed-on-queue, workers pull immediately) | **SATISFIED** | T0 is not a phase. Seed is a queue item; workers start immediately. |
 
 ---
@@ -98,7 +98,8 @@ Reconciling the original design verdicts with the actual code post-refactor.
 
 | Verdict | Count | IDs |
 |---------|-------|-----|
-| **SATISFIED** | 28 | FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-8, FR-9, FR-10, FR-11, NFR-1, NFR-2, NFR-3, NFR-4, NFR-7, NFR-8, NFR-9, NFR-10, constraints 1/2/3/4/5/7/8, mandates 1/3, fitness 1/2/3/5/6/7/8/9/10/12/13/14/15/16 |
+| **SATISFIED** | 28 | FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-8, FR-9, FR-10, FR-11, NFR-1, NFR-2, NFR-3, NFR-7, NFR-8, NFR-9, NFR-10, constraints 1/2/3/4/5/7/8, mandates 1/3, fitness 1/2/3/5/6/7/8/9/10/12/13/14/15/16 |
+| **SATISFIED (placeholder)** | 1 | NFR-4 |
 | **PARTIAL** | 4 | FR-7, mandate 2, fitness 4/11 |
 | **NOT SATIATED** | 0 | — |
 | **PROCESS** | 4 | NFR-5, NFR-6, constraints 6/7 |
@@ -115,7 +116,7 @@ Reconciling the original design verdicts with the actual code post-refactor.
 
 ### Remaining gaps
 
-1. **FR-7 / Mandate #2 / Fitness #4** — Date-aware refresh is a recrawl window (7-day age check), not a probe-then-compare-dates mechanism. The blog's `page_date_max` is never compared against `scanned_at`.
+1. **FR-7 / Mandate #2 / Fitness #4** — Date-aware refresh is a recrawl window (7-day age check placeholder the agent introduced, not a user requirement — see NFR-4), not a probe-then-compare-dates mechanism. The blog's `page_date_max` is never compared against `scanned_at`.
 2. **Fitness #11** — Graceful shutdown lacks a SIGINT/SIGTERM handler in `run.py`.
 
 ---
