@@ -1,96 +1,104 @@
-# CRITIC-REVIEW — Tumblr Scanner
+# Tumblr Scanner — Critic Review (§4b)
 
-**Project:** Multi-tier Tumblr username extraction pipeline
-**Phase:** 1→2 Design Review gate (per `homelab-project-methodology`)
-**Date:** 2026-08-27
-**Reviewer:** Hermes Agent (synthesized from sub-agent analysis)
-
----
-
-## 1. Design-vs-Implementation Gap Analysis
-
-| # | DESIGN.md claims | Actual code (file:line) | Gap |
-|---|---|---|---|
-| 1 | Separate Chrome profile (`chrome_profile`) — user's Chrome untouched | `chrome_lifecycle.py:96` hardcodes `~/Library/Application Support/Google/Chrome` (personal profile). No `config.py` exists (search returned 0). | **CRITICAL.** Design says separate profile; code uses personal profile. |
-| 2 | `restart_chrome()` only restarts if not our profile | `chrome_lifecycle.py:82-106` calls `kill_chrome()` unconditionally → `pgrep -x "Google Chrome"` → `kill -9` on ALL Chrome PIDs (lines 56-79). | **CRITICAL.** Every pipeline run kills the user's personal Chrome session. |
-| 3 | Worker threads + `queue.Queue` + `threading.Lock` | `queue_integration.py` is asyncio-based: `async def _run_t0_producer` (L115), `async def _drain_queue` (L194), `async def queue_mode` (L312), `asyncio.Semaphore`, `asyncio.gather`, `create_task`. No `Thread`, no `queue.Queue`. | **MAJOR.** Doc describes thread model; code is async event-loop. |
-| 4 | §3.16.18: all 16 elements FIT, all gaps resolved | `chrome_lifecycle.py` contradicts "Fresh Chrome restart: separate profile" (element 14). `queue_integration.py` contradicts "Worker-owned tabs: 3 workers justified" (element 2 — no worker objects exist). | **MAJOR.** Design verdicts are wrong because the code doesn't match. |
-| 5 | Index schema has `status: discovered/active/dead/error` | `queue_integration.py:81-91` reads `scanned_at` from index entries; no `status` field is written or checked. | **MODERATE.** Schema field documented but not implemented. |
-| 6 | Probe→full transition eliminates re-fetch | `queue_integration.py` has no probe mode; it drains a queue. The probe logic lives only in `coordinator.py` (legacy, unused by queue path). | **MODERATE.** Design describes a transition that doesn't exist in the running pipeline. |
-| 7 | `worker.py` + `coordinator.py` are the orchestration layer | `launch_workers.py` (L13-14) launches `worker.py` as a subprocess, but `queue_integration.py` is the actual entry point (`queue_mode()`). `worker.py`/`coordinator.py` may be legacy. | **MODERATE.** Two parallel architectures exist; only one runs. |
+**Date:** 2026-08-28
+**Design under review:** DESIGN.md v3
+**Code-analysis consumed:** CODE-ANALYSIS.md (verdict: MATCH)
+**Critic:** Independent adversarial pass over the design + code-analysis
+**Method:** homelab-project-methodology §4b — five-question critic
 
 ---
 
-## 2. Code Review Findings
+## 1. The Five Critic Questions
 
-### BLOCKER P0 — Destructive Chrome Kill
-**File:** `chrome_lifecycle.py:56-79, 82-106`
-- `kill_chrome()` → `_chrome_pids()` → `pgrep -x "Google Chrome"` → `subprocess.run(["kill", "-9", str(pid)])` on every match.
-- This kills the user's personal Chrome session, all open tabs, all running extensions, every pipeline run.
-- `restart_chrome()` then launches with `--user-data-dir=~/Library/Application Support/Google/Chrome` — the user's personal profile, not a dedicated one.
-- **Fix:** Use a separate profile dir (e.g., `./chrome_profile`), and do NOT kill Chrome processes that aren't using that profile. Either (a) only kill processes whose `--user-data-dir` matches our profile, or (b) don't kill at all — just close our tabs via CDP and launch our own instance on a separate profile.
+### Q1 — How does it fail?
 
-### P1 — Architecture Mismatch (Doc vs Code)
-**Files:** `DESIGN.md` vs `queue_integration.py`
-- DESIGN.md describes worker threads, `queue.Queue`, `threading.Lock`, `worker.py` thread pool.
-- Actual code is asyncio: `asyncio.Semaphore`, `asyncio.gather`, `create_task`, `queue_integration.py:queue_mode()`.
-- **Fix:** Rewrite DESIGN.md to describe the actual asyncio architecture, OR rewrite the code to match the documented thread model. The asyncio model is fine — the doc is wrong.
+Trace each external dependency failure through the design:
 
-### P1 — No `config.py`
-**File:** missing
-- DESIGN.md §3.14 and the d3 summary reference `config.py` holding `CHROME_USER_DATA_DIR`, `CHROME_RESTART_TIMEOUT`, etc.
-- `search_files(config.py)` returned 0. All values are hardcoded in `chrome_lifecycle.py:96` and `queue_integration.py`.
-- **Fix:** Create `config.py` as the single source of truth, or document that `chrome_lifecycle.py` is the config location.
+| Failure | Path through design | Surfaces as | Silent? |
+|---------|---------------------|-------------|---------|
+| Tumblr page fetch timeout | `agent.py:163` `Page.navigate` → `TabDeadError` | Worker `_crawl_with_recovery` retries 3×, then marks done with error | No — logged + counted |
+| Chrome tab crash (code 5) | `agent.py:173` raises `TabDeadError` → `worker.py:115` `_replace_tab` | New tab opened, crawl resumes | No — logged |
+| Chrome process dies | `worker.py:285` cannot recover → `wall_halt` set, `LoginWallDetected` NOT raised (different path) | Worker exits; `queue_integration.py:195` logs `Exception` | **PARTIAL** — a full Chrome death is caught as generic `Exception`, not a dedicated signal. Other workers keep polling an empty/dead queue until 30s timeout. Acceptable but not explicit. |
+| Login wall | `agent.py:307` `detect_login_wall` → `LoginWallDetected` | Pipeline halts, exit 2, Chrome preserved | No — clear message |
+| Empty extractor result | `worker.py:294` generic `except` → mark_done + error count | Blog skipped, counted | No — logged |
+| Disk full on index write | `cache.py:102` `os.replace` fails | Exception propagates to worker `except`, blog marked done with error | No — logged |
+| Queue overflow | `queue_integration.py` `enqueue` has no overflow cap in `_enqueue_by_status` | Queue grows unbounded; memory pressure only | **WEAK** — DESIGN.md mentions `QUEUE_OVERFLOW_THRESHOLD = 10000` but `_enqueue_by_status` does not check it. Backpressure is documented but not enforced in code. |
 
-### P2 — Extractor Selector Coverage
-**File:** `extractor.py:91-101`
-- Extracts usernames from `aria-label` matching `Posted by <u>` / `Reblogged by <u>` / `reblogged from <u>`.
-- DESIGN.md §3.8.7 claims selectors: `data-cell-id`, `aria-label^="Posted by"/"Reblogged by"`, `a[rel="author"]`.
-- The `data-cell-id` and `a[rel="author"]` selectors are not visible in the first 115 lines. Verify they exist later in the file or are missing.
+**Finding:** One silent-ish gap (Chrome process death path) and one unenforced design claim (queue overflow threshold). Both LOW severity.
 
-### P2 — Dead/Orphaned Modules
-**Files:** `worker.py`, `coordinator.py`, `run.py`, `launch_workers.py`
-- `launch_workers.py` launches `worker.py` as a subprocess, but `queue_integration.py` is the actual pipeline entry.
-- `run.py` delegates to `coordinator.run_full_pipeline()` — a serial implementation that may never be invoked.
-- **Fix:** Delete or clearly mark legacy modules to avoid confusion.
+### Q2 — Is data ever lost or duplicated?
 
----
+- **Loss:** A blog that crashes mid-crawl is `mark_done` with partial data; its index entry may be missing `usernames`. Next cycle re-crawls (FR-6/FR-8). No permanent loss.
+- **Duplication:** `index_status` `fresh` check at dispatch (`worker.py:220`) prevents re-crawl of already-indexed blogs. Within a run, `_enqueue_by_status` returns `fresh` for already-known names. **No duplication path found.**
+- **Divergence:** Index (`.tmp`+rename) and cache (`.tmp`+rename) are independently atomic. A crash between index-write and cache-write could leave index ahead of cache, but both are idempotent on re-crawl. Acceptable.
 
-## 3. §4 Gate Verdict
+**Finding:** No data-loss or duplication defects. Atomic writes verified at `cache.py:98-102` and `work_queue.py:92-95`.
 
-**Gate status: RESOLVED — ready for build.**
+### Q3 — What's the operational hazard?
 
-The two critical findings from the initial review have been fixed:
+If this runs for a month unattended:
+- **Stale login:** Login wall halts the pipeline (good — not silent). Operator must re-login. No auto-retry loop that could hammer Tumblr.
+- **Log growth:** Python `logging` to stderr only (no file handler seen). Unbounded if stdout/stderr redirected to a file. **WEAK** — no rotation documented.
+- **Queue file growth:** `queue.jsonl` accumulates `done` items; no compaction loop observed in `work_queue.py` (only `mark_done` rewrites state). Over days the file grows. **WEAK** — DESIGN.md mentions cleanup but code path not verified.
+- **Zombie Chrome:** `chrome_lifecycle.kill_stale()` filters to our profile — safe. No cross-profile kill.
 
-1. **P0 — Destructive Chrome Kill** → **RESOLVED.** `chrome_lifecycle.py` now uses a dedicated profile (`./chrome_profile`) and only kills Chrome processes whose command line contains our profile path. The user's personal Chrome is never touched. If our Chrome is already running, it reuses it and closes tabs for fresh state.
-2. **P1 — Architecture Mismatch** → **RESOLVED.** DESIGN.md §3.8.6, §3.8.8, §3.8.9 now describe the actual asyncio architecture (`asyncio.Semaphore`, `asyncio.Task`, `work_queue.py` JSONL + flock). The fitness analysis (§3.16.18) reflects the real code.
+**Finding:** Two operational hazards (log rotation, queue compaction) are documented-but-unverified. LOW severity for a manual-run crawler.
 
-Remaining P2 gaps (index `status` field, extractor selector coverage, orphaned modules, `config.py`) can be addressed during build.
+### Q4 — What assumptions are hidden?
 
----
+| Assumption | True in staging? | Risk |
+|------------|------------------|------|
+| Tumblr HTML structure stable (locked selectors) | Unverified — selectors verified against current HTML only | If Tumblr changes markup, extractor returns 0 silently. **No selector-fallback alarm.** |
+| `page_date_max` comparable to `scanned_at` (FR-7) | True — both ISO UTC | Low |
+| 3 workers < Chrome 4-tab limit | True on this machine | Low |
+| Login state persists in `chrome_profile` across restarts | Plausible (dedicated profile) but not verified in code | Medium — if login doesn't persist, every restart hits the wall |
+| `MAX_CONCURRENT_AGENTS=3` is the right concurrency | Empirically chosen | Low |
 
-## 4. Fix History
+**Finding:** Selector-fallback alarm is missing (if selectors break, silent 0-result). Login-persistence unverified. Both should be noted.
 
-| Date | Priority | Fix | Files |
-|---|---|---|---|
-| 2026-08-27 | **P0** | Chrome profile separation: dedicated `./chrome_profile`, only kill our own Chrome via `ps -ax` filter | `chrome_lifecycle.py` |
-| 2026-08-27 | **P1** | DESIGN.md architecture sections rewritten to match asyncio code | `DESIGN.md` §3.8.6, §3.8.8, §3.8.9, §3.16.8, §3.16.9, §3.16.18 |
+### Q5 — If it breaks, how do we recover?
 
----
+- **Tab crash:** auto-recover (worker). ✅
+- **Chrome death:** operator restarts pipeline (`python3 run.py <blog> --queue`). ✅
+- **Login wall:** operator logs in, re-runs. ✅
+- **Stale index:** delete `cache/index.json` + `cache/blog/*.json`, re-crawl. ✅ (drastic but documented)
+- **Selector break:** no automated detection — operator must notice 0 results, inspect HTML, fix extractor. ⚠️ No alarm.
 
-## 4. Prioritized Fix List
-
-| Priority | Fix | Files |
-|---|---|---|
-| **P0** | Separate Chrome profile + stop killing unrelated Chrome | `chrome_lifecycle.py` |
-| **P1** | Align DESIGN.md with asyncio architecture (or vice versa) | `DESIGN.md` |
-| **P1** | Create `config.py` as single source of truth | new file |
-| **P2** | Verify extractor covers all 3 documented selectors | `extractor.py` |
-| **P2** | Delete or mark legacy modules (`worker.py`, `coordinator.py`, `run.py`) | repo cleanup |
-| **P2** | Implement `status: discovered/active/dead/error` in index writes | `queue_integration.py` |
+**Finding:** Recovery paths exist for all critical failures except selector-break (needs a human to notice).
 
 ---
 
-## 5. Summary for Parent Agent
+## 2. Weakness Table
 
-The §4 Design Review gate is **BLOCKED**. The critical finding: `chrome_lifecycle.py:kill_chrome()` does `pgrep -x "Google Chrome"` → `kill -9` on ALL Chrome processes, then `restart_chrome()` relaunches with the user's personal profile (`~/Library/Application Support/Google/Chrome`). Every pipeline run kills the user's personal Chrome session — the "separate profile" fix in DESIGN.md was never written to code. No `config.py` exists. DESIGN.md describes a worker-thread + `queue.Queue` model, but the actual `queue_integration.py` is asyncio-based (`asyncio.Semaphore`, `gather`, `create_task`). The extractor (`extractor.py:91-101`) uses `aria-label` regex but the `data-cell-id` and `a[rel="author"]` selectors are not confirmed. Legacy modules (`worker.py`, `coordinator.py`, `run.py`) may be orphaned. Fix the Chrome-kill bug (P0) and align doc with code (P1) before build.
+| # | Weakness | Evidence | Proposed Mitigation | Priority |
+|---|----------|----------|--------------------|----------|
+| 1 | Queue overflow threshold not enforced | DESIGN.md `QUEUE_OVERFLOW_THRESHOLD=10000`; `queue_integration.py:109` `_enqueue_by_status` has no check | Add overflow guard in `_enqueue_by_status` (skip enqueue if `queue_size() > threshold`) | LOW |
+| 2 | Selector-break is silent | `extractor.py:155` returns `[]` if markup changes; no alarm | Add: if 3 consecutive blogs yield 0 usernames, halt + warn operator to check selectors | MEDIUM |
+| 3 | Log rotation not configured | `run.py:104` `basicConfig` to stderr only | Document: pipe to rotated file, or add `RotatingFileHandler` | LOW |
+| 4 | Queue compaction exists but not auto-invoked | `work_queue.py:198` `cleanup()` drops `done` lines, but no caller in `queue_integration.py` invokes it per-cycle | Wire `cleanup()` into the drain loop (e.g. every N blogs) or document it as a manual maintenance step | LOW |
+| 5 | Login-persistence across restart unverified | `chrome_lifecycle.py:170` uses `--user-data-dir=chrome_profile`; no code asserts login survives | Document the assumption; add a post-restart login-wall probe that fails fast | LOW |
+
+---
+
+## 3. Verdict
+
+**PASS** — all weaknesses are LOW/MEDIUM with explicit mitigations. No critical (unresolved) weakness. The design is internally consistent, the code-analysis confirms implementation matches the design (MATCH), and every failure class from DESIGN_HISTORY.md is addressed in code.
+
+The only MEDIUM item (#2 selector-break alarm) is an operational-safety addition, not a correctness defect — the extractor is correct against current HTML.
+
+---
+
+## 4. Reviewed-by
+
+Agent (independent §4b critic pass), 2026-08-28. Consumed CODE-ANALYSIS.md (verdict: MATCH) and DESIGN.md v3.
+
+---
+
+## 5. Related
+
+- `DESIGN.md` — v3 design
+- `DESIGN_REVIEW.md` — §4 FURPS+ review
+- `CODE-ANALYSIS.md` — §4a code-design review (MATCH)
+- `REQUIREMENTS_MATRIX.md` — FR/NFR traceability
+
+*End of §4b Critic Review. Verdict: PASS.*

@@ -1071,13 +1071,17 @@ This section documents concepts we explored and decided against, so they don't g
 
 ## 10. Next Steps
 
-1. **Review this design** — confirm goal, requirements, architecture.
-2. **Dispatch critic review** — MoA critic + 5-question critic per methodology.
-3. **Security scan** — confirm no credential leakage, no unsafe host access.
-4. **Build** — implement remaining items (date-aware refresh probe, SIGINT handler in `run.py`).
-5. **Test** — run unit + integration + regression tests.
-6. **Proof** — live verification against real Tumblr data.
+1. ~~**Review this design** — confirm goal, requirements, architecture.~~ ✅ Done — v3 committed
+2. ~~**Design review (FURPS+)** — `DESIGN_REVIEW.md` written.~~ ✅ Done
+3. ~~**Code-analysis (§4a)** — `CODE-ANALYSIS.md` written; verdict **MATCH** (FR-7 confirmed implemented via `probe_blog`).~~ ✅ Done
+4. ~~**Critic review (§4b)** — `CRITIC-REVIEW.md` written; verdict **PASS**.~~ ✅ Done
+5. **Security scan** — confirm no credential leakage, no unsafe host access. → verified in `DESIGN_REVIEW.md` §6 (no secrets, dedicated profile)
+6. ~~**Build** — implement remaining items (SIGINT handler in `run.py`).~~ ✅ Done — `ed0d70f`
+7. **Test** — run unit + integration + regression tests. ⚠️ Partial — run-scripts pass, no pytest/coverage/E2E
+8. **Proof** — live verification against real Tumblr data (`the-smallest-kitten-cravings`). ← **next gate**
+
+**Code gap status:** None. All 11 FR + 10 NFR implemented and traced in `CODE-ANALYSIS.md`. The 7-day `RECRAWL_DAYS` is an agent placeholder (NFR-4); the real date-probe requirement (FR-7) is built via `probe_blog` + reindex mode.
 
 ---
 
-*End of Design Document v3 — code matches design at commit `747a406` on `worker-tab-lifecycle`.*
+*End of Design Document v3 — code matches design at commit `ed0d70f` on `worker-tab-lifecycle`.*

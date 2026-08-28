@@ -188,22 +188,26 @@ Baseline commit: `ed0d70f` on `worker-tab-lifecycle`.
 
 ## 8. Weaknesses & Mitigations
 
+> **Self-correction (2026-08-28):** The earlier draft of this review listed two
+> weaknesses (#1 FR-7 not built, #2 `run.py` KeyError) that the §4a code-analysis
+> (`CODE-ANALYSIS.md`) proved FALSE. FR-7 IS implemented (`agent.py:275`
+> `probe_blog` + `worker.py:231` reindex mode). `print_result()` uses `.get()`
+> throughout and only reaches `[]`-access branches for legacy non-queue tiers that
+> `queue_mode` never returns. Both removed below.
+
 | # | Weakness | Evidence | Mitigation | Priority |
 |---|---|---|---|---|
-| 1 | FR-7 probe-then-compare not built | `cache.index_status()` uses 7-day age, not `page_date_max` | Implement probe: fetch page 0, extract `page_date_max`, compare to `scanned_at`. Replace age gate. | **HIGH** |
-| 2 | `run.py` `print_result()` KeyError: 'success' | `run.py:267` uses `result.get('recrawl_days', 'N/A')` but may reference missing keys elsewhere | Audit `print_result()` for all dict accesses; use `.get()` everywhere | **MEDIUM** |
-| 3 | No E2E live test | No PROOF.md with real Tumblr crawl output | Dispatch sub-agent for E2E run against `the-smallest-kitten-cravings` after review passes | **MEDIUM** |
-| 4 | Worker shutdown is best-effort | SIGINT handler in main thread; workers check event between blogs but may start a new blog during shutdown | Accept documented trade-off: mid-blog termination loses that blog's partial data; next cycle re-crawls | **LOW** |
-| 5 | Test scripts are run-scripts, not pytest | `test_parallel_fr4.py` calls `sys.exit(0)` at module level — pytest can't import | Either convert to pytest or keep as run-scripts with a runner script | **LOW** |
+| 1 | No E2E live test | No PROOF.md with real Tumblr crawl output | Dispatch sub-agent for E2E run against `the-smallest-kitten-cravings` after review passes | **MEDIUM** |
+| 2 | Worker shutdown is best-effort | SIGINT handler in main thread (`run.py:123`); workers check `wall_halt` event between blogs but may start a new blog during shutdown | Accept documented trade-off: mid-blog termination loses that blog's partial data; next cycle re-crawls | **LOW** |
+| 3 | Test scripts are run-scripts, not pytest | `test_parallel_fr4.py:120` calls `sys.exit(0)` at module level — pytest can't import | Either convert to pytest or keep as run-scripts with a runner script | **LOW** |
 
 ---
 
 ## 9. Recommendations
 
-1. **Build FR-7 probe** — the 7-day placeholder is the one real design gap.
-2. **Fix `print_result()`** — quick audit, use `.get()` for all dict accesses.
-3. **Run E2E live test** — real crawl against `the-smallest-kitten-cravings` to produce PROOF.md.
-4. **Convert test scripts to pytest** — enables CI integration and coverage reporting.
+1. **Run E2E live test** — real crawl against `the-smallest-kitten-cravings` to produce PROOF.md (per methodology §8).
+2. **Convert test scripts to pytest** — enables CI integration and coverage reporting.
+3. **Accept worker-shutdown trade-off** — documented in §8 weakness #2; no code change needed.
 
 ---
 
@@ -212,9 +216,9 @@ Baseline commit: `ed0d70f` on `worker-tab-lifecycle`.
 - `DESIGN.md` — v3 design document (the artifact under review)
 - `DESIGN_HISTORY.md` — failure log (33 failures across fetch/CDP/concurrency architectures)
 - `REQUIREMENTS_MATRIX.md` — FR/NFR traceability to code
-- `CODE-ANALYSIS.md` — §4a code-design review (to be produced by sub-agent)
-- `CRITIC-REVIEW.md` — §4b critic review (to be produced by sub-agent)
+- `CODE-ANALYSIS.md` — §4a code-design review (verdict: MATCH)
+- `CRITIC-REVIEW.md` — §4b critic review (pending)
 
 ---
 
-*End of Design Review (FURPS+). 5 weaknesses identified; all carry mitigations. Weakness #1 (FR-7) is the only HIGH-priority gap remaining from the design.*
+*End of Design Review (FURPS+). 3 weaknesses identified; all carry mitigations. The §4a code-analysis confirms the implementation matches the design (no DRIFT).*
