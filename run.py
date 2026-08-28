@@ -140,6 +140,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     async def _run() -> dict[str, Any]:
+        # Reset the clean event log for a fresh trace of this run.
+        from eventlog import reset as ev_reset
+        ev_reset()
         # The only production path is queue-mode: fresh Chrome, seed-on-queue,
         # worker pool drains T1/T2 in parallel from first extraction.
         return await queue_mode(

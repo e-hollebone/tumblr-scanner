@@ -252,6 +252,26 @@ def queue_size(queue_path: Path) -> int:
             pass
 
 
+def active_count(queue_path: Path) -> int:
+    """Count items still requiring work: pending (state "") + in_progress.
+
+    "done" entries are excluded — they have been crawled and are only waiting
+    for the end-of-drain cleanup to remove them. Used by the coordinator to
+    decide when the crawl is genuinely finished (no pending and nothing mid-
+    crawl), so it does not mistake leftover "done" lines for live work.
+    """
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.touch(exist_ok=True)
+    with open(queue_path, "r+", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+        try:
+            return sum(
+                1 for ln in _read_lines(queue_path) if ln.get("state", "") != "done"
+            )
+        finally:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Lock acquisition with deadline → exit(2)
 # ---------------------------------------------------------------------------

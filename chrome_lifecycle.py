@@ -112,8 +112,8 @@ def _find_available_port() -> int:
 def _probe_login_wall(port: int) -> bool:
     """Probe a fresh Chrome tab on ``port`` for a login wall.
 
-    Navigates to tumblr.com and checks the final URL for a login redirect.
-    Returns True if the login wall is up (so the operator knows immediately).
+    Navigates to tumblr.com, waits for the redirect to settle, then
+    checks the final URL. Returns True if the login wall is up.
     """
     import urllib.request as _ur
     try:
@@ -124,6 +124,10 @@ def _probe_login_wall(port: int) -> bool:
             ws_url = info.get("webSocketDebuggerUrl")
         if not tab_id:
             return False
+        # Wait for the redirect to settle — the login page takes a moment
+        # to load. Reading immediately gives a false negative (tumblr.com
+        # before redirect → reports "no wall" when there is one).
+        time.sleep(3.0)
         try:
             with _ur.urlopen(f"http://127.0.0.1:{port}/json/get", timeout=5) as resp:
                 targets = json.loads(resp.read())
@@ -146,59 +150,67 @@ def _probe_login_wall(port: int) -> bool:
                 pass
 
 
+def _our_chrome_port() -> int | None:
+    """Return the debug port our running Chrome actually listens on, or None.
+
+    Detects our Chrome by PID (profile match), then finds which debug port it
+    bound by probing the candidate ports for a live CDP endpoint. This is the
+    correct port to reuse — NOT _find_available_port(), which returns a FREE
+    port (a fallback) when 9222 is occupied and would never match a live one.
+    """
+    if not _our_chrome_pids():
+        return None
+    for port in (CHROME_DEBUG_PORT, *CHROME_FALLBACK_PORTS):
+        if not _is_port_in_use(port):
+            continue
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=5
+            ) as resp:
+                json.loads(resp.read())
+            return port
+        except Exception:
+            pass
+    return None
+
+
 def restart_chrome() -> dict[str, Any]:
     """Restart Chrome with our dedicated profile. Never touches other Chrome.
 
-    If our Chrome is already running with our profile, reuses it (closes
-    all tabs for fresh state). If the default debug port is in use by
-    another process, tries fallback ports.
+    If our Chrome is already running (and listening on a debug port), REUSE it
+    — close its tabs for fresh state and keep the running process (which holds
+    the authenticated login session). Only if no our-Chrome is running do we
+    kill leftovers and launch a fresh instance.
 
-    After restart, probes the new Chrome to verify login state is preserved.
-    If the probe hits a login wall, the status includes ``login_wall: True``
-    so the operator knows immediately instead of discovering it mid-crawl.
+    After deciding, probe the Chrome to verify login state is preserved. If the
+    probe hits a login wall, the status includes ``login_wall: True`` so the
+    operator knows immediately instead of discovering it mid-crawl.
 
     Returns status dict with the actual port used.
     """
-    # Check if our Chrome is already running
-    existing_pids = _our_chrome_pids()
-
-    # Find an available port
-    port = _find_available_port()
-
-    # If our Chrome is already running on the target port, reuse it
-    if existing_pids and _is_port_in_use(port):
+    # Reuse our already-running Chrome if present (preserves login session).
+    running_port = _our_chrome_port()
+    if running_port is not None:
         logger.info(
-            "Our Chrome (PID %s) already running on port %d — reusing",
-            existing_pids,
-            port,
+            "Our Chrome already running on port %d — reusing (session+tabs preserved)",
+            running_port,
         )
-        # Close all page tabs via CDP for fresh state
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/json/list", timeout=5
-            ) as resp:
-                tabs = json.loads(resp.read())
-            for tab in tabs:
-                if tab.get("type") == "page":
-                    try:
-                        urllib.request.urlopen(
-                            f"http://127.0.0.1:{port}/json/close/{tab['id']}",
-                            timeout=5,
-                        )
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        login_wall = _probe_login_wall(port)
+        # DO NOT close tabs in reuse mode — that would destroy the login
+        # session the operator just established. The workers will navigate
+        # within existing tabs or open their own.
+        login_wall = _probe_login_wall(running_port)
         return {
             "killed": 0,
             "remaining_after_kill": 0,
             "restarted": True,
             "reused": True,
-            "port": port,
+            "port": running_port,
             "status": "ok",
             "login_wall": login_wall,
         }
+
+    # Find an available port for a fresh launch
+    port = _find_available_port()
 
     # Kill any leftover our-Chrome processes before launching
     kill_result = kill_chrome()

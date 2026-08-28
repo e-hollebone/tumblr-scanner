@@ -45,6 +45,7 @@ from config import (
     LOGIN_WALL_PHRASES,
 )
 from extractor import check_limit, extract_from_html
+from eventlog import info as ev, warn as ev_warn, error as ev_err
 
 logger = logging.getLogger("tumblr-agent")
 
@@ -171,6 +172,47 @@ async def fetch_page_html(
         logger.warning("Page.navigate failed for %s offset %d: %s", username, offset, exc)
         raise TabDeadError(f"Page.navigate failed: {exc}") from exc
 
+    # Tumblr is a lazy-loaded SPA: post cells only enter the DOM after the
+    # page is scrolled. Without scrolling we capture the empty shell and the
+    # extractor returns 0. Scroll progressively toward the bottom, waiting
+    # for the post-cell count to stabilize, then grab HTML.
+    SCROLL_DEADLINE = time.monotonic() + 30.0
+    prev_cells = -1
+    stable_rounds = 0
+    while time.monotonic() < SCROLL_DEADLINE:
+        try:
+            await client.send.Runtime.evaluate(
+                params={
+                    "expression": (
+                        "(function() {"
+                        "  window.scrollTo(0, document.body.scrollHeight);"
+                        "  return document.querySelectorAll('[data-cell-id]').length;"
+                        "})()"
+                    ),
+                    "returnByValue": True,
+                }
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+        try:
+            res = await client.send.Runtime.evaluate(
+                params={
+                    "expression": "document.querySelectorAll('[data-cell-id]').length",
+                    "returnByValue": True,
+                }
+            )
+            cell_count = int(res.get("result", {}).get("value", 0) or 0)
+        except Exception:
+            cell_count = 0
+        if cell_count == prev_cells:
+            stable_rounds += 1
+            if stable_rounds >= 2:
+                break
+        else:
+            stable_rounds = 0
+            prev_cells = cell_count
+
     TIMEOUT = 20.0
     deadline = time.monotonic() + TIMEOUT
     last_text = ""
@@ -226,16 +268,32 @@ async def fetch_page_html(
 
 
 def detect_login_wall(page_text: str, html: str = "", url: str = "") -> bool:
-    """Return True if the page is a login wall / human verification challenge."""
-    combined = (page_text + " " + html + " " + url).lower()
-    for phrase in LOGIN_WALL_PHRASES:
-        if phrase in combined:
-            return True
-    if "content_warning_wall" in url.lower():
+    """Return True if the page is a login wall / human verification challenge.
+
+    The ONLY reliable signal is the URL: Tumblr redirects to /login or
+    /signup when the session is unauthenticated. Scanning page HTML for
+    keywords (e.g. "recaptcha") causes false positives — that word
+    appears in analytics/tracking scripts on every page, including
+    authenticated ones. So we check the URL only.
+    """
+    u = url.lower()
+    if "login" in u or "signup" in u:
         return True
-    if "recaptcha" in (html + " " + url).lower():
+    if "content_warning_wall" in u:
         return True
     return False
+
+
+def detect_login_wall_detail(page_text: str, html: str = "", url: str = "") -> tuple[bool, str]:
+    """Return (is_wall, reason) — like detect_login_wall but explains the match."""
+    u = url.lower()
+    if "login" in u:
+        return True, "url:login"
+    if "signup" in u:
+        return True, "url:signup"
+    if "content_warning_wall" in u:
+        return True, "url:content_warning_wall"
+    return False, ""
 
 
 def detect_dead(page_text: str) -> bool:
@@ -334,11 +392,14 @@ async def probe_blog(
             "usernames": [],
         }
     finally:
+        # DO NOT close the tab. The operator owns tab lifecycle — the
+        # application never closes tabs. The operator closes them.
         if tab_target_id:
-            try:
-                await close_tab(browser_ws, tab_target_id)
-            except Exception:
-                pass
+            logger.info(
+                "Probe complete for %s — tab left OPEN (targetId=%s).",
+                username,
+                tab_target_id,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +489,7 @@ async def crawl_blog(
 
             # Fetch page — raises TabDeadError on failure
             page_html_str, final_url = await fetch_page_html(client, username, offset)
+            ev("agent", "page_fetched", username=username, offset=offset, html_len=len(page_html_str or ""))
 
             if not page_html_str:
                 try:
@@ -583,6 +645,7 @@ async def crawl_blog(
                 "AGENT HALTED for %s — login wall. Chrome left open for you to authenticate.",
                 username,
             )
+            ev("agent", "login_wall_halt", username=username)
 
     entry = {
         "username": username,
