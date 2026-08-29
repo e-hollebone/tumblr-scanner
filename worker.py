@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent import (
     LoginWallDetected,
@@ -24,7 +24,20 @@ from agent import (
     crawl_blog,
     probe_blog,
 )
-from config import DELAY_MAX, DELAY_MIN, LIMITS_BY_TIER, QUEUE_POLL_INTERVAL
+from config import (
+    DELAY_MAX,
+    DELAY_MIN,
+    LIMITS_BY_TIER,
+    QUEUE_POLL_INTERVAL,
+    SKIP_USERNAME_PATTERNS,
+)
+
+
+def _should_skip(username: str) -> bool:
+    """Return True if username matches any SKIP_USERNAME_PATTERNS."""
+    low = username.lower()
+    return any(p in low for p in SKIP_USERNAME_PATTERNS)
+
 from work_queue import dequeue, mark_done
 from eventlog import info as ev, warn as ev_warn, error as ev_err
 
@@ -42,6 +55,9 @@ class Worker:
         index_path: Path,
         wall_halt: asyncio.Event,
         busy_event: asyncio.Event | None = None,
+        progress_cb: "Callable[[], None] | None" = None,
+        set_current_cb: "Callable[[str], None] | None" = None,
+        stats_cb: "Callable[[str], None] | None" = None,
     ) -> None:
         self.worker_id = worker_id
         self.browser_ws = browser_ws
@@ -49,6 +65,9 @@ class Worker:
         self.index_path = index_path
         self.wall_halt = wall_halt
         self.busy_event = busy_event or asyncio.Event()
+        self.progress_cb = progress_cb
+        self.set_current_cb = set_current_cb
+        self.stats_cb = stats_cb
 
         self.ws_url: str | None = None
         self.target_id: str | None = None
@@ -82,8 +101,20 @@ class Worker:
         self.ws_url = None
 
     async def _replace_tab(self) -> None:
-        """Open a fresh tab (recovery). Does NOT close the dead tab — the
-        operator owns tab lifecycle."""
+        """Open a fresh tab (recovery). Closes the dead tab first so we
+        don't leak one tab per recovery cycle."""
+        old_target = self.target_id
+        if old_target:
+            try:
+                from agent import close_tab
+                await close_tab(self.browser_ws, old_target)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Worker %d: failed to close dead tab %s: %s",
+                    self.worker_id, old_target, exc,
+                )
+        self.target_id = None
+        self.ws_url = None
         await self._open_tab()
 
     # ------------------------------------------------------------------ #
@@ -145,6 +176,7 @@ class Worker:
                     source_blog=None,
                     cache_dir=self.cache_dir,
                     on_page=lambda name, users, t: enqueue_fn(name, users, t),
+                    on_progress=self.progress_cb,
                 )
             except TabDeadError as exc:
                 last_exc = exc
@@ -221,13 +253,28 @@ class Worker:
 
                 self._empty_since = None
 
-                # Advertise "mid-crawl" so the coordinator does not declare the
-                # drain complete while we are working this blog.
-                self.busy_event.set()
-
                 username = item["username"]
                 tier = item.get("tier", 1)
                 mode = item.get("mode", "full")
+
+                # Skip deactivated/dead blogs by name convention — no fetch.
+                if _should_skip(username):
+                    logger.info(
+                        "Worker %d: %s matches skip pattern — skipping",
+                        self.worker_id,
+                        username,
+                    )
+                    mark_done(queue_path, username)
+                    processed += 1
+                    continue
+
+                # Advertise "mid-crawl" so the coordinator does not declare the
+                # drain complete while we are working this blog.
+                self.busy_event.set()
+                if self.set_current_cb:
+                    self.set_current_cb(username)  # dashboard: now on this blog
+                if self.progress_cb:
+                    self.progress_cb()  # heartbeat: we picked up a blog
 
                 # NFR-10: index check at dispatch time
                 idx_status = index_status(self.index_path, username)
@@ -296,16 +343,25 @@ class Worker:
                             )
                             if action in ("reindex", "full"):
                                 enqueued += 1
+                                if self.stats_cb:
+                                    self.stats_cb("enqueued")
 
                 try:
                     result = await self._crawl_with_recovery(
                         username, tier, mode, _enqueue_page
                     )
                     if not result.get("usernames"):
-                        consecutive_empty += 1
+                        # Only count as "empty" when the extractor parsed
+                        # nothing at all (posts=0). Blogs with posts>0 but
+                        # usernames=0 are legitimately empty (no reblogs/
+                        # original content) — not a markup failure.
+                        if result.get("posts_processed", 0) == 0:
+                            consecutive_empty += 1
+                        else:
+                            consecutive_empty = 0
                         if consecutive_empty >= 3:
                             logger.error(
-                                "Worker %d: %d consecutive blogs yielded 0 usernames — "
+                                "Worker %d: %d consecutive blogs yielded 0 posts — "
                                 "Tumblr markup may have changed. Halting pipeline.",
                                 self.worker_id, consecutive_empty,
                             )
@@ -336,6 +392,8 @@ class Worker:
                     errors += 1
                     processed += 1
                     self.busy_event.clear()
+                    if self.stats_cb:
+                        self.stats_cb("errors")
                     continue
 
                 # Write to index
@@ -367,14 +425,14 @@ class Worker:
                 mark_done(queue_path, username)
                 processed += 1
                 self.busy_event.clear()
+                if self.stats_cb:
+                    self.stats_cb("blogs_done")
 
         finally:
-            # DO NOT close the tab. The operator owns tab lifecycle — workers
-            # leave their tabs open for inspection. The operator closes them.
-            logger.info(
-                "Worker %d: exiting — tab left OPEN (targetId=%s).",
-                self.worker_id,
-                self.target_id,
-            )
+            # Close our tab on exit — the login session lives in the Chrome
+            # profile dir, so closing the tab does NOT log us out. Leaving tabs
+            # open is what accumulates across runs and OOMs Chrome.
+            await self._close_tab()
+            logger.info("Worker %d: exiting — tab closed.", self.worker_id)
 
         return {"processed": processed, "errors": errors, "enqueued": enqueued}

@@ -22,7 +22,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent import LoginWallDetected
 from cache import index_status
@@ -32,10 +32,12 @@ from config import (
     MAX_CONCURRENT_AGENTS,
     QUEUE_OVERFLOW_THRESHOLD,
     QUEUE_PATH,
+    WORKER_STALL_TIMEOUT,
 )
 from work_queue import cleanup as queue_cleanup
 from work_queue import active_count, enqueue, queue_size
 from eventlog import info as ev, warn as ev_warn, error as ev_err
+from status_server import publish as _publish_status, start_status_server as _start_status_server
 
 logger = logging.getLogger("queue-pipeline")
 
@@ -155,6 +157,35 @@ async def _drain_queue(
     )
     ev("coordinator", "drain_start", workers=MAX_CONCURRENT_AGENTS, queue_size=queue_size(queue_path))
 
+    # Live counters published to the dashboard (mutated by worker results
+    # via the shared callback below). The coordinator only sees final
+    # totals after gather(), so we track them live here.
+    _live = {"blogs_done": 0, "errors": 0, "enqueued": 0}
+    from threading import Lock as _Lock
+    _live_lock = _Lock()
+
+    def _on_blog_done_inc() -> None:
+        with _live_lock:
+            _live["blogs_done"] += 1
+
+    # indexed count helper (reads index.json size)
+    def _index_count(idx_path: Path) -> int:
+        try:
+            import json as _json
+            if not idx_path.exists():
+                return 0
+            with open(idx_path, encoding="utf-8") as _f:
+                return len(_json.load(_f))
+        except Exception:
+            return 0
+
+    # Start the live status dashboard (operator watches it from Preview; no
+    # need to ask the agent for updates). http://localhost:8788/
+    try:
+        _start_status_server()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not start status server: %s", exc)
+
     # Shared "worker busy" signals: coordinator must NOT declare the crawl
     # done while any worker is mid-crawl. active_count() alone can miss the
     # in_progress window between dequeue and mark_done (and that is exactly
@@ -162,8 +193,41 @@ async def _drain_queue(
     # advertise their crawl state explicitly via these events.
     busy_events = [asyncio.Event() for _ in range(MAX_CONCURRENT_AGENTS)]
 
+    # ACTIVE PROGRESS MONITOR (user directive 2026-08-28): busy_event only
+    # tells the coordinator a worker THINKS it is busy. A worker stuck inside a
+    # CDP await with no timeout holds busy_event forever while making zero
+    # progress — the coordinator must not just trust busy_event, it must
+    # verify progress. Each worker bumps progress_at[worker_id] on every page
+    # fetch and at blog start. The coordinator force-restarts any worker that
+    # holds busy_event but has not progressed in WORKER_STALL_TIMEOUT seconds.
+    progress_at: dict[int, float] = {
+        i: time.monotonic() for i in range(MAX_CONCURRENT_AGENTS)
+    }
+    # Current blog each worker is on (set at blog_start) — for the live
+    # dashboard. None = idle/not-yet-started.
+    current_blog: dict[int, str | None] = {
+        i: None for i in range(MAX_CONCURRENT_AGENTS)
+    }
+
     # Launch the worker pool — each Worker instance owns its own tab
     from worker import Worker
+
+    def _make_progress_cb(wid: int) -> Callable[[], None]:
+        def _cb() -> None:
+            progress_at[wid] = time.monotonic()
+        return _cb
+
+    def _make_set_current_cb(wid: int) -> Callable[[str], None]:
+        def _cb(username: str) -> None:
+            current_blog[wid] = username
+        return _cb
+
+    def _make_stats_cb() -> Callable[[str], None]:
+        def _cb(key: str) -> None:
+            with _live_lock:
+                if key in _live:
+                    _live[key] += 1
+        return _cb
 
     worker_tasks = [
         asyncio.create_task(
@@ -174,6 +238,9 @@ async def _drain_queue(
                 index_path=index_path,
                 wall_halt=wall_halt,
                 busy_event=busy_events[i],
+                progress_cb=_make_progress_cb(i),
+                set_current_cb=_make_set_current_cb(i),
+                stats_cb=_make_stats_cb(),
             ).run(queue_path)
         )
         for i in range(MAX_CONCURRENT_AGENTS)
@@ -185,10 +252,109 @@ async def _drain_queue(
     # period AND no worker is mid-crawl. Set wall_halt to release all workers.
     DRAIN_IDLE_GRACE = 15.0
     idle_since: float | None = None
+    loop_count = 0
+    # Track which workers we have already force-restarted for the current stall,
+    # so we don't cancel the same task twice in one stall episode.
+    stalled_restarted: set[int] = set()
     while not wall_halt.is_set():
         await asyncio.sleep(2.0)
+        loop_count += 1
         qsize = active_count(queue_path)
         crawling = any(e.is_set() for e in busy_events)
+
+        # ---- ACTIVE PROGRESS MONITOR -------------------------------------
+        # A worker holding busy_event but silent for > WORKER_STALL_TIMEOUT is
+        # HUNG (a CDP await with no timeout). Do not wait passively — cancel the
+        # stuck task and respawn a fresh worker so its tab/queue slot is reused.
+        now = time.monotonic()
+        for i in range(MAX_CONCURRENT_AGENTS):
+            if not busy_events[i].is_set():
+                stalled_restarted.discard(i)
+                continue
+            silent = now - progress_at[i]
+            if silent >= WORKER_STALL_TIMEOUT and i not in stalled_restarted:
+                logger.error(
+                    "STALL WATCHDOG: worker %d silent for %.0fs (no page_fetched) "
+                    "— force-restarting task",
+                    i, silent,
+                )
+                ev_err("coordinator", "worker_stall_restart",
+                       worker_id=i, silent_seconds=round(silent, 1))
+                old_task = worker_tasks[i]
+                # Cancel the hung task. We do NOT `await old_task` here: a hung
+                # worker is stuck inside a CDP await with no timeout, so awaiting
+                # it would re-block the coordinator — the exact bug this watchdog
+                # exists to fix. Cancellation fires; the task's finally block
+                # closes its tab. We shield the cancel so a stuck await can't
+                # swallow the CancelledError and hang us.
+                old_task.cancel()
+                # Spawn replacement immediately so the worker slot is reused.
+                worker_tasks[i] = asyncio.create_task(
+                    Worker(
+                        worker_id=i,
+                        browser_ws=browser_ws,
+                        cache_dir=cache_dir,
+                        index_path=index_path,
+                        wall_halt=wall_halt,
+                        busy_event=busy_events[i],
+                        progress_cb=_make_progress_cb(i),
+                        set_current_cb=_make_set_current_cb(i),
+                        stats_cb=_make_stats_cb(),
+                    ).run(queue_path)
+                )
+                progress_at[i] = now
+                stalled_restarted.add(i)
+                logger.info("STALL WATCHDOG: worker %d respawned", i)
+        # -----------------------------------------------------------------
+
+        # ---- PUBLISH LIVE STATUS (operator dashboard) --------------------
+        # Compute per-worker status for the dashboard: busy (recent progress),
+        # stalled (busy but silent >30s), idle (not busy). Then push a snapshot.
+        workers_status = []
+        last_stall = None
+        for i in range(MAX_CONCURRENT_AGENTS):
+            lag = now - progress_at[i]
+            if busy_events[i].is_set():
+                status = "stalled" if lag > 30 else "busy"
+            else:
+                status = "idle"
+            if status == "stalled" and (last_stall is None or lag > last_stall["silent_s"]):
+                last_stall = {"worker_id": i, "silent_s": lag}
+            workers_status.append({
+                "id": i,
+                "status": status,
+                "current": current_blog.get(i),
+                "lag_s": round(lag, 1),
+            })
+        _publish_status(
+            queue_pending=active_count(queue_path),
+            queue_in_progress=sum(1 for e in busy_events if e.is_set()),
+            indexed=_index_count(index_path),
+            blogs_done=_live["blogs_done"],
+            errors=_live["errors"],
+            enqueued=_live["enqueued"],
+            workers=workers_status,
+            last_stall=last_stall,
+            login_wall=False,
+            drain_complete=False,
+        )
+        # -----------------------------------------------------------------
+
+        if loop_count % 10 == 1 or qsize == 0 or not crawling:
+            stalled = [
+                i for i in range(MAX_CONCURRENT_AGENTS)
+                if busy_events[i].is_set()
+                and (now := time.monotonic()) - progress_at[i] > 30
+            ]
+            logger.info(
+                "Coordinator loop #%d: qsize=%d crawling=%s idle_since=%s "
+                "progress_lag=%s",
+                loop_count,
+                qsize,
+                crawling,
+                idle_since,
+                {i: round(time.monotonic() - progress_at[i]) for i in range(MAX_CONCURRENT_AGENTS)},
+            )
         if qsize == 0 and not crawling:
             if idle_since is None:
                 idle_since = time.monotonic()
@@ -204,6 +370,21 @@ async def _drain_queue(
 
     elapsed = time.monotonic() - start
     ev("coordinator", "drain_complete", processed=processed, errors=errors, new_enqueued=total_enqueued, elapsed_seconds=round(elapsed, 1))
+
+    # Final dashboard publish: mark drain complete.
+    _publish_status(
+        queue_pending=active_count(queue_path),
+        queue_in_progress=0,
+        indexed=_index_count(index_path),
+        blogs_done=_live["blogs_done"],
+        errors=_live["errors"],
+        enqueued=_live["enqueued"],
+        workers=[{"id": i, "status": "idle", "current": None, "lag_s": 0.0}
+                 for i in range(MAX_CONCURRENT_AGENTS)],
+        last_stall=None,
+        login_wall=False,
+        drain_complete=True,
+    )
 
     results = await asyncio.gather(*worker_tasks, return_exceptions=True)
 

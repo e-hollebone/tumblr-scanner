@@ -22,8 +22,8 @@ fresh → drop
 
 # ── NFR-4: no GUI focus steal — Chrome must NOT be launched via open -g ──
 # (open -g both drops --args AND activates the app, stealing focus)
-# Pattern "-g" catches all forms: "open -g", ["open","-g"], etc.
--g
+# Pattern "open -g" catches all forms: "open -g", ["open","-g"], etc.
+open -g
 
 # ── NFR-8: stable selectors only — these CSS classes are unstable ──
 # (verified against real Tumblr HTML 2026-08-20; will break on markup change)

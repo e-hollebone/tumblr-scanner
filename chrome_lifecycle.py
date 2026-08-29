@@ -59,6 +59,41 @@ def _our_chrome_pids() -> list[int]:
     return pids
 
 
+def cleanup_tabs(port: int | None = None) -> int:
+    """Close all open page tabs on our Chrome.
+
+    Does NOT destroy the Tumblr login session — that lives in the Chrome
+    profile directory (--user-data-dir), not in an open tab. Closing tabs
+    only frees the leaked tabs that accumulate across runs. Called at init
+    (in restart_chrome reuse-mode) so every launch starts clean instead of
+    stacking new tabs on top of stale ones.
+
+    Returns the number of tabs closed.
+    """
+    if port is None:
+        port = _our_chrome_port()
+    if port is None:
+        return 0
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=5) as resp:
+            targets = json.loads(resp.read())
+    except Exception:
+        return 0
+    closed = 0
+    for t in targets:
+        if t.get("type") == "page" and t.get("id"):
+            try:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/close/{t['id']}", timeout=5
+                )
+                closed += 1
+            except Exception:
+                pass
+    if closed:
+        logger.info("cleanup_tabs: closed %d stale tab(s) on port %d", closed, port)
+    return closed
+
+
 def kill_chrome() -> dict[str, Any]:
     """Kill only Chrome processes using our dedicated profile.
 
@@ -192,12 +227,14 @@ def restart_chrome() -> dict[str, Any]:
     running_port = _our_chrome_port()
     if running_port is not None:
         logger.info(
-            "Our Chrome already running on port %d — reusing (session+tabs preserved)",
+            "Our Chrome already running on port %d — reusing (session preserved)",
             running_port,
         )
-        # DO NOT close tabs in reuse mode — that would destroy the login
-        # session the operator just established. The workers will navigate
-        # within existing tabs or open their own.
+        # Close ALL leaked tabs at init. The Tumblr login session lives in the
+        # Chrome profile dir, NOT in an open tab — closing tabs does NOT log us
+        # out. This prevents the per-run tab accumulation that OOMs Chrome.
+        closed = cleanup_tabs(running_port)
+        logger.info("Reuse-mode: closed %d stale tab(s) before launch", closed)
         login_wall = _probe_login_wall(running_port)
         return {
             "killed": 0,

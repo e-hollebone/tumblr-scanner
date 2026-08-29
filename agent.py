@@ -172,10 +172,31 @@ async def fetch_page_html(
         logger.warning("Page.navigate failed for %s offset %d: %s", username, offset, exc)
         raise TabDeadError(f"Page.navigate failed: {exc}") from exc
 
-    # Tumblr is a lazy-loaded SPA: post cells only enter the DOM after the
-    # page is scrolled. Without scrolling we capture the empty shell and the
-    # extractor returns 0. Scroll progressively toward the bottom, waiting
-    # for the post-cell count to stabilize, then grab HTML.
+    # ---- IMMEDIATE DEAD CHECK (user directive 2026-08-28) ----------------
+    # Tumblr redirects dead/deactivated blogs to /blog-explorer or shows a
+    # dead-phrase page. Without this we burn 10-30s scrolling + waiting on
+    # the dead page before the crawl loop's detect_dead() fires. Grab the
+    # URL + a snippet of text right after navigate and bail fast if dead.
+    try:
+        res = await client.send.Runtime.evaluate(
+            params={
+                "expression": "JSON.stringify({url: location.href, text: (document.body ? document.body.innerText : '').slice(0, 800)})",
+                "returnByValue": True,
+            }
+        )
+        snap = json.loads(res.get("result", {}).get("value", "{}"))
+        snap_url = snap.get("url", "")
+        snap_text = (snap.get("text") or "").lower()
+        if "blog-explorer" in snap_url.lower():
+            logger.info("DEAD (early): %s offset %d — blog-explorer redirect", username, offset)
+            return "", snap_url
+        for phrase in DEAD_PHRASES:
+            if phrase in snap_text:
+                logger.info("DEAD (early): %s offset %d — phrase '%s'", username, offset, phrase)
+                return "", snap_url
+    except Exception:
+        pass  # If the quick check fails, fall through to normal flow
+    # ----------------------------------------------------------------------
     SCROLL_DEADLINE = time.monotonic() + 30.0
     prev_cells = -1
     stable_rounds = 0
@@ -421,6 +442,7 @@ async def crawl_blog(
     source_blog: str | None = None,
     cache_dir: Path | None = None,
     on_page: callable | None = None,
+    on_progress: callable | None = None,
 ) -> dict[str, Any]:
     """Crawl a single blog from start to stop condition.
 
@@ -490,6 +512,25 @@ async def crawl_blog(
             # Fetch page — raises TabDeadError on failure
             page_html_str, final_url = await fetch_page_html(client, username, offset)
             ev("agent", "page_fetched", username=username, offset=offset, html_len=len(page_html_str or ""))
+            if on_progress:
+                try:
+                    on_progress()
+                except Exception:
+                    pass
+
+            # NOT-FOUND redirect: Tumblr sends a nonexistent blog to
+            # /blog-explorer instead of a 404. Without this we'd scroll+wait on
+            # the explorer page for EVERY offset — the extra load the user saw
+            # moving from "not found" to "blog explorer". Detect and bail fast.
+            if "blog-explorer" in final_url.lower():
+                logger.info(
+                    "Blog %s not found (redirected to blog-explorer) — marking dead",
+                    username,
+                )
+                status = "not_found"
+                dead = True
+                dead_reason = "blog-explorer-redirect"
+                break
 
             if not page_html_str:
                 try:

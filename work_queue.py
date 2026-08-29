@@ -259,17 +259,38 @@ def active_count(queue_path: Path) -> int:
     for the end-of-drain cleanup to remove them. Used by the coordinator to
     decide when the crawl is genuinely finished (no pending and nothing mid-
     crawl), so it does not mistake leftover "done" lines for live work.
+
+    RACE-PROOFING (2026-08-28): the queue file is rewritten via os.replace(),
+    which briefly makes the target path absent. A reader that opens the file in
+    that window sees an EMPTY file and would report active_count == 0, even
+    when thousands of items are pending. That intermittent-0 was the cause of
+    the coordinator's premature drain_complete (it saw "empty for 15s" during
+    heavy dequeue/mark_done churn). Mitigation: retry the read a few times when
+    the file is empty-or-absent; only return 0 if it is genuinely, persistently
+    empty. This converts a transient swap-race into a non-event.
     """
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
-    with open(queue_path, "r+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+    for _ in range(5):
         try:
-            return sum(
-                1 for ln in _read_lines(queue_path) if ln.get("state", "") != "done"
-            )
-        finally:
-            pass
+            with open(queue_path, "r+", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    lines = _read_lines(queue_path)
+                finally:
+                    pass
+        except (FileNotFoundError, OSError):
+            # Target briefly absent during an os.replace() swap — retry.
+            time.sleep(0.005)
+            continue
+        # Empty read: could be a genuine empty queue OR a mid-swap race.
+        # Retry to distinguish; only trust a persistently-empty file.
+        if not lines:
+            time.sleep(0.005)
+            continue
+        return sum(1 for ln in lines if ln.get("state", "") != "done")
+    # After retries the file is still empty/absent — it really is drained.
+    return 0
 
 
 # ---------------------------------------------------------------------------

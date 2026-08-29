@@ -27,10 +27,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from work_queue import enqueue
+from config import SKIP_USERNAME_PATTERNS
 
 CACHE_DIR = Path("/Users/eric/Documents/tumblr-scanner/cache")
 QUEUE_PATH = CACHE_DIR / "queue.jsonl"
 INDEX_PATH = CACHE_DIR / "index.json"
+
+
+def _should_skip(username: str) -> bool:
+    """Return True if username matches any SKIP_USERNAME_PATTERNS."""
+    low = username.lower()
+    return any(p in low for p in SKIP_USERNAME_PATTERNS)
 
 
 def _index_lock_path(path: Path) -> Path:
@@ -184,7 +191,7 @@ async def produce_target(target: str, browser_ws: str) -> int:
     # Enqueue target + all discovered usernames at tier 1
     enqueued = 0
     for name in usernames:
-        if name != target:
+        if name != target and not _should_skip(name):
             enqueue(QUEUE_PATH, name, state="", tier=1)
             enqueued += 1
 
