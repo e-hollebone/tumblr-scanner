@@ -602,27 +602,34 @@ class Worker:
                 # Write to index
                 from datetime import datetime, timezone
 
+                _u = result.get("unique_count", 0) or result.get("unique", 0)
+                _t = result.get("total_count", 0) or result.get("total_occurrences", 0)
+                _p = result.get("posts_processed", 0) or result.get("posts_rendered", 0)
+                _unchanged = (_u == 0 and _p == 0)
+
                 index_entry = {
                     "username": username,
                     "tier": tier,
                     "status": result.get("status", "unknown"),
                     "scanned_at": datetime.now(timezone.utc).isoformat(),
-                    "unique": result.get("unique_count", 0),
-                    "total": result.get("total_count", 0),
-                    "posts": result.get("posts_processed", 0),
+                    "unique": _u,
+                    "total": _t,
+                    "posts": _p,
                     "usernames": result.get("usernames", []),
                     "dead": result.get("dead", False),
+                    "unchanged": _unchanged,
                 }
                 _write_index(self.index_path, username, index_entry)
 
-                ev("worker%d" % self.worker_id, "blog_done", username=username, status=result.get("status"), unique=result.get("unique_count"), total=result.get("total_count"), posts=result.get("posts_processed"))
+                ev("worker%d" % self.worker_id, "blog_done", username=username, status=result.get("status"), unique=_u, total=_t, posts=_p, unchanged=_unchanged)
 
                 logger.info(
-                    "Worker %d: done %s status=%s unique=%d",
+                    "Worker %d: done %s status=%s unique=%d%s",
                     self.worker_id,
                     username,
                     result.get("status", "unknown"),
-                    result.get("unique_count", 0),
+                    _u,
+                    " (unchanged — no posts detected)" if _unchanged else "",
                 )
 
                 mark_done(queue_path, username)

@@ -475,9 +475,10 @@ async def crawl_blog(
 
         result = compute_page_metrics(html, username)
         page_usernames = result.get("usernames", [])
-        page_unique = result.get("unique_count", 0)
-        page_total = result.get("total_count", 0)
-        page_posts = result.get("posts_processed", 0)
+        # extract_from_html() keys: unique / total_occurrences / posts_rendered
+        page_unique = result.get("unique", result.get("unique_count", 0))
+        page_total = result.get("total_occurrences", result.get("total_count", 0))
+        page_posts = result.get("posts_rendered", result.get("posts_processed", 0))
 
         posts_processed += page_posts
         total_count += page_total

@@ -178,7 +178,8 @@ def _tail_events(log_path: Path, n: int = 8) -> list[str]:
         if evt == "page_fetched":
             out.append(f"{t_part} page  {username}  off{d.get('offset','?')}  {d.get('html_len',0) // 1024}KB")
         elif evt == "blog_done":
-            out.append(f"{t_part} done  {username}  unique={d.get('unique','?')} total={d.get('total','?')}")
+            flag = "  (unchanged)" if d.get("unchanged") else ""
+            out.append(f"{t_part} done  {username}  unique={d.get('unique','?')} total={d.get('total','?')}{flag}")
         elif evt == "blog_start":
             out.append(f"{t_part} start {username}  tier={d.get('tier','?')}")
         elif evt == "worker_stall_restart":
