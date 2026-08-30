@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import signal
 import sys
 from argparse import ArgumentParser
 from pathlib import Path
@@ -119,25 +120,6 @@ def main(argv: list[str] | None = None) -> int:
         ],
     )
 
-    # Signal handling — graceful shutdown on Ctrl-C / SIGTERM.
-    import signal as _signal
-
-    _cancel_requested = {"flag": False}
-
-    def _request_shutdown(signum, frame):
-        _cancel_requested["flag"] = True
-        print(
-            "\n\n⚠️  Shutdown requested (SIGINT/SIGTERM). "
-            "Finishing current blog, then exiting cleanly...",
-            file=sys.stderr,
-        )
-
-    try:
-        _signal.signal(_signal.SIGINT, _request_shutdown)
-        _signal.signal(_signal.SIGTERM, _request_shutdown)
-    except ValueError:
-        pass
-
     if args.dry_run:
         print("=== DRY RUN ===")
         print(f"Target:       {args.target_blog}")
@@ -150,15 +132,43 @@ def main(argv: list[str] | None = None) -> int:
         # Reset the clean event log for a fresh trace of this run.
         from eventlog import reset as ev_reset
         ev_reset()
+
+        # Caller-owned shutdown event. Registered with the event loop BEFORE the
+        # crawl starts so a SIGINT/SIGTERM during the crawl actually triggers
+        # shutdown (the coordinator + workers honor wall_halt). Registering it
+        # only AFTER queue_mode returns would be a no-op, because queue_mode does
+        # not return until the crawl ends.
+        wall_halt = asyncio.Event()
+
+        def _request_shutdown() -> None:
+            print(
+                "\n\n⚠️  Shutdown requested (SIGINT/SIGTERM). "
+                "Halting workers, finishing current blog, then exiting...",
+                file=sys.stderr,
+            )
+            wall_halt.set()
+
+        try:
+            loop = asyncio.get_running_loop()
+            for _sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(_sig, _request_shutdown)
+                except (NotImplementedError, RuntimeError):
+                    pass
+        except RuntimeError:
+            pass
+
         # The only production path is queue-mode: fresh Chrome, seed-on-queue,
         # worker pool drains T1/T2 in parallel from first extraction.
-        return await queue_mode(
+        result = await queue_mode(
             target_blog=args.target_blog,
             browser_ws=args.browser,
             cache_dir=args.cache_dir,
             verbose=args.verbose,
             pool_size=args.tabs,
+            wall_halt=wall_halt,
         )
+        return result
 
     try:
         result = asyncio.run(_run())

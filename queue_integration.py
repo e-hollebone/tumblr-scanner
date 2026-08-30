@@ -136,6 +136,7 @@ async def _drain_queue(
     cache_dir: Path,
     browser_ws: str,
     pool_size: int = WORKER_POOL_SIZE,
+    wall_halt: asyncio.Event | None = None,
 ) -> dict[str, Any]:
     """Drain the queue using a pool of workers. Parallel from first extraction.
 
@@ -143,13 +144,21 @@ async def _drain_queue(
     if empty, they sleep and retry. If the queue stays empty past the timeout,
     the worker exits. The pool runs until all workers exit.
 
+    Args:
+        wall_halt: caller-owned asyncio.Event used as the shutdown signal. If
+            None, a fresh event is created (self-contained runs). The coordinator
+            loop and every worker honor this event to release on shutdown.
+
     Returns drain stats.
     """
     processed = 0
     errors = 0
     total_enqueued = 0
     start = time.monotonic()
-    wall_halt = asyncio.Event()
+    # Use the caller-provided shutdown event if given (so an external signal
+    # handler can halt the crawl); otherwise create a self-contained one.
+    if wall_halt is None:
+        wall_halt = asyncio.Event()
 
     logger.info(
         "Starting queue drain (queue_size=%d, workers=%d)",
@@ -442,6 +451,7 @@ async def _drain_queue(
         "new_enqueued": total_enqueued,
         "elapsed_seconds": elapsed,
         "queue_final": queue_size(queue_path),
+        "wall_halt": wall_halt,
     }
 
 
@@ -451,6 +461,7 @@ async def queue_mode(
     cache_dir: Path,
     verbose: bool = False,
     pool_size: int = WORKER_POOL_SIZE,
+    wall_halt: asyncio.Event | None = None,
 ) -> dict[str, Any]:
     """Run the queue-mode pipeline: fresh Chrome, worker pool, parallel from first extraction.
 
@@ -459,6 +470,12 @@ async def queue_mode(
     3. Start the worker pool — workers pull from the queue immediately
     4. The seed blog is just another queue item; workers crawl it, enqueue
        discoveries, and other workers pick them up — no staging gate
+
+    Args:
+        wall_halt: optional caller-owned asyncio.Event. If provided, the drain
+            loop uses THIS event for shutdown (so an external signal handler
+            registered by the caller can set it to halt the crawl). If None, a
+            fresh event is created internally.
     """
     overall_start = time.monotonic()
 
@@ -507,6 +524,7 @@ async def queue_mode(
         cache_dir=cache_dir,
         browser_ws=actual_browser_ws,
         pool_size=pool_size,
+        wall_halt=wall_halt,
     )
 
     total_elapsed = time.monotonic() - overall_start
@@ -522,4 +540,5 @@ async def queue_mode(
         "index_path": str(INDEX_PATH),
         "drain": drain_result,
         "elapsed_seconds": total_elapsed,
+        "wall_halt": drain_result.get("wall_halt"),
     }
