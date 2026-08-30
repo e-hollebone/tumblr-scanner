@@ -3,6 +3,8 @@
 Every module imports from here. No magic numbers scattered across source
 files. To change timing, concurrency, or limits — edit this file.
 """
+import os
+import shutil
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -84,7 +86,21 @@ QUEUE_OVERFLOW_THRESHOLD = 10_000
 # Paths
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = Path("/Users/eric/Documents/tumblr-scanner/cache")
+# Cache root is overridable via TUMBLR_SCANNER_CACHE_DIR so a clone on another
+# machine (or CI) doesn't write into the original author's home directory.
+# Falls back to a project-relative ./cache if the env var is unset AND the
+# legacy absolute macOS path does not exist.
+def _resolve_cache_dir() -> Path:
+    env = os.environ.get("TUMBLR_SCANNER_CACHE_DIR")
+    if env:
+        return Path(env).expanduser()
+    legacy = Path("/Users/eric/Documents/tumblr-scanner/cache")
+    if legacy.exists() or legacy.parent.exists():
+        return legacy
+    return Path.cwd() / "cache"
+
+
+CACHE_DIR = _resolve_cache_dir()
 QUEUE_PATH = CACHE_DIR / "queue.jsonl"
 INDEX_PATH = CACHE_DIR / "index.json"
 
@@ -92,8 +108,42 @@ INDEX_PATH = CACHE_DIR / "index.json"
 # Chrome
 # ---------------------------------------------------------------------------
 
-CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-CHROME_USER_DATA_DIR = Path("/Users/eric/Documents/tumblr-scanner/chrome_profile")
+def _resolve_chrome_path() -> str:
+    """Locate the Chrome/Chromium binary in a platform-portable way.
+
+    Priority:
+      1. CHROME_PATH env var — explicit override for any OS (headless servers,
+         custom installs, etc.).
+      2. shutil.which() on common executable names (Linux/Windows/Homebrew).
+      3. macOS Application bundle (the original hardcoded default).
+    Raises RuntimeError only if nothing is found, so the failure is explicit
+    rather than a confusing "file not found" deep in the launch path.
+    """
+    env = os.environ.get("CHROME_PATH")
+    if env:
+        return env
+    for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return found
+    mac_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if Path(mac_path).exists():
+        return mac_path
+    raise RuntimeError(
+        "Chrome/Chromium not found. Set CHROME_PATH to the binary, "
+        "or install Chrome/Chromium on PATH."
+    )
+
+
+CHROME_PATH = _resolve_chrome_path()
+# Profile dir is overridable via TUMBLR_SCANNER_CHROME_PROFILE so an external
+# clone doesn't write into the original author's home directory.
+CHROME_USER_DATA_DIR = Path(
+    os.environ.get(
+        "TUMBLR_SCANNER_CHROME_PROFILE",
+        "/Users/eric/Documents/tumblr-scanner/chrome_profile",
+    )
+).expanduser()
 CDP_PORT = 9222
 CHROME_RESTART_TIMEOUT = 10
 
