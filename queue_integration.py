@@ -29,9 +29,9 @@ from cache import index_status
 from chrome_lifecycle import restart_chrome
 from config import (
     INDEX_PATH,
-    MAX_CONCURRENT_AGENTS,
     QUEUE_OVERFLOW_THRESHOLD,
     QUEUE_PATH,
+    WORKER_POOL_SIZE,
     WORKER_STALL_TIMEOUT,
 )
 from work_queue import cleanup as queue_cleanup
@@ -153,9 +153,9 @@ async def _drain_queue(
     logger.info(
         "Starting queue drain (queue_size=%d, workers=%d)",
         queue_size(queue_path),
-        MAX_CONCURRENT_AGENTS,
+        WORKER_POOL_SIZE,
     )
-    ev("coordinator", "drain_start", workers=MAX_CONCURRENT_AGENTS, queue_size=queue_size(queue_path))
+    ev("coordinator", "drain_start", workers=WORKER_POOL_SIZE, queue_size=queue_size(queue_path))
 
     # Live counters published to the dashboard (mutated by worker results
     # via the shared callback below). The coordinator only sees final
@@ -191,7 +191,7 @@ async def _drain_queue(
     # in_progress window between dequeue and mark_done (and that is exactly
     # what caused an early drain_complete in a prior run), so workers
     # advertise their crawl state explicitly via these events.
-    busy_events = [asyncio.Event() for _ in range(MAX_CONCURRENT_AGENTS)]
+    busy_events = [asyncio.Event() for _ in range(WORKER_POOL_SIZE)]
 
     # ACTIVE PROGRESS MONITOR (user directive 2026-08-28): busy_event only
     # tells the coordinator a worker THINKS it is busy. A worker stuck inside a
@@ -201,12 +201,12 @@ async def _drain_queue(
     # fetch and at blog start. The coordinator force-restarts any worker that
     # holds busy_event but has not progressed in WORKER_STALL_TIMEOUT seconds.
     progress_at: dict[int, float] = {
-        i: time.monotonic() for i in range(MAX_CONCURRENT_AGENTS)
+        i: time.monotonic() for i in range(WORKER_POOL_SIZE)
     }
     # Current blog each worker is on (set at blog_start) — for the live
     # dashboard. None = idle/not-yet-started.
     current_blog: dict[int, str | None] = {
-        i: None for i in range(MAX_CONCURRENT_AGENTS)
+        i: None for i in range(WORKER_POOL_SIZE)
     }
 
     # Launch the worker pool — each Worker instance owns its own tab
@@ -243,7 +243,7 @@ async def _drain_queue(
                 stats_cb=_make_stats_cb(),
             ).run(queue_path)
         )
-        for i in range(MAX_CONCURRENT_AGENTS)
+        for i in range(WORKER_POOL_SIZE)
     ]
 
     # Coordinator-owned shutdown: workers wait indefinitely for queue items
@@ -267,7 +267,7 @@ async def _drain_queue(
         # HUNG (a CDP await with no timeout). Do not wait passively — cancel the
         # stuck task and respawn a fresh worker so its tab/queue slot is reused.
         now = time.monotonic()
-        for i in range(MAX_CONCURRENT_AGENTS):
+        for i in range(WORKER_POOL_SIZE):
             if not busy_events[i].is_set():
                 stalled_restarted.discard(i)
                 continue
@@ -312,7 +312,7 @@ async def _drain_queue(
         # stalled (busy but silent >30s), idle (not busy). Then push a snapshot.
         workers_status = []
         last_stall = None
-        for i in range(MAX_CONCURRENT_AGENTS):
+        for i in range(WORKER_POOL_SIZE):
             lag = now - progress_at[i]
             if busy_events[i].is_set():
                 status = "stalled" if lag > 30 else "busy"
@@ -342,7 +342,7 @@ async def _drain_queue(
 
         if loop_count % 10 == 1 or qsize == 0 or not crawling:
             stalled = [
-                i for i in range(MAX_CONCURRENT_AGENTS)
+                i for i in range(WORKER_POOL_SIZE)
                 if busy_events[i].is_set()
                 and (now := time.monotonic()) - progress_at[i] > 30
             ]
@@ -353,7 +353,7 @@ async def _drain_queue(
                 qsize,
                 crawling,
                 idle_since,
-                {i: round(time.monotonic() - progress_at[i]) for i in range(MAX_CONCURRENT_AGENTS)},
+                {i: round(time.monotonic() - progress_at[i]) for i in range(WORKER_POOL_SIZE)},
             )
         if qsize == 0 and not crawling:
             if idle_since is None:
@@ -380,7 +380,7 @@ async def _drain_queue(
         errors=_live["errors"],
         enqueued=_live["enqueued"],
         workers=[{"id": i, "status": "idle", "current": None, "lag_s": 0.0}
-                 for i in range(MAX_CONCURRENT_AGENTS)],
+                 for i in range(WORKER_POOL_SIZE)],
         last_stall=None,
         login_wall=False,
         drain_complete=True,

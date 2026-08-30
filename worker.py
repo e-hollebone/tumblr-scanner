@@ -22,12 +22,12 @@ from agent import (
     LoginWallDetected,
     TabDeadError,
     crawl_blog,
-    probe_blog,
 )
 from config import (
     DELAY_MAX,
     DELAY_MIN,
     LIMITS_BY_TIER,
+    MAX_RECOVERY_PER_BLOG,
     QUEUE_POLL_INTERVAL,
     SKIP_USERNAME_PATTERNS,
 )
@@ -38,8 +38,10 @@ def _should_skip(username: str) -> bool:
     low = username.lower()
     return any(p in low for p in SKIP_USERNAME_PATTERNS)
 
+from eventlog import error as ev_err
+from eventlog import info as ev
+from eventlog import warn as ev_warn
 from work_queue import dequeue, mark_done
-from eventlog import info as ev, warn as ev_warn, error as ev_err
 
 logger = logging.getLogger("worker")
 
@@ -77,8 +79,11 @@ class Worker:
     # Tab lifecycle                                                      #
     # ------------------------------------------------------------------ #
 
-    async def _open_tab(self) -> None:
-        """Open a new Chrome tab. Called once at worker start."""
+    async def _open_tab(self) -> tuple[str, str]:
+        """Open a new Chrome tab. Called once at worker start.
+
+        Returns (ws_url, target_id).
+        """
         from agent import _new_tab_url
 
         self.ws_url, self.target_id = await _new_tab_url(
@@ -86,6 +91,7 @@ class Worker:
         )
         logger.info("Worker %d: opened tab targetId=%s", self.worker_id, self.target_id)
         ev("worker%d" % self.worker_id, "tab_opened", target_id=self.target_id)
+        return self.ws_url, self.target_id
 
     async def _close_tab(self) -> None:
         """Close the current Chrome tab (if any)."""
@@ -100,31 +106,19 @@ class Worker:
         self.target_id = None
         self.ws_url = None
 
-    async def _replace_tab(self) -> None:
-        """Open a fresh tab (recovery). Closes the dead tab first so we
-        don't leak one tab per recovery cycle."""
-        old_target = self.target_id
-        if old_target:
-            try:
-                from agent import close_tab
-                await close_tab(self.browser_ws, old_target)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Worker %d: failed to close dead tab %s: %s",
-                    self.worker_id, old_target, exc,
-                )
-        self.target_id = None
-        self.ws_url = None
-        await self._open_tab()
-
     # ------------------------------------------------------------------ #
     # WS URL refresh (NFR-9)                                             #
     # ------------------------------------------------------------------ #
 
-    async def _refresh_ws(self) -> None:
-        """Re-query /json/list for the current page WS URL of our tab."""
+    async def _refresh_ws_url(self) -> None:
+        """Re-query /json/list for the current page WS URL of our tab.
+
+        Raises RuntimeError if the tab is not found or WS URL cannot be
+        retrieved — forces recovery instead of silently continuing with
+        a stale connection.
+        """
         if not self.target_id:
-            return
+            raise RuntimeError("No target_id to refresh")
         import json
         import urllib.request
 
@@ -135,11 +129,175 @@ class Worker:
             for t in targets:
                 if t.get("type") == "page" and t.get("id") == self.target_id:
                     new_ws = t.get("webSocketDebuggerUrl")
-                    if new_ws and new_ws != self.ws_url:
+                    if new_ws:
                         self.ws_url = new_ws
-                    return
-        except Exception:  # noqa: BLE001
-            pass  # Keep existing WS URL on refresh failure
+                        return
+            raise RuntimeError(f"Tab targetId={self.target_id} not found in /json/list")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to refresh WS URL: {exc}") from exc
+
+    async def navigate_to(self, username: str, offset: int = 0) -> tuple[str, str]:
+        """Navigate worker's persistent tab to a Tumblr blog page.
+
+        Returns (html, final_url). Raises TabDeadError on CDP failure.
+        """
+        from cdp_use import CDPClient
+
+        from cdp_wrapper import TabDeadError, cdp_send
+
+        await self._refresh_ws_url()
+        if not self.ws_url:
+            raise TabDeadError("No WS URL available")
+
+        url = f"https://www.tumblr.com/{username}?offset={offset}"
+
+        client = CDPClient(self.ws_url)
+        await client.start()
+        try:
+            await cdp_send(client, "Page.navigate", {"url": url, "loadResponse": True}, timeout=15.0)
+
+            # Wait for content
+            deadline = time.monotonic() + 30.0
+            last_text = ""
+            while time.monotonic() < deadline:
+                await asyncio.sleep(1)
+                try:
+                    result = await cdp_send(
+                        client,
+                        "Runtime.evaluate",
+                        {
+                            "expression": "document.body ? document.body.innerText : ''",
+                            "returnByValue": True,
+                        },
+                    )
+                    new_text = result.get("result", {}).get("value", "")
+                    if new_text:
+                        last_text = new_text
+                        if len(new_text) > 100:
+                            break
+                except Exception:
+                    pass
+
+            # Get HTML
+            result = await cdp_send(
+                client,
+                "Runtime.evaluate",
+                {
+                    "expression": "JSON.stringify({html: document.documentElement.outerHTML, url: location.href})",
+                    "returnByValue": True,
+                },
+            )
+            payload = result.get("result", {}).get("value", "{}")
+            try:
+                import json
+                data = json.loads(payload)
+                html = data.get("html", "")
+                final_url = data.get("url", "")
+            except Exception:
+                html = payload
+                final_url = ""
+            return html, final_url
+        except Exception as exc:
+            raise TabDeadError(f"navigate_to failed: {exc}") from exc
+        finally:
+            await client.stop()
+
+    async def fetch_page(self, username: str, offset: int) -> tuple[str, str]:
+        """Fetch a page at offset using worker's persistent tab.
+
+        Returns (html, final_url). Raises TabDeadError on CDP failure.
+        """
+        return await self.navigate_to(username, offset)
+
+    async def probe_page_zero(self, username: str, html: str, final_url: str, cache_dir, index_path) -> dict:
+        """Probe page 0 for reindex mode — check if blog has new content since last crawl.
+
+        Uses the already-fetched page 0 HTML from navigate_to.
+        """
+        from cache import index_status, load_entry
+        from config import DEAD_PHRASES
+
+        # Check if blog is dead
+        if "blog-explorer" in final_url.lower():
+            # Reset the persistent tab to a blank page so the stale redirect
+            # response does not carry into the next blog's navigation (Gap 3 —
+            # verified: prior code returned skip but left the tab on the
+            # blog-explorer redirect page).
+            try:
+                from cdp_use import CDPClient
+
+                from cdp_wrapper import cdp_send
+                if self.ws_url:
+                    client = CDPClient(self.ws_url)
+                    await client.start()
+                    try:
+                        await cdp_send(client, "Page.navigate", {"url": "about:blank"}, timeout=15.0)
+                    finally:
+                        await client.stop()
+            except Exception:  # noqa: BLE001, S110
+                pass  # best effort; next navigate_to refreshes the WS anyway
+            return {"skip": True, "reason": "blog_explorer_redirect"}
+
+        page_text = html.lower()
+        for phrase in DEAD_PHRASES:
+            if phrase in page_text:
+                return {"skip": True, "reason": f"dead_phrase:{phrase}"}
+
+        # Compare with cached entry
+        idx_status = index_status(index_path, username)
+        if idx_status == "fresh":
+            return {"skip": True, "reason": "index_fresh"}
+
+        cached = load_entry(cache_dir / f"tier_1" / f"{username}.json")
+        if cached:
+            cached_usernames = set(cached.get("usernames", []))
+            current_usernames = set()
+            # Extract usernames from current page
+            import re
+            matches = re.findall(r'"([^"]+)"', html)
+            for m in matches:
+                if m.startswith("@"):
+                    current_usernames.add(m[1:].lower())
+
+            if cached_usernames == current_usernames:
+                return {"skip": True, "reason": "no_new_usernames"}
+
+        return {"skip": False}
+
+    async def _recover_tab(self) -> bool:
+        """Recover the worker's tab after a TabDeadError.
+
+        Closes the dead tab (best effort), opens a new one.
+        Returns True on success, False on failure.
+
+        Tab-open bounded by MAX_RECOVERY_PER_BLOG: the inner open loop must
+        not exceed the outer recovery count, or a storm of _open_tab failures
+        leaks one tab per attempt (Gap 1 — verified in MoA eval).
+        """
+        dead_id = self.target_id
+        if dead_id:
+            try:
+                from agent import close_tab
+                await close_tab(self.browser_ws, dead_id)
+            except Exception:  # noqa: BLE001, S110
+                pass  # Best effort
+        self.target_id = None
+        self.ws_url = None
+
+        for attempt in range(MAX_RECOVERY_PER_BLOG):
+            try:
+                self.target_id, self.ws_url = await self._open_tab()
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Worker %d: tab recovery attempt %d/%d failed: %s",
+                    self.worker_id,
+                    attempt + 1,
+                    MAX_RECOVERY_PER_BLOG,
+                    exc,
+                )
+                await asyncio.sleep(2 ** attempt)
+        return False
 
     # ------------------------------------------------------------------ #
     # Blog crawl                                                         #
@@ -155,17 +313,19 @@ class Worker:
         """Crawl a blog with tab-retry. Worker owns recovery.
 
         On TabDeadError from the agent: close dead tab, open new one, retry.
-        After MAX_RECOVERY_ATTEMPTS, re-raise as a non-fatal error dict.
+        After MAX_RECOVERY_PER_BLOG attempts, mark blog as error and return
+        error dict (do NOT re-queue).
         """
 
-        MAX_TAB_RETRIES = 3
+        MAX_RECOVERY = MAX_RECOVERY_PER_BLOG  # from config (1)
         last_exc: Exception | None = None
 
-        for attempt in range(1, MAX_TAB_RETRIES + 1):
+        for attempt in range(1, MAX_RECOVERY + 1):
             try:
                 return await crawl_blog(
                     browser_ws=self.browser_ws,
-                    ws_url=self.ws_url,
+                    navigate_fn=self.navigate_to,
+                    fetch_page_fn=lambda offset: self.fetch_page(username, offset),
                     username=username,
                     tier=tier,
                     unique_limit=LIMITS_BY_TIER[tier]["unique"],
@@ -185,12 +345,18 @@ class Worker:
                     self.worker_id,
                     username,
                     attempt,
-                    MAX_TAB_RETRIES,
+                    MAX_RECOVERY,
                     exc,
                 )
-                if attempt < MAX_TAB_RETRIES:
+                if attempt < MAX_RECOVERY:
                     await asyncio.sleep(2.0)
-                    await self._replace_tab()
+                    if not await self._recover_tab():
+                        logger.error(
+                            "Worker %d: tab recovery failed for %s",
+                            self.worker_id,
+                            username,
+                        )
+                        break
                 else:
                     logger.error(
                         "Worker %d: tab recovery exhausted for %s",
@@ -211,9 +377,43 @@ class Worker:
                         "dead_reason": "tab_recovery_exhausted",
                         "source_blog": None,
                     }
+            except Exception as exc:
+                logger.error(
+                    "Worker %d: unexpected error crawling %s: %s",
+                    self.worker_id,
+                    username,
+                    exc,
+                )
+                return {
+                    "username": username,
+                    "tier": tier,
+                    "status": "error",
+                    "unique_count": 0,
+                    "total_count": 0,
+                    "posts_processed": 0,
+                    "usernames": [],
+                    "all_occurrences": [],
+                    "per_page": [],
+                    "dead": True,
+                    "dead_reason": f"unexpected_error:{type(exc).__name__}",
+                    "source_blog": None,
+                }
 
-        # Unreachable — for type-checker
-        raise RuntimeError(f"unreachable: {last_exc}")
+        # If we got here, recovery failed completely
+        return {
+            "username": username,
+            "tier": tier,
+            "status": "error",
+            "unique_count": 0,
+            "total_count": 0,
+            "posts_processed": 0,
+            "usernames": [],
+            "all_occurrences": [],
+            "per_page": [],
+            "dead": True,
+            "dead_reason": "tab_recovery_failed",
+            "source_blog": None,
+        }
 
     # ------------------------------------------------------------------ #
     # Main worker loop                                                   #
@@ -292,12 +492,13 @@ class Worker:
                 # FR-7: reindex mode — probe page 0, compare dates
                 if mode == "reindex":
                     try:
-                        probe_result = await probe_blog(
-                            self.browser_ws,
-                            username,
-                            cache_dir=self.cache_dir,
-                            index_path=self.index_path,
-                        )
+                        # Navigate to page 0 using worker's persistent tab
+                        html, final_url = await self.navigate_to(username, 0)
+                        if html:
+                            from cache import index_status
+                            probe_result = await self.probe_page_zero(username, html, final_url, self.cache_dir, self.index_path)
+                        else:
+                            probe_result = {"skip": False}
                         if probe_result.get("skip"):
                             logger.info(
                                 "Worker %d: %s reindex probe — no new content",
@@ -326,7 +527,7 @@ class Worker:
                     continue
 
                 # NFR-9: refresh WS URL before each blog
-                await self._refresh_ws()
+                await self._refresh_ws_url()
 
                 ev("worker%d" % self.worker_id, "blog_start", username=username, tier=tier, mode=mode)
 
@@ -432,7 +633,19 @@ class Worker:
             # Close our tab on exit — the login session lives in the Chrome
             # profile dir, so closing the tab does NOT log us out. Leaving tabs
             # open is what accumulates across runs and OOMs Chrome.
-            await self._close_tab()
+            # Use shield to prevent cancellation from interrupting tab cleanup.
+            try:
+                await asyncio.shield(self._close_tab())
+            except Exception:  # noqa: BLE001, S110
+                pass  # Best effort
+            # Clear busy_event so a coordinator Task.cancel() mid-crawl cannot
+            # leave busy_events[i] stuck True and block drain_complete forever
+            # (Gap 5 — verified: only the inner busy_event.clear() sites ran;
+            # the finally path never cleared it on cancellation).
+            try:
+                self.busy_event.clear()
+            except Exception:  # noqa: BLE001, S110
+                pass
             logger.info("Worker %d: exiting — tab closed.", self.worker_id)
 
         return {"processed": processed, "errors": errors, "enqueued": enqueued}

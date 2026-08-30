@@ -10,8 +10,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 # Worker pool size = number of concurrent Chrome tabs. Must stay below the
-# Chrome crash threshold (observed ~30, practical max 4). 3 workers + headroom.
-MAX_CONCURRENT_AGENTS = 4
+# Chrome crash threshold (observed ~30, practical max 8). The design locks the
+# active worker pool at 3 persistent tabs (DESIGN.md:217, DESIGN_TAB_LIFECYCLE.md
+# invariant "tab count = MAX_CONCURRENT_AGENTS"); raise only with explicit reason.
+# NOTE: historical config value was 8 — changed to 3 to match the locked design
+# (MoA eval Gap 2: code=8 vs design=3 conflict).
+WORKER_POOL_SIZE = 3
 
 # ---------------------------------------------------------------------------
 # Timing (seconds)
@@ -41,7 +45,15 @@ QUEUE_EMPTY_TIMEOUT = 30.0
 WORKER_STALL_TIMEOUT = 180.0
 
 # ---------------------------------------------------------------------------
-# Limits per tier
+# Timeouts
+# ---------------------------------------------------------------------------
+
+CDP_COMMAND_TIMEOUT = 15.0
+CONTENT_WAIT_TIMEOUT = 30.0
+MAX_RECOVERY_PER_BLOG = 1
+
+# --------------------------------------------------------------------------- # noqa
+# Windows
 # ---------------------------------------------------------------------------
 
 T0_LIMITS = {"unique": 250, "total": 500, "posts": 500}
@@ -67,7 +79,7 @@ PROGRESS_INTERVAL = 30
 # ---------------------------------------------------------------------------
 
 # Stop pushing new items to the queue if it exceeds this depth.
-QUEUE_OVERFLOW_THRESHOLD = 2_500
+QUEUE_OVERFLOW_THRESHOLD = 10_000
 
 # ---------------------------------------------------------------------------
 # Paths

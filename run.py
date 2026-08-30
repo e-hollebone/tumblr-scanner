@@ -26,7 +26,7 @@ from typing import Any
 # Local imports — submodules we just wrote
 from agent import LoginWallDetected
 from cache import CACHE_DIR
-from config import DEFAULT_CDP_BROWSER, MAX_CONCURRENT_AGENTS
+from config import DEFAULT_CDP_BROWSER, WORKER_POOL_SIZE
 from queue_integration import queue_mode
 
 
@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Target:       {args.target_blog}")
         print(f"Browser:      {args.browser}")
         print(f"Cache:        {args.cache_dir}")
-        print(f"Concurrent:   {MAX_CONCURRENT_AGENTS}")
+        print(f"Concurrent:   {WORKER_POOL_SIZE}")
         return 0
 
     async def _run() -> dict[str, Any]:
