@@ -209,6 +209,9 @@ async def _drain_queue(
     current_blog: dict[int, str | None] = {
         i: None for i in range(pool_size)
     }
+    current_tier: dict[int, int | None] = {
+        i: None for i in range(pool_size)
+    }
 
     # Launch the worker pool — each Worker instance owns its own tab
     from worker import Worker
@@ -218,9 +221,10 @@ async def _drain_queue(
             progress_at[wid] = time.monotonic()
         return _cb
 
-    def _make_set_current_cb(wid: int) -> Callable[[str], None]:
-        def _cb(username: str) -> None:
+    def _make_set_current_cb(wid: int) -> Callable[[str, int], None]:
+        def _cb(username: str, tier: int) -> None:
             current_blog[wid] = username
+            current_tier[wid] = tier
         return _cb
 
     def _make_stats_cb() -> Callable[[str], None]:
@@ -325,6 +329,7 @@ async def _drain_queue(
                 "id": i,
                 "status": status,
                 "current": current_blog.get(i),
+                "tier": current_tier.get(i),
                 "lag_s": round(lag, 1),
             })
         _publish_status(

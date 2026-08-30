@@ -58,7 +58,7 @@ class Worker:
         wall_halt: asyncio.Event,
         busy_event: asyncio.Event | None = None,
         progress_cb: "Callable[[str], None] | None" = None,
-        set_current_cb: "Callable[[str], None] | None" = None,
+        set_current_cb: "Callable[[str, int], None] | None" = None,
         stats_cb: "Callable[[str], None] | None" = None,
     ) -> None:
         self.worker_id = worker_id
@@ -472,7 +472,7 @@ class Worker:
                 # drain complete while we are working this blog.
                 self.busy_event.set()
                 if self.set_current_cb:
-                    self.set_current_cb(username)  # dashboard: now on this blog
+                    self.set_current_cb(username, tier)  # dashboard: now on this blog
                 if self.progress_cb:
                     self.progress_cb(f"blog_start:{username}")  # heartbeat: we picked up a blog
 

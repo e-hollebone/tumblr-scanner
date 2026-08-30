@@ -108,6 +108,8 @@ def _render(s: dict, last_events: list[str]) -> str:
             wid = w["id"]
             st = w["status"]
             cur = w.get("current") or "(waiting)"
+            tier = w.get("tier")
+            tier_s = f"tier {tier} " if tier is not None else ""
             lag = w.get("lag_s")
             if lag is None:
                 lag_s = "—"
@@ -118,7 +120,7 @@ def _render(s: dict, last_events: list[str]) -> str:
             flag = ""
             if st == "stalled":
                 flag = "  ← STALLED"
-            lines.append(f"w{wid:<2} {st.upper():6} {cur:28} lag {lag_s}{flag}")
+            lines.append(f"w{wid:<2} {st.upper():6} {cur:28}  {tier_s}lag {lag_s}{flag}")
     else:
         lines.append("(workers not yet reported)")
 
