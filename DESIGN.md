@@ -499,6 +499,73 @@ The shutdown sequence:
 
 **Crash recovery on next start:** The next pipeline run reads the index and cache, skips already-completed blogs, and resumes from where the previous run stopped. Mid-blog worker termination loses that blog's partial data; the next cycle re-crawls it from the source blog's pages.
 
+#### 3.8.14 Companion Search (`search.py`)
+
+A read-only lookup tool over the index (`cache/index.json`), used to answer
+"is this username in the crawl, and where did it come from?" without running
+the crawler. It does not crawl, write, or modify any state — it only reads the
+index.
+
+**Index schema it queries** (actual `cache/index.json` shape — flat
+`username -> entry` dict):
+
+```json
+{
+  "username": "the-smallest-kitten-cravings",
+  "tier": 0,
+  "status": "limit_reached",
+  "scanned_at": "2026-08-27T21:55:37.580124+00:00",
+  "unique": 278,
+  "total": 18,
+  "posts": 18,
+  "usernames": ["name1", "name2", "..."],
+  "dead": false
+}
+```
+
+- `usernames` is the list of every name discovered on that blog (including
+  itself). This is what makes companion search possible: a target that was
+  never a seed blog can still be found as a *discovered* name inside another
+  blog's list.
+- `status` values observed in practice: `ok`, `limit_reached`, `error`,
+  `finished`, `dead`, `skipped`, `empty`.
+
+**Match modes:**
+
+- `exact` — case-insensitive normalized equality. The query is compared
+  (normalized) against each index *key* (the crawled blog) and against every
+  entry's `usernames` list. A hit on the key is reported as `match: self`; a
+  hit inside a `usernames` list is reported as `match: companion` with the
+  surfacing blog named.
+- `partial` — substring containment after normalization, plus stemming of the
+  `-deactivatedYYYY` noise suffix (e.g. `amazingkinks-deactivated` matches
+  `amazingkinks-deactivated2015080`).
+
+**Normalization:** both the query and every index key/name are lowercased and
+run through a digit→letter map that collapses the common OCR/leet confusions
+between digits and letters, so a mangled query still hits the real name:
+
+```python
+DIGIT_TO_LETTER = {"0": "o", "1": "l", "3": "e", "4": "a",
+                   "5": "s", "7": "t", "8": "b"}
+```
+
+Because both sides are normalized the same way, a digit in the query matches a
+letter in the index and vice versa (e.g. `submisiv3-tendencies` →
+`submisive-tendencies`).
+
+**Usage:**
+
+```
+python3 search.py <target> [--mode exact|partial] [--index path]
+python3 search.py the-smallest-kitten-cravings --mode exact
+python3 search.py kitten --mode partial
+python3 search.py "submisiv3-tendencies" --mode exact
+```
+
+Output: one row per match with `target_blog`, `tier`, `status`, `unique`,
+`posts`, and `match: self|companion` (with `via <name>` when a companion hit).
+
 #### 3.14 Configuration
 
 All pipeline tunables live in a single `config.py`:
@@ -1024,6 +1091,7 @@ These are the issues in the pre-refactor codebase that the v3 design resolves. T
 | `worker.py` | Worker class (tab owner) | **Created** — owns tab lifecycle, crawl loop, recovery |
 | `agent.py` | Pure CDP library | Refactored — `crawl_blog()` accepts `ws_url`, raises `TabDeadError` |
 | `extractor.py` | HTML → usernames | Exists — canonical, unchanged |
+| `search.py` | Read-only companion search over `cache/index.json` (exact/partial + digit→letter normalization) | Exists — documents `§3.8.14` |
 | `cache.py` | JSON cache, index, staleness | Exists — needs index functions |
 | `chrome_lifecycle.py` | Fresh Chrome restart (dedicated profile) | Exists — verified working |
 | `lint_modules.py` | py_compile | Exists |
