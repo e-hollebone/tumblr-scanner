@@ -135,6 +135,7 @@ async def _drain_queue(
     index_path: Path,
     cache_dir: Path,
     browser_ws: str,
+    pool_size: int = WORKER_POOL_SIZE,
 ) -> dict[str, Any]:
     """Drain the queue using a pool of workers. Parallel from first extraction.
 
@@ -153,9 +154,9 @@ async def _drain_queue(
     logger.info(
         "Starting queue drain (queue_size=%d, workers=%d)",
         queue_size(queue_path),
-        WORKER_POOL_SIZE,
+        pool_size,
     )
-    ev("coordinator", "drain_start", workers=WORKER_POOL_SIZE, queue_size=queue_size(queue_path))
+    ev("coordinator", "drain_start", workers=pool_size, queue_size=queue_size(queue_path))
 
     # Live counters published to the dashboard (mutated by worker results
     # via the shared callback below). The coordinator only sees final
@@ -191,7 +192,7 @@ async def _drain_queue(
     # in_progress window between dequeue and mark_done (and that is exactly
     # what caused an early drain_complete in a prior run), so workers
     # advertise their crawl state explicitly via these events.
-    busy_events = [asyncio.Event() for _ in range(WORKER_POOL_SIZE)]
+    busy_events = [asyncio.Event() for _ in range(pool_size)]
 
     # ACTIVE PROGRESS MONITOR (user directive 2026-08-28): busy_event only
     # tells the coordinator a worker THINKS it is busy. A worker stuck inside a
@@ -201,19 +202,19 @@ async def _drain_queue(
     # fetch and at blog start. The coordinator force-restarts any worker that
     # holds busy_event but has not progressed in WORKER_STALL_TIMEOUT seconds.
     progress_at: dict[int, float] = {
-        i: time.monotonic() for i in range(WORKER_POOL_SIZE)
+        i: time.monotonic() for i in range(pool_size)
     }
     # Current blog each worker is on (set at blog_start) — for the live
     # dashboard. None = idle/not-yet-started.
     current_blog: dict[int, str | None] = {
-        i: None for i in range(WORKER_POOL_SIZE)
+        i: None for i in range(pool_size)
     }
 
     # Launch the worker pool — each Worker instance owns its own tab
     from worker import Worker
 
-    def _make_progress_cb(wid: int) -> Callable[[], None]:
-        def _cb() -> None:
+    def _make_progress_cb(wid: int) -> Callable[[str], None]:
+        def _cb(msg: str) -> None:
             progress_at[wid] = time.monotonic()
         return _cb
 
@@ -243,7 +244,7 @@ async def _drain_queue(
                 stats_cb=_make_stats_cb(),
             ).run(queue_path)
         )
-        for i in range(WORKER_POOL_SIZE)
+        for i in range(pool_size)
     ]
 
     # Coordinator-owned shutdown: workers wait indefinitely for queue items
@@ -267,7 +268,7 @@ async def _drain_queue(
         # HUNG (a CDP await with no timeout). Do not wait passively — cancel the
         # stuck task and respawn a fresh worker so its tab/queue slot is reused.
         now = time.monotonic()
-        for i in range(WORKER_POOL_SIZE):
+        for i in range(pool_size):
             if not busy_events[i].is_set():
                 stalled_restarted.discard(i)
                 continue
@@ -312,7 +313,7 @@ async def _drain_queue(
         # stalled (busy but silent >30s), idle (not busy). Then push a snapshot.
         workers_status = []
         last_stall = None
-        for i in range(WORKER_POOL_SIZE):
+        for i in range(pool_size):
             lag = now - progress_at[i]
             if busy_events[i].is_set():
                 status = "stalled" if lag > 30 else "busy"
@@ -342,7 +343,7 @@ async def _drain_queue(
 
         if loop_count % 10 == 1 or qsize == 0 or not crawling:
             stalled = [
-                i for i in range(WORKER_POOL_SIZE)
+                i for i in range(pool_size)
                 if busy_events[i].is_set()
                 and (now := time.monotonic()) - progress_at[i] > 30
             ]
@@ -353,18 +354,38 @@ async def _drain_queue(
                 qsize,
                 crawling,
                 idle_since,
-                {i: round(time.monotonic() - progress_at[i]) for i in range(WORKER_POOL_SIZE)},
+                {i: round(time.monotonic() - progress_at[i]) for i in range(pool_size)},
             )
-        if qsize == 0 and not crawling:
+        # Gate on queue emptiness ONLY (active_count is swap-race-proofed in
+        # work_queue.py). Do NOT also require `not crawling` — workers clear
+        # busy_event in finally between blogs, so `not crawling` is routinely
+        # true mid-crawl and was the cause of a false drain_complete that left
+        # thousands of pending items unprocessed. If the queue is genuinely
+        # empty, workers have nothing to pick up, so `qsize==0` sustained for
+        # DRAIN_IDLE_GRACE is the correct and sufficient completion signal.
+        if qsize == 0:
             if idle_since is None:
                 idle_since = time.monotonic()
             elif time.monotonic() - idle_since >= DRAIN_IDLE_GRACE:
-                logger.info(
-                    "Coordinator: queue empty for %.0fs — crawl complete, halting workers",
-                    time.monotonic() - idle_since,
-                )
-                wall_halt.set()
-                break
+                # FINAL GUARD: re-read the queue immediately before halting.
+                # The single qsize==0 that opened the grace window could have
+                # been a transient (workers between blogs, producer paused). If
+                # there is ANY pending work now, abort the exit and keep draining.
+                final_check = active_count(queue_path)
+                if final_check > 0:
+                    logger.warning(
+                        "Coordinator: final pre-halt re-check found %d pending "
+                        "(transient empty during grace) — continuing drain",
+                        final_check,
+                    )
+                    idle_since = None
+                else:
+                    logger.info(
+                        "Coordinator: queue empty for %.0fs — crawl complete, halting workers",
+                        time.monotonic() - idle_since,
+                    )
+                    wall_halt.set()
+                    break
         else:
             idle_since = None
 
@@ -380,7 +401,7 @@ async def _drain_queue(
         errors=_live["errors"],
         enqueued=_live["enqueued"],
         workers=[{"id": i, "status": "idle", "current": None, "lag_s": 0.0}
-                 for i in range(WORKER_POOL_SIZE)],
+                 for i in range(pool_size)],
         last_stall=None,
         login_wall=False,
         drain_complete=True,
@@ -424,6 +445,7 @@ async def queue_mode(
     browser_ws: str,
     cache_dir: Path,
     verbose: bool = False,
+    pool_size: int = WORKER_POOL_SIZE,
 ) -> dict[str, Any]:
     """Run the queue-mode pipeline: fresh Chrome, worker pool, parallel from first extraction.
 
@@ -479,6 +501,7 @@ async def queue_mode(
         index_path=INDEX_PATH,
         cache_dir=cache_dir,
         browser_ws=actual_browser_ws,
+        pool_size=pool_size,
     )
 
     total_elapsed = time.monotonic() - overall_start

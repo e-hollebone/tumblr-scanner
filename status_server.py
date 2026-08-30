@@ -15,6 +15,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from config import CACHE_DIR
+
 _snapshot: dict = {
     "started_at": None,
     "now": 0.0,
@@ -195,7 +197,7 @@ def _tail_events(log_path: Path, n: int = 8) -> list[str]:
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         s = snapshot_copy()
-        events = _tail_events(Path("cache/worker_events.log"))
+        events = _tail_events(CACHE_DIR / "worker_events.log")
         text = _render(s, events)
         # HTML wrapper with auto-refresh every 10s. <pre> keeps the plain-text look.
         body = (

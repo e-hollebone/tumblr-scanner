@@ -57,7 +57,7 @@ class Worker:
         index_path: Path,
         wall_halt: asyncio.Event,
         busy_event: asyncio.Event | None = None,
-        progress_cb: "Callable[[], None] | None" = None,
+        progress_cb: "Callable[[str], None] | None" = None,
         set_current_cb: "Callable[[str], None] | None" = None,
         stats_cb: "Callable[[str], None] | None" = None,
     ) -> None:
@@ -474,7 +474,7 @@ class Worker:
                 if self.set_current_cb:
                     self.set_current_cb(username)  # dashboard: now on this blog
                 if self.progress_cb:
-                    self.progress_cb()  # heartbeat: we picked up a blog
+                    self.progress_cb(f"blog_start:{username}")  # heartbeat: we picked up a blog
 
                 # NFR-10: index check at dispatch time
                 idx_status = index_status(self.index_path, username)
@@ -552,17 +552,19 @@ class Worker:
                         username, tier, mode, _enqueue_page
                     )
                     if not result.get("usernames"):
-                        # Only count as "empty" when the extractor parsed
-                        # nothing at all (posts=0). Blogs with posts>0 but
-                        # usernames=0 are legitimately empty (no reblogs/
-                        # original content) — not a markup failure.
-                        if result.get("posts_processed", 0) == 0:
+                        # A blog with status="ok" but 0 posts is legitimately
+                        # empty (NSFW/login-wall pages return no content) — NOT
+                        # a markup failure. Only treat a blog as suspicious if
+                        # the crawl itself errored (status="error") or we got a
+                        # wall/dead signal, which would indicate the extractor
+                        # or page load genuinely broke across the board.
+                        if result.get("status") == "error":
                             consecutive_empty += 1
                         else:
                             consecutive_empty = 0
                         if consecutive_empty >= 3:
                             logger.error(
-                                "Worker %d: %d consecutive blogs yielded 0 posts — "
+                                "Worker %d: %d consecutive blogs errored — "
                                 "Tumblr markup may have changed. Halting pipeline.",
                                 self.worker_id, consecutive_empty,
                             )

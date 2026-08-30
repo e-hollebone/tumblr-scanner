@@ -19,10 +19,11 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-EVENT_LOG_PATH = Path("./cache/worker_events.log")
+from config import CACHE_DIR
+
+EVENT_LOG_PATH = CACHE_DIR / "worker_events.log"
 
 _lock = threading.Lock()
 

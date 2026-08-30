@@ -88,6 +88,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print plan without executing any CDP calls",
     )
+    parser.add_argument(
+        "--tabs",
+        type=int,
+        default=WORKER_POOL_SIZE,
+        help=f"Number of concurrent Chrome tabs / workers (default: {WORKER_POOL_SIZE}; "
+             f"Chrome crash threshold ~30, practical max 8). Overrides config WORKER_POOL_SIZE.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -136,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Target:       {args.target_blog}")
         print(f"Browser:      {args.browser}")
         print(f"Cache:        {args.cache_dir}")
-        print(f"Concurrent:   {WORKER_POOL_SIZE}")
+        print(f"Concurrent:   {args.tabs} (config WORKER_POOL_SIZE={WORKER_POOL_SIZE})")
         return 0
 
     async def _run() -> dict[str, Any]:
@@ -150,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
             browser_ws=args.browser,
             cache_dir=args.cache_dir,
             verbose=args.verbose,
+            pool_size=args.tabs,
         )
 
     try:

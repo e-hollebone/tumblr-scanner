@@ -14,13 +14,15 @@ import socket
 import subprocess
 import time
 import urllib.request
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("chrome-lifecycle")
 
-# Dedicated profile — separate from the user's personal Chrome
-CHROME_PROFILE_DIR = Path("./chrome_profile").resolve()
+# Dedicated profile — separate from the user's personal Chrome.
+# Uses the absolute CACHE_DIR-based profile path from config so the launch
+# directory no longer matters.
+from config import CHROME_USER_DATA_DIR
+CHROME_PROFILE_DIR = CHROME_USER_DATA_DIR
 CHROME_DEBUG_PORT = 9222
 CHROME_FALLBACK_PORTS = [9223, 9224, 9225, 9226]
 

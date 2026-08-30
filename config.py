@@ -16,7 +16,6 @@ from pathlib import Path
 # NOTE: historical config value was 8 — changed to 3 to match the locked design
 # (MoA eval Gap 2: code=8 vs design=3 conflict).
 WORKER_POOL_SIZE = 3
-
 # ---------------------------------------------------------------------------
 # Timing (seconds)
 # ---------------------------------------------------------------------------
