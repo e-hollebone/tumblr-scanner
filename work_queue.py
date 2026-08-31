@@ -100,27 +100,43 @@ def _read_lines(path: Path) -> list[dict[str, Any]]:
 def _read_lines_from_fd(fd: int) -> list[dict[str, Any]]:
     """Read and parse all JSON lines from an already-open, locked file descriptor.
 
-    This avoids the double-open race in the old _read_lines(path): the fd we
-    hold was opened to the inode that existed when we acquired the flock,
-    so the flock actually protects the read. Reading from the same fd
-    means os.replace() swaps cannot make the file appear empty mid-read.
+    Uses raw os.read to avoid Python file-object buffering issues that cause
+    position corruption when the same fd is later written to via _write_lines.
     """
     out: list[dict[str, Any]] = []
     os.lseek(fd, 0, os.SEEK_SET)
-    with open(fd, "r", encoding="utf-8", closefd=False) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                logger.warning("Skipping malformed queue line: %s", line[:80])
+    data = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    for line in data.decode("utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            logger.warning("Skipping malformed queue line: %s", line[:80])
     return out
 
 
-def _write_lines(path: Path, lines: list[dict[str, Any]]) -> None:
-    """Overwrite the queue file with the given lines (not append)."""
+def _write_lines(path: Path, lines: list[dict[str, Any]], fd: int | None = None) -> None:
+    """Overwrite the queue file with the given lines (not append).
+
+    If fd is provided, write in-place using raw os.write (no Python buffering)
+    so the inode and any held lockf persist across the write. Using raw
+    os.write + os.ftruncate avoids Python file-object position/buffer issues
+    that corrupt lines under concurrent load.
+    """
+    if fd is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = b"".join((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8") for item in lines)
+        os.write(fd, raw)
+        os.ftruncate(fd, len(raw))
+        os.fsync(fd)
+        return
     tmp = path.with_suffix(".queue.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         f.writelines(json.dumps(item, ensure_ascii=False) + "\n" for item in lines)
@@ -159,7 +175,6 @@ def enqueue(
     queue_path.touch(exist_ok=True)
     with _queue_lock:
         with open(queue_path, "r+", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 lines = _read_lines_from_fd(f.fileno())
                 names = {
@@ -191,7 +206,6 @@ def dequeue(queue_path: Path) -> dict[str, Any] | None:
     queue_path.touch(exist_ok=True)
     with _queue_lock:
         with open(queue_path, "r+", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 lines = _read_lines_from_fd(f.fileno())
                 for i, item in enumerate(lines):
@@ -199,7 +213,7 @@ def dequeue(queue_path: Path) -> dict[str, Any] | None:
                         item["state"] = "in_progress"
                         item["claimed_at"] = _now_iso()
                         lines[i] = item
-                        _write_lines(queue_path, lines)
+                        _write_lines(queue_path, lines, f.fileno())
                         return item
                 return None
             finally:
@@ -216,14 +230,13 @@ def mark_done(queue_path: Path, username: str) -> None:
         return
     with _queue_lock:
         with open(queue_path, "r+", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 lines = _read_lines_from_fd(f.fileno())
                 for item in lines:
                     if item.get("username", "").lower() == username:
                         item["state"] = "done"
                         item["completed_at"] = _now_iso()
-                        _write_lines(queue_path, lines)
+                        _write_lines(queue_path, lines, f.fileno())
                         return
             finally:
                 pass
@@ -249,7 +262,6 @@ def cleanup(queue_path: Path) -> int:
     queue_path.touch(exist_ok=True)
     with _queue_lock:
         with open(queue_path, "r+", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 lines = _read_lines_from_fd(f.fileno())
                 new_lines: list[dict[str, Any]] = []
@@ -271,25 +283,19 @@ def cleanup(queue_path: Path) -> int:
                         logger.info("Dropped in_progress %s (already in index)", name)
                         continue
                     new_lines.append(item)
-                _write_lines(queue_path, new_lines)
+                _write_lines(queue_path, new_lines, f.fileno())
                 return removed
             finally:
                 pass
 
 
 def queue_size(queue_path: Path) -> int:
-    """Return total lines in the queue file (all states).
-
-    Uses a locked fd read to avoid the os.replace() swap-race that would
-    otherwise make the file intermittently appear empty during heavy
-    mark_done churn.
-    """
+    """Return total lines in the queue file (all states)."""
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
     try:
         with _queue_lock:
             with open(queue_path, "r+", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
                 try:
                     return len(_read_lines_from_fd(f.fileno()))
                 finally:
@@ -299,26 +305,12 @@ def queue_size(queue_path: Path) -> int:
 
 
 def active_count(queue_path: Path) -> int:
-    """Count items still requiring work: pending (state "") + in_progress.
-
-    "done" entries are excluded — they have been crawled and are only waiting
-    for the end-of-drain cleanup to remove them. Used by the coordinator to
-    decide when the crawl is genuinely finished (no pending and nothing mid-
-    crawl), so it does not mistake leftover "done" lines for live work.
-
-    RACE-PROOF (2026-08-31): reads from the locked fd directly via
-    _read_lines_from_fd() instead of re-opening the file by path. The old
-    double-open path raced the os.replace() swap in mark_done, so during heavy
-    dequeue/mark_done churn active_count intermittently returned 0 even though
-    thousands of pending items remained — which triggered a premature
-    drain_complete and halted the crawl with the queue still full.
-    """
+    """Count items still requiring work: pending (state "") + in_progress."""
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
     try:
         with _queue_lock:
             with open(queue_path, "r+", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
                 try:
                     lines = _read_lines_from_fd(f.fileno())
                 finally:
