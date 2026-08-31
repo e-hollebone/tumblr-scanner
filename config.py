@@ -53,6 +53,16 @@ CDP_COMMAND_TIMEOUT = 15.0
 CONTENT_WAIT_TIMEOUT = 30.0
 MAX_RECOVERY_PER_BLOG = 1
 
+# Login-wall confirmation (fix A): a detected wall is treated as a *soft*
+# signal and retried before halting the whole pipeline. Tumblr's rate-limit /
+# "are you human" interstitial routes through a /login URL, which the
+# URL-only detector (agent.detect_login_wall) misreads as a hard login wall.
+# A transient interstitial clears on retry; a genuine auth gate does not.
+# After WALL_RETRY_MAX failed attempts the wall is accepted as real and the
+# pipeline halts (so a true gate still tells the user to log in).
+WALL_RETRY_MAX = 2
+WALL_RETRY_BACKOFF_S = 15.0
+
 # --------------------------------------------------------------------------- # noqa
 # Windows
 # ---------------------------------------------------------------------------

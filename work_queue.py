@@ -24,12 +24,21 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("queue")
+
+# Module-level threading lock — serializes all queue operations across threads
+# in this process. On macOS, fcntl.flock is per-open-file-description, so a
+# flock held by one thread does NOT block another thread that opens its own fd
+# to the same path. The threading lock closes that gap: it guarantees mutual
+# exclusion within the process, while flock still protects against other
+# processes. Held together, they make queue operations atomic.
+_queue_lock = threading.Lock()
 
 DEFAULT_QUEUE = Path("/Users/eric/Documents/tumblr-scanner/cache/queue.jsonl")
 LOCK_DEADLINE = 30.0  # total wait before exit(2)
@@ -72,10 +81,33 @@ def acquire_lock_timeout(fd: int, timeout: float = LOCK_DEADLINE) -> None:
 
 
 def _read_lines(path: Path) -> list[dict[str, Any]]:
+    """Read and parse all JSON lines from a queue file path."""
     if not path.exists():
         return []
     out: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed queue line: %s", line[:80])
+    return out
+
+
+def _read_lines_from_fd(fd: int) -> list[dict[str, Any]]:
+    """Read and parse all JSON lines from an already-open, locked file descriptor.
+
+    This avoids the double-open race in the old _read_lines(path): the fd we
+    hold was opened to the inode that existed when we acquired the flock,
+    so the flock actually protects the read. Reading from the same fd
+    means os.replace() swaps cannot make the file appear empty mid-read.
+    """
+    out: list[dict[str, Any]] = []
+    os.lseek(fd, 0, os.SEEK_SET)
+    with open(fd, "r", encoding="utf-8", closefd=False) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -125,28 +157,29 @@ def enqueue(
 
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
-    with open(queue_path, "r+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            lines = _read_lines(queue_path)
-            names = {
-                ln.get("username", "").lower()
-                for ln in lines
-                if ln.get("state", "") != "done"
-            }
-            if username in names:
-                return
-            _append_line(
-                queue_path,
-                {
-                    "username": username,
-                    "state": state,
-                    "tier": tier,
-                    "mode": mode,
-                },
-            )
-        finally:
-            pass
+    with _queue_lock:
+        with open(queue_path, "r+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                lines = _read_lines_from_fd(f.fileno())
+                names = {
+                    ln.get("username", "").lower()
+                    for ln in lines
+                    if ln.get("state", "") != "done"
+                }
+                if username in names:
+                    return
+                _append_line(
+                    queue_path,
+                    {
+                        "username": username,
+                        "state": state,
+                        "tier": tier,
+                        "mode": mode,
+                    },
+                )
+            finally:
+                pass
 
 
 def dequeue(queue_path: Path) -> dict[str, Any] | None:
@@ -156,20 +189,21 @@ def dequeue(queue_path: Path) -> dict[str, Any] | None:
     """
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
-    with open(queue_path, "r+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            lines = _read_lines(queue_path)
-            for i, item in enumerate(lines):
-                if item.get("state", "") in ("", None):
-                    item["state"] = "in_progress"
-                    item["claimed_at"] = _now_iso()
-                    lines[i] = item
-                    _write_lines(queue_path, lines)
-                    return item
-            return None
-        finally:
-            pass
+    with _queue_lock:
+        with open(queue_path, "r+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                lines = _read_lines_from_fd(f.fileno())
+                for i, item in enumerate(lines):
+                    if item.get("state", "") in ("", None):
+                        item["state"] = "in_progress"
+                        item["claimed_at"] = _now_iso()
+                        lines[i] = item
+                        _write_lines(queue_path, lines)
+                        return item
+                return None
+            finally:
+                pass
 
 
 def mark_done(queue_path: Path, username: str) -> None:
@@ -180,18 +214,19 @@ def mark_done(queue_path: Path, username: str) -> None:
     username = username.strip().lower()
     if not queue_path.exists():
         return
-    with open(queue_path, "r+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            lines = _read_lines(queue_path)
-            for item in lines:
-                if item.get("username", "").lower() == username:
-                    item["state"] = "done"
-                    item["completed_at"] = _now_iso()
-                    _write_lines(queue_path, lines)
-                    return
-        finally:
-            pass
+    with _queue_lock:
+        with open(queue_path, "r+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                lines = _read_lines_from_fd(f.fileno())
+                for item in lines:
+                    if item.get("username", "").lower() == username:
+                        item["state"] = "done"
+                        item["completed_at"] = _now_iso()
+                        _write_lines(queue_path, lines)
+                        return
+            finally:
+                pass
 
 
 def cleanup(queue_path: Path) -> int:
@@ -212,44 +247,55 @@ def cleanup(queue_path: Path) -> int:
 
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
-    with open(queue_path, "r+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            lines = _read_lines(queue_path)
-            new_lines: list[dict[str, Any]] = []
-            removed = 0
-            for item in lines:
-                state = item.get("state", "")
-                name = item.get("username", "").lower()
-                if state == "done":
-                    removed += 1
-                    continue
-                if state == "in_progress" and name not in index:
-                    # Worker crashed — reset to pending
-                    item["state"] = ""
-                    item.pop("claimed_at", None)
-                    logger.info("Reset in_progress %s to pending (not in index)", name)
-                elif state == "in_progress" and name in index:
-                    # Worker finished but didn't clean up — drop
-                    removed += 1
-                    logger.info("Dropped in_progress %s (already in index)", name)
-                    continue
-                new_lines.append(item)
-            _write_lines(queue_path, new_lines)
-            return removed
-        finally:
-            pass
+    with _queue_lock:
+        with open(queue_path, "r+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                lines = _read_lines_from_fd(f.fileno())
+                new_lines: list[dict[str, Any]] = []
+                removed = 0
+                for item in lines:
+                    state = item.get("state", "")
+                    name = item.get("username", "").lower()
+                    if state == "done":
+                        removed += 1
+                        continue
+                    if state == "in_progress" and name not in index:
+                        # Worker crashed — reset to pending
+                        item["state"] = ""
+                        item.pop("claimed_at", None)
+                        logger.info("Reset in_progress %s to pending (not in index)", name)
+                    elif state == "in_progress" and name in index:
+                        # Worker finished but didn't clean up — drop
+                        removed += 1
+                        logger.info("Dropped in_progress %s (already in index)", name)
+                        continue
+                    new_lines.append(item)
+                _write_lines(queue_path, new_lines)
+                return removed
+            finally:
+                pass
 
 
 def queue_size(queue_path: Path) -> int:
+    """Return total lines in the queue file (all states).
+
+    Uses a locked fd read to avoid the os.replace() swap-race that would
+    otherwise make the file intermittently appear empty during heavy
+    mark_done churn.
+    """
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
-    with open(queue_path, "r+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-        try:
-            return len(_read_lines(queue_path))
-        finally:
-            pass
+    try:
+        with _queue_lock:
+            with open(queue_path, "r+", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    return len(_read_lines_from_fd(f.fileno()))
+                finally:
+                    pass
+    except (FileNotFoundError, OSError):
+        return 0
 
 
 def active_count(queue_path: Path) -> int:
@@ -260,37 +306,26 @@ def active_count(queue_path: Path) -> int:
     decide when the crawl is genuinely finished (no pending and nothing mid-
     crawl), so it does not mistake leftover "done" lines for live work.
 
-    RACE-PROOFING (2026-08-28): the queue file is rewritten via os.replace(),
-    which briefly makes the target path absent. A reader that opens the file in
-    that window sees an EMPTY file and would report active_count == 0, even
-    when thousands of items are pending. That intermittent-0 was the cause of
-    the coordinator's premature drain_complete (it saw "empty for 15s" during
-    heavy dequeue/mark_done churn). Mitigation: retry the read a few times when
-    the file is empty-or-absent; only return 0 if it is genuinely, persistently
-    empty. This converts a transient swap-race into a non-event.
+    RACE-PROOF (2026-08-31): reads from the locked fd directly via
+    _read_lines_from_fd() instead of re-opening the file by path. The old
+    double-open path raced the os.replace() swap in mark_done, so during heavy
+    dequeue/mark_done churn active_count intermittently returned 0 even though
+    thousands of pending items remained — which triggered a premature
+    drain_complete and halted the crawl with the queue still full.
     """
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
-    for _ in range(5):
-        try:
+    try:
+        with _queue_lock:
             with open(queue_path, "r+", encoding="utf-8") as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_SH)
                 try:
-                    lines = _read_lines(queue_path)
+                    lines = _read_lines_from_fd(f.fileno())
                 finally:
                     pass
-        except (FileNotFoundError, OSError):
-            # Target briefly absent during an os.replace() swap — retry.
-            time.sleep(0.005)
-            continue
-        # Empty read: could be a genuine empty queue OR a mid-swap race.
-        # Retry to distinguish; only trust a persistently-empty file.
-        if not lines:
-            time.sleep(0.005)
-            continue
-        return sum(1 for ln in lines if ln.get("state", "") != "done")
-    # After retries the file is still empty/absent — it really is drained.
-    return 0
+    except (FileNotFoundError, OSError):
+        return 0
+    return sum(1 for ln in lines if ln.get("state", "") != "done")
 
 
 # ---------------------------------------------------------------------------

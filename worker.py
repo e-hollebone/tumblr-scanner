@@ -30,6 +30,8 @@ from config import (
     MAX_RECOVERY_PER_BLOG,
     QUEUE_POLL_INTERVAL,
     SKIP_USERNAME_PATTERNS,
+    WALL_RETRY_BACKOFF_S,
+    WALL_RETRY_MAX,
 )
 
 
@@ -320,24 +322,54 @@ class Worker:
         MAX_RECOVERY = MAX_RECOVERY_PER_BLOG  # from config (1)
         last_exc: Exception | None = None
 
+        def _do_crawl():
+            return crawl_blog(
+                browser_ws=self.browser_ws,
+                navigate_fn=self.navigate_to,
+                fetch_page_fn=lambda offset: self.fetch_page(username, offset),
+                username=username,
+                tier=tier,
+                unique_limit=LIMITS_BY_TIER[tier]["unique"],
+                total_limit=LIMITS_BY_TIER[tier]["total"],
+                post_limit=LIMITS_BY_TIER[tier]["posts"],
+                delay_min=DELAY_MIN,
+                delay_max=DELAY_MAX,
+                source_blog=None,
+                cache_dir=self.cache_dir,
+                on_page=lambda name, users, t: enqueue_fn(name, users, t),
+                on_progress=self.progress_cb,
+            )
+
         for attempt in range(1, MAX_RECOVERY + 1):
             try:
-                return await crawl_blog(
-                    browser_ws=self.browser_ws,
-                    navigate_fn=self.navigate_to,
-                    fetch_page_fn=lambda offset: self.fetch_page(username, offset),
-                    username=username,
-                    tier=tier,
-                    unique_limit=LIMITS_BY_TIER[tier]["unique"],
-                    total_limit=LIMITS_BY_TIER[tier]["total"],
-                    post_limit=LIMITS_BY_TIER[tier]["posts"],
-                    delay_min=DELAY_MIN,
-                    delay_max=DELAY_MAX,
-                    source_blog=None,
-                    cache_dir=self.cache_dir,
-                    on_page=lambda name, users, t: enqueue_fn(name, users, t),
-                    on_progress=self.progress_cb,
+                return await _do_crawl()
+            except LoginWallDetected as wall:
+                # Fix A: a detected wall is a SOFT signal. Tumblr's rate-limit
+                # / "are you human" interstitial routes through a /login URL,
+                # which agent.detect_login_wall misreads as a hard login wall.
+                # Retry the same blog from scratch up to WALL_RETRY_MAX times;
+                # a transient interstitial clears on retry and the crawl
+                # proceeds. Only after retries are exhausted do we accept it as
+                # a genuine wall (re-raise -> worker loop halts + "log in").
+                if attempt <= WALL_RETRY_MAX:
+                    logger.warning(
+                        "Worker %d: wall signal for %s (attempt %d/%d) — "
+                        "retrying after %.0fs backoff (may be transient interstitial)",
+                        self.worker_id,
+                        username,
+                        attempt,
+                        WALL_RETRY_MAX,
+                        WALL_RETRY_BACKOFF_S,
+                    )
+                    await asyncio.sleep(WALL_RETRY_BACKOFF_S)
+                    continue
+                logger.warning(
+                    "Worker %d: wall confirmed for %s after %d retries — halting",
+                    self.worker_id,
+                    username,
+                    WALL_RETRY_MAX,
                 )
+                raise wall
             except TabDeadError as exc:
                 last_exc = exc
                 logger.warning(
