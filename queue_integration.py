@@ -267,8 +267,7 @@ async def _drain_queue(
     DRAIN_IDLE_GRACE = 15.0
     idle_since: float | None = None
     loop_count = 0
-    # Track which workers we have already force-restarted for the current stall,
-    # so we don't cancel the same task twice in one stall episode.
+    workers_silent = False
     stalled_restarted: set[int] = set()
     while not wall_halt.is_set():
         await asyncio.sleep(2.0)
@@ -287,6 +286,11 @@ async def _drain_queue(
         # HUNG (a CDP await with no timeout). Do not wait passively — cancel the
         # stuck task and respawn a fresh worker so its tab/queue slot is reused.
         now = time.monotonic()
+        workers_silent = all(
+            not busy_events[i].is_set()
+            and (now - progress_at[i]) >= DRAIN_IDLE_GRACE
+            for i in range(pool_size)
+        )
         for i in range(pool_size):
             if not busy_events[i].is_set():
                 stalled_restarted.discard(i)
@@ -379,7 +383,7 @@ async def _drain_queue(
         # Require both queue empty AND no index growth for the full idle grace.
         # The old gate only checked queue state, which could be empty while
         # workers were still mid-blog and producing blog_done results afterward.
-        if pending == 0 and in_progress == 0:
+        if pending == 0 and in_progress == 0 and workers_silent:
             if idle_since is None:
                 idle_since = time.monotonic()
                 last_index_count = _index_count(index_path)
