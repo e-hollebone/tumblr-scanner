@@ -43,7 +43,7 @@ def _should_skip(username: str) -> bool:
 from eventlog import error as ev_err
 from eventlog import info as ev
 from eventlog import warn as ev_warn
-from work_queue import dequeue, mark_done
+from work_queue import dequeue, get_fail_count, mark_done, _increment_fail_count
 
 logger = logging.getLogger("worker")
 
@@ -591,19 +591,24 @@ class Worker:
                         # the crawl itself errored (status="error") or we got a
                         # wall/dead signal, which would indicate the extractor
                         # or page load genuinely broke across the board.
-                        if result.get("status") == "error":
-                            consecutive_empty += 1
+                        if result.get("status") == "error" or result.get("dead"):
+                            fail_count = _increment_fail_count(queue_path, username)
+                            logger.warning(
+                                "Worker %d: %s failed (dead=%s, fails=%d) — %s",
+                                self.worker_id,
+                                username,
+                                result.get("dead", False),
+                                fail_count,
+                                "marking dead" if fail_count >= 2 else "requeuing",
+                            )
+                            if fail_count >= 2:
+                                mark_done(queue_path, username)
+                                errors += 1
+                                processed += 1
+                                self.busy_event.clear()
+                                continue
                         else:
                             consecutive_empty = 0
-                        if consecutive_empty >= 3:
-                            logger.error(
-                                "Worker %d: %d consecutive blogs errored — "
-                                "Tumblr markup may have changed. Halting pipeline.",
-                                self.worker_id, consecutive_empty,
-                            )
-                            self.wall_halt.set()
-                            self.busy_event.clear()
-                            return {"processed": processed, "errors": errors, "enqueued": enqueued}
                     else:
                         consecutive_empty = 0
                 except LoginWallDetected:
@@ -625,9 +630,18 @@ class Worker:
                         username,
                         exc,
                     )
-                    mark_done(queue_path, username)
-                    errors += 1
-                    processed += 1
+                    fail_count = _increment_fail_count(queue_path, username)
+                    logger.warning(
+                        "Worker %d: %s crashed (fails=%d) — %s",
+                        self.worker_id,
+                        username,
+                        fail_count,
+                        "marking dead" if fail_count >= 2 else "requeuing",
+                    )
+                    if fail_count >= 2:
+                        mark_done(queue_path, username)
+                        errors += 1
+                        processed += 1
                     self.busy_event.clear()
                     if self.stats_cb:
                         self.stats_cb("errors")

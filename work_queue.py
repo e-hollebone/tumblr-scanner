@@ -136,6 +136,42 @@ def _append_line(path: Path, item: dict[str, Any]) -> None:
         f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
+def get_fail_count(queue_path: Path, username: str) -> int:
+    """Return current fail_count for a queued username, or 0 if absent."""
+    username = username.strip().lower()
+    if not username or not queue_path.exists():
+        return 0
+    try:
+        with _queue_lock:
+            lines = _read_lines(queue_path)
+    except (FileNotFoundError, OSError):
+        return 0
+    for item in lines:
+        if item.get("username", "").lower() == username:
+            return int(item.get("fail_count", 0) or 0)
+    return 0
+
+
+def _increment_fail_count(queue_path: Path, username: str) -> int:
+    """Atomically increment fail_count for a queued username, return new value."""
+    username = username.strip().lower()
+    if not username or not queue_path.exists():
+        return 0
+    with _queue_lock:
+        lines = _read_lines(queue_path)
+        count = 0
+        for item in lines:
+            if item.get("username", "").lower() == username:
+                count = int(item.get("fail_count", 0) or 0) + 1
+                item["fail_count"] = count
+                break
+        else:
+            count = 1
+            lines.append({"username": username, "state": "", "fail_count": count})
+        _write_lines(queue_path, lines)
+        return count
+
+
 # ---------------------------------------------------------------------------
 # Operations
 # ---------------------------------------------------------------------------
