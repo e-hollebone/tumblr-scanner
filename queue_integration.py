@@ -35,7 +35,7 @@ from config import (
     WORKER_STALL_TIMEOUT,
 )
 from work_queue import cleanup as queue_cleanup
-from work_queue import active_count, enqueue, queue_size
+from work_queue import active_count, enqueue, pending_count, in_progress_count, queue_size
 from eventlog import info as ev, warn as ev_warn, error as ev_err
 from status_server import publish as _publish_status, start_status_server as _start_status_server
 
@@ -275,6 +275,8 @@ async def _drain_queue(
         loop_count += 1
         qsize = active_count(queue_path)
         crawling = any(e.is_set() for e in busy_events)
+        pending = pending_count(queue_path)
+        in_progress = in_progress_count(queue_path)
 
         # ---- ACTIVE PROGRESS MONITOR -------------------------------------
         # A worker holding busy_event but silent for > WORKER_STALL_TIMEOUT is
@@ -370,22 +372,16 @@ async def _drain_queue(
                 idle_since,
                 {i: round(time.monotonic() - progress_at[i]) for i in range(pool_size)},
             )
-        # Gate on queue emptiness ONLY (active_count is swap-race-proofed in
-        # work_queue.py). Do NOT also require `not crawling` — workers clear
-        # busy_event in finally between blogs, so `not crawling` is routinely
-        # true mid-crawl and was the cause of a false drain_complete that left
-        # thousands of pending items unprocessed. If the queue is genuinely
-        # empty, workers have nothing to pick up, so `qsize==0` sustained for
-        # DRAIN_IDLE_GRACE is the correct and sufficient completion signal.
-        if qsize == 0:
+        # Gate on both pending and in_progress being zero. active_count() can
+        # return 0 when all items are in_progress and workers are between blogs
+        # with busy_event cleared, which caused premature drain_complete.
+        if pending == 0 and in_progress == 0:
             if idle_since is None:
                 idle_since = time.monotonic()
             elif time.monotonic() - idle_since >= DRAIN_IDLE_GRACE:
-                # FINAL GUARD: re-read the queue immediately before halting.
-                # The single qsize==0 that opened the grace window could have
-                # been a transient (workers between blogs, producer paused). If
-                # there is ANY pending work now, abort the exit and keep draining.
-                final_check = active_count(queue_path)
+                # Both counts already read at top of loop; re-read only pending
+                # as the final guard against transient empty window.
+                final_check = pending_count(queue_path)
                 if final_check > 0:
                     logger.warning(
                         "Coordinator: final pre-halt re-check found %d pending "

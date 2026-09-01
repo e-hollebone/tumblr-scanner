@@ -122,21 +122,8 @@ def _read_lines_from_fd(fd: int) -> list[dict[str, Any]]:
     return out
 
 
-def _write_lines(path: Path, lines: list[dict[str, Any]], fd: int | None = None) -> None:
-    """Overwrite the queue file with the given lines (not append).
-
-    If fd is provided, write in-place using raw os.write (no Python buffering)
-    so the inode and any held lockf persist across the write. Using raw
-    os.write + os.ftruncate avoids Python file-object position/buffer issues
-    that corrupt lines under concurrent load.
-    """
-    if fd is not None:
-        os.lseek(fd, 0, os.SEEK_SET)
-        raw = b"".join((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8") for item in lines)
-        os.write(fd, raw)
-        os.ftruncate(fd, len(raw))
-        os.fsync(fd)
-        return
+def _write_lines(path: Path, lines: list[dict[str, Any]]) -> None:
+    """Overwrite the queue file with the given lines atomically via tmp+replace."""
     tmp = path.with_suffix(".queue.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         f.writelines(json.dumps(item, ensure_ascii=False) + "\n" for item in lines)
@@ -174,27 +161,23 @@ def enqueue(
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
     with _queue_lock:
-        with open(queue_path, "r+", encoding="utf-8") as f:
-            try:
-                lines = _read_lines_from_fd(f.fileno())
-                names = {
-                    ln.get("username", "").lower()
-                    for ln in lines
-                    if ln.get("state", "") != "done"
-                }
-                if username in names:
-                    return
-                _append_line(
-                    queue_path,
-                    {
-                        "username": username,
-                        "state": state,
-                        "tier": tier,
-                        "mode": mode,
-                    },
-                )
-            finally:
-                pass
+        lines = _read_lines(queue_path)
+        names = {
+            ln.get("username", "").lower()
+            for ln in lines
+            if ln.get("state", "") != "done"
+        }
+        if username in names:
+            return
+        _append_line(
+            queue_path,
+            {
+                "username": username,
+                "state": state,
+                "tier": tier,
+                "mode": mode,
+            },
+        )
 
 
 def dequeue(queue_path: Path) -> dict[str, Any] | None:
@@ -205,19 +188,15 @@ def dequeue(queue_path: Path) -> dict[str, Any] | None:
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
     with _queue_lock:
-        with open(queue_path, "r+", encoding="utf-8") as f:
-            try:
-                lines = _read_lines_from_fd(f.fileno())
-                for i, item in enumerate(lines):
-                    if item.get("state", "") in ("", None):
-                        item["state"] = "in_progress"
-                        item["claimed_at"] = _now_iso()
-                        lines[i] = item
-                        _write_lines(queue_path, lines, f.fileno())
-                        return item
-                return None
-            finally:
-                pass
+        lines = _read_lines(queue_path)
+        for i, item in enumerate(lines):
+            if item.get("state", "") in ("", None):
+                item["state"] = "in_progress"
+                item["claimed_at"] = _now_iso()
+                lines[i] = item
+                _write_lines(queue_path, lines)
+                return item
+        return None
 
 
 def mark_done(queue_path: Path, username: str) -> None:
@@ -229,17 +208,13 @@ def mark_done(queue_path: Path, username: str) -> None:
     if not queue_path.exists():
         return
     with _queue_lock:
-        with open(queue_path, "r+", encoding="utf-8") as f:
-            try:
-                lines = _read_lines_from_fd(f.fileno())
-                for item in lines:
-                    if item.get("username", "").lower() == username:
-                        item["state"] = "done"
-                        item["completed_at"] = _now_iso()
-                        _write_lines(queue_path, lines, f.fileno())
-                        return
-            finally:
-                pass
+        lines = _read_lines(queue_path)
+        for item in lines:
+            if item.get("username", "").lower() == username:
+                item["state"] = "done"
+                item["completed_at"] = _now_iso()
+                _write_lines(queue_path, lines)
+                return
 
 
 def cleanup(queue_path: Path) -> int:
@@ -261,32 +236,28 @@ def cleanup(queue_path: Path) -> int:
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
     with _queue_lock:
-        with open(queue_path, "r+", encoding="utf-8") as f:
-            try:
-                lines = _read_lines_from_fd(f.fileno())
-                new_lines: list[dict[str, Any]] = []
-                removed = 0
-                for item in lines:
-                    state = item.get("state", "")
-                    name = item.get("username", "").lower()
-                    if state == "done":
-                        removed += 1
-                        continue
-                    if state == "in_progress" and name not in index:
-                        # Worker crashed — reset to pending
-                        item["state"] = ""
-                        item.pop("claimed_at", None)
-                        logger.info("Reset in_progress %s to pending (not in index)", name)
-                    elif state == "in_progress" and name in index:
-                        # Worker finished but didn't clean up — drop
-                        removed += 1
-                        logger.info("Dropped in_progress %s (already in index)", name)
-                        continue
-                    new_lines.append(item)
-                _write_lines(queue_path, new_lines, f.fileno())
-                return removed
-            finally:
-                pass
+        lines = _read_lines(queue_path)
+        new_lines: list[dict[str, Any]] = []
+        removed = 0
+        for item in lines:
+            state = item.get("state", "")
+            name = item.get("username", "").lower()
+            if state == "done":
+                removed += 1
+                continue
+            if state == "in_progress" and name not in index:
+                # Worker crashed — reset to pending
+                item["state"] = ""
+                item.pop("claimed_at", None)
+                logger.info("Reset in_progress %s to pending (not in index)", name)
+            elif state == "in_progress" and name in index:
+                # Worker finished but didn't clean up — drop
+                removed += 1
+                logger.info("Dropped in_progress %s (already in index)", name)
+                continue
+            new_lines.append(item)
+        _write_lines(queue_path, new_lines)
+        return removed
 
 
 def queue_size(queue_path: Path) -> int:
@@ -295,13 +266,10 @@ def queue_size(queue_path: Path) -> int:
     queue_path.touch(exist_ok=True)
     try:
         with _queue_lock:
-            with open(queue_path, "r+", encoding="utf-8") as f:
-                try:
-                    return len(_read_lines_from_fd(f.fileno()))
-                finally:
-                    pass
+            lines = _read_lines(queue_path)
     except (FileNotFoundError, OSError):
         return 0
+    return len(lines)
 
 
 def active_count(queue_path: Path) -> int:
@@ -310,14 +278,34 @@ def active_count(queue_path: Path) -> int:
     queue_path.touch(exist_ok=True)
     try:
         with _queue_lock:
-            with open(queue_path, "r+", encoding="utf-8") as f:
-                try:
-                    lines = _read_lines_from_fd(f.fileno())
-                finally:
-                    pass
+            lines = _read_lines(queue_path)
     except (FileNotFoundError, OSError):
         return 0
     return sum(1 for ln in lines if ln.get("state", "") != "done")
+
+
+def pending_count(queue_path: Path) -> int:
+    """Count pending items only (state == "")."""
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.touch(exist_ok=True)
+    try:
+        with _queue_lock:
+            lines = _read_lines(queue_path)
+    except (FileNotFoundError, OSError):
+        return 0
+    return sum(1 for ln in lines if ln.get("state", "") == "")
+
+
+def in_progress_count(queue_path: Path) -> int:
+    """Count in_progress items only."""
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.touch(exist_ok=True)
+    try:
+        with _queue_lock:
+            lines = _read_lines(queue_path)
+    except (FileNotFoundError, OSError):
+        return 0
+    return sum(1 for ln in lines if ln.get("state", "") == "in_progress")
 
 
 # ---------------------------------------------------------------------------
