@@ -372,26 +372,36 @@ async def _drain_queue(
                 idle_since,
                 {i: round(time.monotonic() - progress_at[i]) for i in range(pool_size)},
             )
-        # Gate on both pending and in_progress being zero. active_count() can
-        # return 0 when all items are in_progress and workers are between blogs
-        # with busy_event cleared, which caused premature drain_complete.
+        # Require both queue empty AND no index growth for the full idle grace.
+        # The old gate only checked queue state, which could be empty while
+        # workers were still mid-blog and producing blog_done results afterward.
         if pending == 0 and in_progress == 0:
             if idle_since is None:
                 idle_since = time.monotonic()
+                last_index_count = _index_count(index_path)
             elif time.monotonic() - idle_since >= DRAIN_IDLE_GRACE:
-                # Both counts already read at top of loop; re-read only pending
-                # as the final guard against transient empty window.
-                final_check = pending_count(queue_path)
-                if final_check > 0:
+                current_index_count = _index_count(index_path)
+                final_pending = pending_count(queue_path)
+                if final_pending > 0:
                     logger.warning(
                         "Coordinator: final pre-halt re-check found %d pending "
                         "(transient empty during grace) — continuing drain",
-                        final_check,
+                        final_pending,
                     )
                     idle_since = None
+                elif current_index_count != last_index_count:
+                    logger.warning(
+                        "Coordinator: index still growing (%d -> %d) during drain "
+                        "grace — continuing drain",
+                        last_index_count,
+                        current_index_count,
+                    )
+                    idle_since = time.monotonic()
+                    last_index_count = current_index_count
                 else:
                     logger.info(
-                        "Coordinator: queue empty for %.0fs — crawl complete, halting workers",
+                        "Coordinator: queue empty and index stable for %.0fs — "
+                        "crawl complete, halting workers",
                         time.monotonic() - idle_since,
                     )
                     wall_halt.set()
