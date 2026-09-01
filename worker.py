@@ -503,6 +503,7 @@ class Worker:
                 # Advertise "mid-crawl" so the coordinator does not declare the
                 # drain complete while we are working this blog.
                 self.busy_event.set()
+                logger.error("WORKER_TRACE: busy_event.set %s", username)
                 if self.set_current_cb:
                     self.set_current_cb(username, tier)  # dashboard: now on this blog
                 if self.progress_cb:
@@ -615,6 +616,7 @@ class Worker:
                     ev("worker%d" % self.worker_id, "login_wall", username=username, reason="LoginWallDetected-raised")
                     self.wall_halt.set()
                     self.busy_event.clear()
+                    logger.error("WORKER_TRACE: busy_event.clear after login_wall")
                     raise
                 except Exception as exc:
                     logger.error(

@@ -277,6 +277,10 @@ async def _drain_queue(
         crawling = any(e.is_set() for e in busy_events)
         pending = pending_count(queue_path)
         in_progress = in_progress_count(queue_path)
+        if loop_count % 5 == 0:
+            logger.error("DRAIN_TRACE: loop #%d qsize=%d pending=%d in_progress=%d crawling=%s busy=%s",
+                         loop_count, qsize, pending, in_progress, crawling,
+                         [e.is_set() for e in busy_events])
 
         # ---- ACTIVE PROGRESS MONITOR -------------------------------------
         # A worker holding busy_event but silent for > WORKER_STALL_TIMEOUT is
@@ -404,6 +408,9 @@ async def _drain_queue(
                         "crawl complete, halting workers",
                         time.monotonic() - idle_since,
                     )
+                    logger.error("DRAIN_TRACE: setting wall_halt pending=%d in_progress=%d index=%d busy=%s",
+                                 pending, in_progress, current_index_count,
+                                 [e.is_set() for e in busy_events])
                     wall_halt.set()
                     break
         else:
