@@ -292,27 +292,17 @@ async def _drain_queue(
             for i in range(pool_size)
         )
         for i in range(pool_size):
-            if not busy_events[i].is_set():
-                stalled_restarted.discard(i)
-                continue
             silent = now - progress_at[i]
             if silent >= WORKER_STALL_TIMEOUT and i not in stalled_restarted:
                 logger.error(
-                    "STALL WATCHDOG: worker %d silent for %.0fs (no page_fetched) "
+                    "STALL WATCHDOG: worker %d silent for %.0fs (no progress) "
                     "— force-restarting task",
                     i, silent,
                 )
                 ev_err("coordinator", "worker_stall_restart",
                        worker_id=i, silent_seconds=round(silent, 1))
                 old_task = worker_tasks[i]
-                # Cancel the hung task. We do NOT `await old_task` here: a hung
-                # worker is stuck inside a CDP await with no timeout, so awaiting
-                # it would re-block the coordinator — the exact bug this watchdog
-                # exists to fix. Cancellation fires; the task's finally block
-                # closes its tab. We shield the cancel so a stuck await can't
-                # swallow the CancelledError and hang us.
                 old_task.cancel()
-                # Spawn replacement immediately so the worker slot is reused.
                 worker_tasks[i] = asyncio.create_task(
                     Worker(
                         worker_id=i,
@@ -329,6 +319,8 @@ async def _drain_queue(
                 progress_at[i] = now
                 stalled_restarted.add(i)
                 logger.info("STALL WATCHDOG: worker %d respawned", i)
+            elif silent < WORKER_STALL_TIMEOUT:
+                stalled_restarted.discard(i)
         # -----------------------------------------------------------------
 
         # ---- PUBLISH LIVE STATUS (operator dashboard) --------------------
