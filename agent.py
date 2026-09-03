@@ -87,47 +87,59 @@ async def _new_tab_url(browser_ws: str, target_url: str) -> tuple[str, str]:
         raise RuntimeError("Browser has no WebSocket debugger URL")
 
     create_client = CDPClient(browser_ws_url)
-    await create_client.start()
     try:
-        result = await create_client.send.Target.createTarget(
-            params={"url": target_url}
-        )
-        target_id = result.get("targetId")
+        await asyncio.wait_for(create_client.start(), timeout=20.0)
     except Exception as exc:
-        await create_client.stop()
-        raise RuntimeError(
-            f"Target.createTarget failed for {target_url}: {exc}"
-        ) from exc
-    finally:
-        await create_client.stop()
-
-    if not target_id:
-        raise RuntimeError(f"Target.createTarget returned no targetId for {target_url}")
-
-    base = browser_ws.replace("ws://", "http://").rstrip("/")
-    deadline = time.monotonic() + 15.0
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.5)
-        try:
-            import urllib.request as _urllib
-
-            with _urllib.urlopen(f"{base}/json/list", timeout=5) as resp:
-                targets = json.loads(resp.read())
-            for t in targets:
-                if t.get("type") == "page" and t.get("id") == target_id:
-                    ws_url = t.get("webSocketDebuggerUrl")
-                    if ws_url:
-                        return ws_url, target_id
-        except Exception:  # noqa: BLE001
-            pass
-
+        raise RuntimeError(f"Browser handshake failed for {browser_ws_url}: {exc}") from exc
     try:
-        await close_tab(browser_ws, target_id)
+        try:
+            result = await asyncio.wait_for(
+                create_client.send.Target.createTarget(
+                    params={"url": target_url}
+                ),
+                timeout=20.0,
+            )
+            target_id = result.get("targetId")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Target.createTarget failed for {target_url}: {exc}"
+            ) from exc
+        finally:
+            await create_client.stop()
+
+        if not target_id:
+            raise RuntimeError(f"Target.createTarget returned no targetId for {target_url}")
+
+        base = browser_ws.replace("ws://", "http://").rstrip("/")
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            try:
+                import urllib.request as _urllib
+
+                with _urllib.urlopen(f"{base}/json/list", timeout=5) as resp:
+                    targets = json.loads(resp.read())
+                for t in targets:
+                    if t.get("type") == "page" and t.get("id") == target_id:
+                        ws_url = t.get("webSocketDebuggerUrl")
+                        if ws_url:
+                            return ws_url, target_id
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            await close_tab(browser_ws, target_id)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Timed out waiting for new tab {target_url} (targetId={target_id})"
+        )
     except Exception:
-        pass
-    raise RuntimeError(
-        f"Timed out waiting for new tab {target_url} (targetId={target_id})"
-    )
+        try:
+            await create_client.stop()
+        except Exception:
+            pass
+        raise
 
 
 async def close_tab(browser_ws: str, target_id: str) -> None:

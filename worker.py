@@ -88,12 +88,25 @@ class Worker:
         """
         from agent import _new_tab_url
 
-        self.ws_url, self.target_id = await _new_tab_url(
-            self.browser_ws, "https://www.tumblr.com/"
-        )
-        logger.info("Worker %d: opened tab targetId=%s", self.worker_id, self.target_id)
-        ev("worker%d" % self.worker_id, "tab_opened", target_id=self.target_id)
-        return self.ws_url, self.target_id
+        attempts = 0
+        while True:
+            try:
+                self.ws_url, self.target_id = await _new_tab_url(
+                    self.browser_ws, "https://www.tumblr.com/"
+                )
+            except Exception as exc:
+                attempts += 1
+                logger.error(
+                    "Worker %d: tab open failed (%s), attempt %d/3",
+                    self.worker_id, exc, attempts,
+                )
+                if attempts >= 3:
+                    raise
+                await asyncio.sleep(2.0)
+                continue
+            logger.info("Worker %d: opened tab targetId=%s", self.worker_id, self.target_id)
+            ev("worker%d" % self.worker_id, "tab_opened", target_id=self.target_id)
+            return self.ws_url, self.target_id
 
     async def _close_tab(self) -> None:
         """Close the current Chrome tab (if any)."""
