@@ -305,6 +305,11 @@ async def _drain_queue(
                        worker_id=i, silent_seconds=round(silent, 1))
                 old_task = worker_tasks[i]
                 old_task.cancel()
+                # Repair stale queue rows left by the dead task.
+                repaired = queue_cleanup(queue_path)
+                if repaired:
+                    logger.info("STALL WATCHDOG: queue_cleanup repaired %d stale entries after worker %d restart", repaired, i)
+                    ev_err("coordinator", "queue_repaired", worker_id=i, entries=repaired)
                 worker_tasks[i] = asyncio.create_task(
                     Worker(
                         worker_id=i,
