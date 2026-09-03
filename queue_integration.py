@@ -108,10 +108,12 @@ def _enqueue_by_status(
     names not in the index are enqueued as "full".
     """
     status = index_status(index_path, username)
-    if queue_size(queue_path) >= QUEUE_OVERFLOW_THRESHOLD:
+    if pending_count(queue_path) + in_progress_count(queue_path) >= QUEUE_OVERFLOW_THRESHOLD:
         logger.warning(
-            "Queue overflow (%d >= %d) — skipping enqueue of %s",
-            queue_size(queue_path), QUEUE_OVERFLOW_THRESHOLD, username,
+            "Queue overflow (pending+in_progress %d >= %d) — skipping enqueue of %s",
+            pending_count(queue_path) + in_progress_count(queue_path),
+            QUEUE_OVERFLOW_THRESHOLD,
+            username,
         )
         return "fresh"
     if status == "stale":
