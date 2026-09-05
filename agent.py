@@ -405,6 +405,7 @@ async def crawl_blog(
     source_blog: str | None = None,
     cache_dir: Path | None = None,
     on_page: callable | None = None,
+    should_exit: callable | None = None,
     on_progress: callable | None = None,
 ) -> dict[str, Any]:
     """Crawl a single blog from start to stop condition.
@@ -423,6 +424,9 @@ async def crawl_blog(
         source_blog: The blog that led us to this username.
         cache_dir: Override for cache root.
         on_page: Callback(username, page_usernames, tier) per page.
+        should_exit: Optional callback returning True if the crawl should abort
+            (e.g. wall_halt was set by SIGINT). Checked between every page fetch
+            so Ctrl+C aborts mid-blog instead of after completion.
 
     Returns:
         Results dict with cumulative totals and per-page breakdown.
@@ -461,6 +465,9 @@ async def crawl_blog(
         except Exception as exc:
             logger.warning("Page fetch failed for %s offset %d: %s", username, offset, exc)
             raise TabDeadError(f"Page fetch failed: {exc}") from exc
+        if should_exit and should_exit():
+            logger.info("Crawl aborted for %s (shutdown signal) at offset %d", username, offset)
+            break
 
         if detect_login_wall("", html, final_url):
             logger.warning("LOGIN/CONTENT WALL for %s at offset %d — halting", username, offset)

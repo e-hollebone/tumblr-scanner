@@ -350,6 +350,7 @@ class Worker:
                 source_blog=None,
                 cache_dir=self.cache_dir,
                 on_page=lambda name, users, t: enqueue_fn(name, users, t),
+                should_exit=lambda: self.wall_halt.is_set(),
                 on_progress=self.progress_cb,
             )
 
@@ -495,6 +496,12 @@ class Worker:
                         break
                     await asyncio.sleep(QUEUE_POLL_INTERVAL)
                     continue
+
+                # Abort immediately if shutdown was signaled between the while
+                # check and dequeuing — don't start a new blog on Ctrl+C.
+                if self.wall_halt.is_set():
+                    logger.info("Worker %d: wall_halt set after dequeue — aborting", self.worker_id)
+                    break
 
                 self._empty_since = None
 
