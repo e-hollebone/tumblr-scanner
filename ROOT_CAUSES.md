@@ -44,3 +44,12 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 - **Root cause:** `enqueue()` dedup-skipped any username already present in the queue, including T0. The seed at `queue_integration.py:540` ran `enqueue(..., tier=0, mode="reindex")`, but since T0 was already there, the call returned immediately — leaving the stale `mode="full"` entry untouched. There was no queue-file priority rule, so even if T0 had been updated it would still sit at line 3451 behind thousands of T2 items.
 - **Fix:** Changed `enqueue()` in `work_queue.py` so tier-0 entries overwrite existing queue rows instead of being skipped. Changed `dequeue()` to always pick tier-0 first, then tier-1, then tier-2, regardless of file order. This makes T0 priority a permanent invariant, not a one-time manual reordering.
 - **Verification:** `test_async.py` passes (6 dequeued, 0 errors, 6 done, 0 malformed). Committed as `5108046` on `worker-tab-lifecycle-rewrite`.
+
+### 2026-09-07 — 96% blog failures: CDP navigation/handshake timeouts too short for Tumblr under 10-tab load
+- **Claim:** Live run with T0 fix applied still failed: 48/50 blog_done events are `status=error`, `unique=0, total=0, posts=0`. All failures cite `timed out during opening handshake` or `Page.navigate timed out after 15.0s`.
+- **Evidence:** `cache/worker_events.log` last 50 `blog_done`: 48 error, 2 ok. `~/.hermes/logs/tumblr-scanner.log` shows 114 "timed out" / 67 "tab died" / 67 "exhausted" across the run. Worker 0's T0 attempt: `Page.navigate timed out after 15.0s`, tab recovery exhausted, marked `dead=True`.
+- **Root cause:** Two CDP timeouts were too aggressive under concurrent 10-tab load:
+  1. `worker.py navigate_to()`: `Page.navigate` timeout 15s — Tumblr pages need 15–30s+ to render under load
+  2. `agent.py _new_tab_url()`: `client.start()` and `Target.createTarget` timeouts 20s — browser handshake degrades when 10 workers connect simultaneously
+- **Fix:** Raised `Page.navigate` timeout 15s → 45s in `worker.py`. Raised `client.start()` and `Target.createTarget` timeouts 20s → 30s in `agent.py`.
+- **Verification:** `test_async.py` passes (6 dequeued, 0 errors, 6 done). `py_compile` clean on both files. Committed as `0b68a54` on `worker-tab-lifecycle-rewrite`. Needs live `--tabs 10` run to verify failure rate drops.
