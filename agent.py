@@ -88,7 +88,7 @@ async def _new_tab_url(browser_ws: str, target_url: str) -> tuple[str, str]:
 
     create_client = CDPClient(browser_ws_url)
     try:
-        await asyncio.wait_for(create_client.start(), timeout=20.0)
+        await asyncio.wait_for(create_client.start(), timeout=30.0)
     except Exception as exc:
         raise RuntimeError(f"Browser handshake failed for {browser_ws_url}: {exc}") from exc
     try:
@@ -97,7 +97,7 @@ async def _new_tab_url(browser_ws: str, target_url: str) -> tuple[str, str]:
                 create_client.send.Target.createTarget(
                     params={"url": target_url}
                 ),
-                timeout=20.0,
+                timeout=30.0,
             )
             target_id = result.get("targetId")
         except Exception as exc:

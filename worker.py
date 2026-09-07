@@ -169,7 +169,7 @@ class Worker:
         client = CDPClient(self.ws_url)
         await client.start()
         try:
-            await cdp_send(client, "Page.navigate", {"url": url, "loadResponse": True}, timeout=15.0)
+            await cdp_send(client, "Page.navigate", {"url": url, "loadResponse": True}, timeout=45.0)
 
             # Wait for content
             deadline = time.monotonic() + 30.0
