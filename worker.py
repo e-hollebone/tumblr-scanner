@@ -224,10 +224,11 @@ class Worker:
         """
         return await self.navigate_to(username, offset)
 
-    async def probe_page_zero(self, username: str, html: str, final_url: str, cache_dir, index_path) -> dict:
+    async def probe_page_zero(self, username: str, html: str, final_url: str, cache_dir, index_path, force: bool = False) -> dict:
         """Probe page 0 for reindex mode — check if blog has new content since last crawl.
 
         Uses the already-fetched page 0 HTML from navigate_to.
+        force=True skips all skip checks (used for T0 seed blog).
         """
         from cache import index_status, load_entry
         from config import DEAD_PHRASES
@@ -257,6 +258,10 @@ class Worker:
         for phrase in DEAD_PHRASES:
             if phrase in page_text:
                 return {"skip": True, "reason": f"dead_phrase:{phrase}"}
+
+        # T0 force-reindex: never skip based on index state or cached usernames
+        if force:
+            return {"skip": False}
 
         # Compare with cached entry
         idx_status = index_status(index_path, username)
@@ -553,7 +558,10 @@ class Worker:
                         html, final_url = await self.navigate_to(username, 0)
                         if html:
                             from cache import index_status
-                            probe_result = await self.probe_page_zero(username, html, final_url, self.cache_dir, self.index_path)
+                            probe_result = await self.probe_page_zero(
+                                username, html, final_url, self.cache_dir, self.index_path,
+                                force=(tier == 0),
+                            )
                         else:
                             probe_result = {"skip": False}
                         if probe_result.get("skip"):

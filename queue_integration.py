@@ -532,11 +532,14 @@ async def queue_mode(
         logger.info("Step 0: repaired %d stale queue entries", repaired)
         ev("pipeline", "queue_repaired", entries=repaired)
 
-    # Step 2: Seed the queue with the target blog (tier 0)
+    # Step 2: Seed the queue with the target blog (tier 0).
+    # T0 is always force-reindexed regardless of index state so new posts
+    # since the last scan are picked up. Use mode="reindex" so the probe
+    # runs every time.
     logger.info("Step 2: Seeding queue with %s", target_blog)
-    enqueue(QUEUE_PATH, target_blog, state="", tier=0)
+    enqueue(QUEUE_PATH, target_blog, state="", tier=0, mode="reindex")
     ev("pipeline", "seed_queue", blog=target_blog, tier=0)
-    logger.info("Queue seeded: %s (tier=0)", target_blog)
+    logger.info("Queue seeded: %s (tier=0, mode=reindex)", target_blog)
 
     # Step 3: Drain queue — workers start immediately, parallel from first extraction
     logger.info("Step 3: Drain queue — worker pool (parallel from first extraction)")
