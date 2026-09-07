@@ -6,7 +6,7 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 - Worker shutdown path still uses tab target IDs from a pre-shutdown Chrome state; if the coordinator halts while a worker is mid-blog, any later tab lookup can fail with `Tab targetId=... not found in /json/list`. This is tolerated as a shutdown-side error, but it still counts as a non-zero `errors` drain stat.
 - Login-wall retry fix is still pending implementation.
 - Startup bring-up hardening is now in place for tab-open handshake timeouts; needs a live 10-tab run to verify all workers recover under Chrome startup load.
-- Queue overflow at 10000 items is dropping discovered blogs during active crawl — fixed: overflow gate now counts active work (pending+in_progress) only; threshold raised to 20000.
+- Queue overflow at 10000 items is dropping discovered blogs during active crawl — fixed: overflow gate now counts active work (pending+in_progress) only; threshold raised to 50000; T0/T1 always bypass overflow gate, only T2+ is droppable.
 - Ctrl+C shutdown does not abort in-progress blog crawls; workers keep churning through pages for minutes after wall_halt is set. Fix committed (`fbf9ba6`); needs live run verification.
 
 ## Entries
@@ -17,6 +17,13 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 - **Root cause:** `agent._new_tab_url()` created a `CDPClient` and called `client.start()` / `Target.createTarget` without timeouts. Under Chrome startup load, the opening handshake can lag; the unbounded await surfaced as `Worker pool error: ...` and crashed each worker task before any blog was fetched. The worker had no startup retry path.
 - **Fix:** Added `asyncio.wait_for(..., 20.0)` around `client.start()` and `Target.createTarget` in `agent._new_tab_url()`. Added startup retry in `worker._open_tab()`: up to 3 attempts with 2s backoff before failing the worker task. `queue_cleanup()` already resets orphaned `in_progress` items on the next run.
 - **Verification:** `test_async.py` passes; manual verification pending via `.venv/bin/python3 run.py --queue --tabs 10 <target>`.
+
+### 2026-09-03 — T0/T1 discoveries dropped when queue hits overflow threshold
+- **Claim:** When the queue approaches `QUEUE_OVERFLOW_THRESHOLD`, the overflow guard was dropping ALL new enqueues including T0 (seed blog) and T1 (first-wave discoveries), causing the crawl to miss new content from already-indexed blogs that needed re-crawling.
+- **Evidence:** `_enqueue_by_status()` in `queue_integration.py` returned `"fresh"` (skip) for any username when `pending_count + in_progress_count >= QUEUE_OVERFLOW_THRESHOLD`, regardless of tier. This means even the seed blog and primary discovery wave were silently dropped.
+- **Root cause:** The overflow guard was tier-agnostic. T0 and T1 discoveries (which must always be enqueued for reindexing) were subject to the same drop logic as T2 deep-reach names (which are legitimately optional when the queue is full).
+- **Fix:** Raised `QUEUE_OVERFLOW_THRESHOLD` from 20000 to 50000. Made `_enqueue_by_status` tier-aware: T0/T1 always enqueued (bypass overflow guard); only T2+ is droppable. Return value changed from `"fresh"` to `"overflow"` for clarity. Added `queue_overflow` to `_live` counters and status server dashboard display. Wired `stats_cb("queue_overflow")` in worker's `_enqueue_page` callback so overflow drops are tracked live.
+- **Verification:** `py_compile` clean on `config.py`, `queue_integration.py`, `worker.py`, `status_server.py`. `test_async.py` passes.
 
 ### 2026-09-03 — Ctrl+C does not halt in-progress blog crawls
 - **Claim:** After Ctrl+C (SIGINT), the process sets `wall_halt` but workers continue crawling pages of the current blog for minutes, enqueuing more discoveries until each blog finishes.
