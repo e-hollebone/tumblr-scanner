@@ -198,12 +198,21 @@ def enqueue(
     queue_path.touch(exist_ok=True)
     with _queue_lock:
         lines = _read_lines(queue_path)
-        names = {
-            ln.get("username", "").lower()
-            for ln in lines
-            if ln.get("state", "") != "done"
-        }
-        if username in names:
+        existing_idx = None
+        for idx, ln in enumerate(lines):
+            if ln.get("username", "").lower() == username and ln.get("state", "") != "done":
+                existing_idx = idx
+                break
+        if existing_idx is not None:
+            if tier == 0:
+                # Tier-0 always supersedes prior state/mode so it can be reprocessed first.
+                lines[existing_idx] = {
+                    "username": username,
+                    "state": state,
+                    "tier": tier,
+                    "mode": mode,
+                }
+                _write_lines(queue_path, lines)
             return
         _append_line(
             queue_path,
@@ -219,19 +228,33 @@ def enqueue(
 def dequeue(queue_path: Path) -> dict[str, Any] | None:
     """
     Pop the first pending item, mark it "in_progress", return it.
+    Tier-0 items always take priority over tier-1 and tier-2 regardless
+    of queue order, so T0 blogs are processed first.
     Returns None if nothing pending.
     """
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     queue_path.touch(exist_ok=True)
     with _queue_lock:
         lines = _read_lines(queue_path)
+
+        def claim(idx: int) -> dict[str, Any] | None:
+            item = lines[idx]
+            item["state"] = "in_progress"
+            item["claimed_at"] = _now_iso()
+            lines[idx] = item
+            _write_lines(queue_path, lines)
+            return item
+
+        # Tier-0 first, always.
         for i, item in enumerate(lines):
-            if item.get("state", "") in ("", None):
-                item["state"] = "in_progress"
-                item["claimed_at"] = _now_iso()
-                lines[i] = item
-                _write_lines(queue_path, lines)
-                return item
+            if item.get("state", "") in ("", None) and item.get("tier") == 0:
+                return claim(i)
+        # Then tier-1, then tier-2, then anything else.
+        for tier_filter in (1, 2, None):
+            for i, item in enumerate(lines):
+                if item.get("state", "") in ("", None):
+                    if tier_filter is None or item.get("tier") == tier_filter:
+                        return claim(i)
         return None
 
 
