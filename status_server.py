@@ -27,6 +27,7 @@ _snapshot: dict = {
     "blogs_done": 0,
     "errors": 0,
     "enqueued": 0,
+    "queue_overflow": 0,
     "workers": [],
     "last_stall": None,
     "login_wall": False,
@@ -100,6 +101,8 @@ def _render(s: dict, last_events: list[str]) -> str:
     lines.append(f"rate:   {rate_str} blogs/min · ETA {eta_str}")
     if s["errors"]:
         lines.append(f"errors: {s['errors']}")
+    if s.get("queue_overflow"):
+        lines.append(f"overflow: {s['queue_overflow']} T2 names skipped")
     lines.append("─" * 40)
 
     workers = s.get("workers", [])

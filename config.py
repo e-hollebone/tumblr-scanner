@@ -92,7 +92,8 @@ PROGRESS_INTERVAL = 30
 # Stop pushing new items to the queue if it exceeds this depth.
 # Set high enough to avoid dropping discoveries during active crawl;
 # queue_cleanup() trims completed entries on run startup.
-QUEUE_OVERFLOW_THRESHOLD = 20_000
+# T0/T1 discoveries bypass this limit; only T2+ is droppable.
+QUEUE_OVERFLOW_THRESHOLD = 50_000
 
 # ---------------------------------------------------------------------------
 # Paths

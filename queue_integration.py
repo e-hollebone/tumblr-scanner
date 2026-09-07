@@ -108,14 +108,18 @@ def _enqueue_by_status(
     names not in the index are enqueued as "full".
     """
     status = index_status(index_path, username)
-    if pending_count(queue_path) + in_progress_count(queue_path) >= QUEUE_OVERFLOW_THRESHOLD:
+    # Overflow guard: T0/T1 always enqueued (seed + first-wave); only T2+ is
+    # droppable when the queue hits its depth limit to avoid unbounded growth.
+    at_overflow = pending_count(queue_path) + in_progress_count(queue_path) >= QUEUE_OVERFLOW_THRESHOLD
+    if at_overflow and tier >= 2:
         logger.warning(
-            "Queue overflow (pending+in_progress %d >= %d) — skipping enqueue of %s",
+            "Queue overflow (pending+in_progress %d >= %d) — skipping enqueue of %s (tier=%d)",
             pending_count(queue_path) + in_progress_count(queue_path),
             QUEUE_OVERFLOW_THRESHOLD,
             username,
+            tier,
         )
-        return "fresh"
+        return "overflow"
     if status == "stale":
         enqueue(queue_path, username, state="", tier=tier, mode="reindex")
         logger.info("Enqueued %s (tier=%s, mode=reindex)", username, tier)
@@ -172,7 +176,7 @@ async def _drain_queue(
     # Live counters published to the dashboard (mutated by worker results
     # via the shared callback below). The coordinator only sees final
     # totals after gather(), so we track them live here.
-    _live = {"blogs_done": 0, "errors": 0, "enqueued": 0}
+    _live = {"blogs_done": 0, "errors": 0, "enqueued": 0, "queue_overflow": 0}
     from threading import Lock as _Lock
     _live_lock = _Lock()
 
@@ -357,6 +361,7 @@ async def _drain_queue(
             blogs_done=_live["blogs_done"],
             errors=_live["errors"],
             enqueued=_live["enqueued"],
+            queue_overflow=_live["queue_overflow"],
             workers=workers_status,
             last_stall=last_stall,
             login_wall=False,
@@ -430,6 +435,7 @@ async def _drain_queue(
         blogs_done=_live["blogs_done"],
         errors=_live["errors"],
         enqueued=_live["enqueued"],
+        queue_overflow=_live["queue_overflow"],
         workers=[{"id": i, "status": "idle", "current": None, "lag_s": 0.0}
                  for i in range(pool_size)],
         last_stall=None,

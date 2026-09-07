@@ -599,6 +599,9 @@ class Worker:
                                 enqueued += 1
                                 if self.stats_cb:
                                     self.stats_cb("enqueued")
+                            elif action == "overflow":
+                                if self.stats_cb:
+                                    self.stats_cb("queue_overflow")
 
                 try:
                     result = await self._crawl_with_recovery(
