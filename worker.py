@@ -529,18 +529,22 @@ class Worker:
                 if self.progress_cb:
                     self.progress_cb(f"blog_start:{username}")  # heartbeat: we picked up a blog
 
-                # NFR-10: index check at dispatch time
-                idx_status = index_status(self.index_path, username)
-                if idx_status == "fresh":
-                    logger.info(
-                        "Worker %d: %s already indexed — skipping",
-                        self.worker_id,
-                        username,
-                    )
-                    mark_done(queue_path, username)
-                    processed += 1
-                    self.busy_event.clear()
-                    continue
+                # NFR-10: index check at dispatch time — T0 (seed blog) is a
+                # special case: always crawl it regardless of index state so
+                # new posts since the last scan are picked up. T1/T2 keep the
+                # existing fresh-skip optimization.
+                if tier != 0:
+                    idx_status = index_status(self.index_path, username)
+                    if idx_status == "fresh":
+                        logger.info(
+                            "Worker %d: %s already indexed — skipping",
+                            self.worker_id,
+                            username,
+                        )
+                        mark_done(queue_path, username)
+                        processed += 1
+                        self.busy_event.clear()
+                        continue
 
                 # FR-7: reindex mode — probe page 0, compare dates
                 if mode == "reindex":
