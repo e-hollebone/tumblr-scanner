@@ -3,7 +3,7 @@
 Rule: after every run/analysis/failure, append a date-stamped entry and refresh the Open/unresolved section.
 
 ## Open / Unresolved
-- Worker shutdown path still uses tab target IDs from a pre-shutdown Chrome state; if the coordinator halts while a worker is mid-blog, any later tab lookup can fail with `Tab targetId=... not found in /json/list`. This is tolerated as a shutdown-side error, but it still counts as a non-zero `errors` drain stat.
+- **Stale Chrome reuse causing dead CDP WebSocket connections (2026-09-08):** `restart_chrome()` reuses a long-running Chrome process whose WebSocket server has degraded. Fix applied (CDP health check + auto-relaunch) but needs live run verification. Until then, manually kill Chrome before each run: `kill CHROME_PID` where PID found via `ps aux | grep "chrome_profile"`.
 - Login-wall retry fix is still pending implementation.
 - Startup bring-up hardening is now in place for tab-open handshake timeouts; needs a live 10-tab run to verify all workers recover under Chrome startup load.
 - Queue overflow at 10000 items is dropping discovered blogs during active crawl — fixed: overflow gate now counts active work (pending+in_progress) only; threshold raised to 50000; T0/T1 always bypass overflow gate, only T2+ is droppable.
@@ -53,3 +53,20 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
   2. `agent.py _new_tab_url()`: `client.start()` and `Target.createTarget` timeouts 20s — browser handshake degrades when 10 workers connect simultaneously
 - **Fix:** Raised `Page.navigate` timeout 15s → 45s in `worker.py`. Raised `client.start()` and `Target.createTarget` timeouts 20s → 30s in `agent.py`.
 - **Verification:** `test_async.py` passes (6 dequeued, 0 errors, 6 done). `py_compile` clean on both files. Committed as `0b68a54` on `worker-tab-lifecycle-rewrite`. Needs live `--tabs 10` run to verify failure rate drops.
+
+### 2026-09-08 — Stale Chrome reuse: CDP WebSocket server dead but HTTP endpoints alive
+- **Claim:** Restart of `run.py` (PID 9902) at 10:41 fails immediately: every blog gets `status=error` with `"timed out during opening handshake"` or `"CDP command Runtime.evaluate timed out after 15.0s"`. 0 successful crawls across all 10 workers. T0 `the-smallest-kitten-cravings` fails first at 10:41:43, 17s after blog_start at 10:41:26.
+- **Evidence:**
+  - `~/.hermes/logs/tumblr-scanner.log`: 1899 lines, 529 "opening handshake" timeouts, 6 "Runtime.evaluate timed out" errors, 225 "tab recovery exhausted", 0 successful `blog_done` with `status=ok`.
+  - `cache/worker_events.log` line 1: `chrome_restart | {"reused": true, "killed": 0, "port": 9222}` — Chrome was reused, NOT restarted.
+  - Chrome process PID 90782 started Saturday (`ps` shows 251+ min CPU time, running since `Sat01PM`), debug port 9222, our profile (`chrome_profile`).
+  - `lsof -iTCP:9222` shows PID 9902 had 5 ESTABLISHED connections to Chrome at diagnosis time (workers 5-9 connected, workers 0-4 never connected or connections were stale).
+  - Direct WebSocket test: `CDPClient` to tab `4DEF6689...` succeeded immediately (1+1=2, Page.navigate + Runtime.evaluate returned real Tumblr page content). However, `run.py`'s workers cannot connect — their `client.start()` → `websockets.connect()` calls all time out.
+  - After manually closing all 10 tabs via `/json/close/{id}`, running process errors change to `"Tab targetId=... not found in /json/list"` — confirming stale tab ID references; recovery via `_new_tab_url` → `Target.createTarget` also fails (browser-level WebSocket also dead).
+  - `restart_chrome()` reuses Chrome when `_our_chrome_port()` finds the process, but **never validates the CDP WebSocket server works** — only probes for HTTP login wall. The login-wall probe (`/json/new` + URL check) succeeds via HTTP, but WebSocket connections to tabs are dead.
+- **Root cause:** `restart_chrome()` in `chrome_lifecycle.py` has a "reuse" path that skips killing Chrome to preserve the login session (which lives in `--user-data-dir` on disk). However, when the Chrome process has been running for many hours (here: >24h, 251+ min CPU), its per-tab WebSocket server degrades — `Target.createTarget` succeeds and returns targetIds, but subsequent `websockets.connect()` to those tabs hangs indefinitely. The `_probe_login_wall()` health check only tests HTTP endpoints (`/json`), not WebSocket connectivity. Workers then hit "timed out during opening handshake" on every CDP call, and `MAX_RECOVERY_PER_BLOG=1` gives exactly one recovery attempt (which also fails since the browser WebSocket is equally dead).
+- **Fix (applied in this session, not yet committed):**
+  1. Added `_probe_cdp_health(port)` in `chrome_lifecycle.py` — creates a throwaway tab via HTTP `/json/new`, opens a WebSocket to it, sends `Runtime.evaluate 1+1`, and verifies the result. Closes the tab afterward. Returns `False` on any timeout/error.
+  2. In `restart_chrome()`, after the reuse path closes stale tabs, call `_probe_cdp_health(running_port)`. If it fails, `kill_chrome()` + fall through to fresh-launch path. The login session persists in `--user-data-dir` on disk, so killing Chrome does NOT lose authentication.
+  3. `queue_mode()` already handles non-`"ok"` status with a warning — but now `restart_chrome()` always returns `status: "ok"` after relaunching fresh, so workers will connect to a healthy browser.
+- **Verification:** `py_compile` clean on `chrome_lifecycle.py`. Awaiting live run to confirm: Chrome will now be fully killed + relaunched when the reused instance has a dead CDP WebSocket server.

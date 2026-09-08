@@ -211,6 +211,72 @@ def _our_chrome_port() -> int | None:
     return None
 
 
+def _probe_cdp_health(port: int) -> bool:
+    """Verify the Chrome CDP server can actually accept WebSocket connections.
+
+    A stale Chrome instance may answer HTTP /json/list and even create tabs
+    via Target.createTarget, but its per-tab WebSocket server is dead —
+    CDPClient.start() hangs on the ws handshake with no timeout. This check
+    creates a throwaway tab, opens a WebSocket to it, and runs a trivial
+    Runtime.evaluate. Returns True if the round-trip succeeds within a
+    generous deadline.
+    """
+    import asyncio
+    import json
+
+    def _create_tab() -> str | None:
+        """Create a throwaway tab via HTTP and return its wsUrl."""
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/new?about:blank", timeout=5,
+            ) as resp:
+                info = json.loads(resp.read())
+            ws_url = info.get("webSocketDebuggerUrl", "")
+            return ws_url or None
+        except Exception:
+            return None
+
+    def _close_tab(target_id: str) -> None:
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/close/{target_id}", timeout=5,
+            )
+        except Exception:
+            pass
+
+    ws_url = _create_tab()
+    if not ws_url:
+        # Can't even create a tab — server is definitely unhealthy
+        return False
+
+    # Extract target_id for cleanup
+    target_id = ws_url.rsplit("/", 1)[-1] if "/" in ws_url else ""
+
+    async def _ws_roundtrip() -> bool:
+        try:
+            import websockets
+            async with websockets.connect(
+                ws_url, open_timeout=8, close_timeout=5,
+            ) as ws:
+                msg = json.dumps({
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "1+1", "returnByValue": True},
+                })
+                await asyncio.wait_for(ws.send(msg), timeout=5)
+                resp_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                result = json.loads(resp_raw)
+                val = result.get("result", {}).get("result", {}).get("value")
+                return val == 2
+        except Exception:
+            return False
+
+    healthy = asyncio.run(_ws_roundtrip())
+    if target_id:
+        _close_tab(target_id)
+    return healthy
+
+
 def restart_chrome() -> dict[str, Any]:
     """Restart Chrome with our dedicated profile. Never touches other Chrome.
 
@@ -237,22 +303,35 @@ def restart_chrome() -> dict[str, Any]:
         # out. This prevents the per-run tab accumulation that OOMs Chrome.
         closed = cleanup_tabs(running_port)
         logger.info("Reuse-mode: closed %d stale tab(s) before launch", closed)
-        login_wall = _probe_login_wall(running_port)
-        return {
-            "killed": 0,
-            "remaining_after_kill": 0,
-            "restarted": True,
-            "reused": True,
-            "port": running_port,
-            "status": "ok",
-            "login_wall": login_wall,
-        }
+
+        # Validate the reused Chrome actually accepts live CDP connections.
+        # A stale Chrome instance can still answer /json/list and create tabs,
+        # but its per-tab WebSocket server is dead: workers hang forever on
+        # CDPClient.start() with "timed out during opening handshake".
+        if _probe_cdp_health(running_port):
+            login_wall = _probe_login_wall(running_port)
+            return {
+                "killed": 0,
+                "remaining_after_kill": 0,
+                "restarted": True,
+                "reused": True,
+                "port": running_port,
+                "status": "ok",
+                "login_wall": login_wall,
+            }
+
+        # CDP server is unhealthy — kill and fall through to fresh launch.
+        logger.warning(
+            "Reuse-mode: CDP health check failed — killing stale Chrome"
+            " and launching fresh (login session persists in --user-data-dir)"
+        )
+        kill_result = kill_chrome()
+    else:
+        # Chrome not running — kill any leftover processes before launching
+        kill_result = kill_chrome()
 
     # Find an available port for a fresh launch
     port = _find_available_port()
-
-    # Kill any leftover our-Chrome processes before launching
-    kill_result = kill_chrome()
 
     # Launch Chrome directly (NOT via `open -g` — on macOS `open -g -a ...
     # --args` silently drops the --args, so the debug port never opens, AND
