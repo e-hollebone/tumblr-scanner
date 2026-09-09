@@ -177,7 +177,7 @@ async def _preflight_t0_login_check(
                                 "Pre-flight: T0 blog %s not in URL (%s) — may be a redirect, waiting...",
                                 target_blog, final_url[:80],
                             )
-                        elif posts_rendered < 20:
+                        elif posts_rendered < 1:
                             logger.info(
                                 "Pre-flight: T0 blog %s loaded but only %d posts rendered (url=%s) — waiting for full render...",
                                 target_blog, posts_rendered, final_url[:80],
