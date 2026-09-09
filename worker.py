@@ -360,6 +360,10 @@ class Worker:
             )
 
         for attempt in range(1, MAX_RECOVERY + 1):
+            # Fast abort: if shutdown was signaled, don't retry CDP operations
+            if self.wall_halt.is_set():
+                logger.info("Worker %d: shutdown signal during retry loop, aborting", self.worker_id)
+                return {"username": username, "tier": tier, "status": "aborted", "unique": 0, "total": 0, "posts": 0, "usernames": [], "enqueued": 0, "dead": False}
             try:
                 return await _do_crawl()
             except LoginWallDetected as wall:
@@ -381,6 +385,9 @@ class Worker:
                         WALL_RETRY_BACKOFF_S,
                     )
                     await asyncio.sleep(WALL_RETRY_BACKOFF_S)
+                    if self.wall_halt.is_set():
+                        logger.info("Worker %d: shutdown signal during wall retry, aborting", self.worker_id)
+                        return {"username": username, "tier": tier, "status": "aborted", "unique": 0, "total": 0, "posts": 0, "usernames": [], "enqueued": 0, "dead": False}
                     continue
                 logger.warning(
                     "Worker %d: wall confirmed for %s after %d retries — halting",
@@ -400,7 +407,14 @@ class Worker:
                     exc,
                 )
                 if attempt < MAX_RECOVERY:
+                    # Check shutdown before sleeping + recovering
+                    if self.wall_halt.is_set():
+                        logger.info("Worker %d: shutdown signal after tab death, aborting", self.worker_id)
+                        return {"username": username, "tier": tier, "status": "aborted", "unique": 0, "total": 0, "posts": 0, "usernames": [], "enqueued": 0, "dead": False}
                     await asyncio.sleep(2.0)
+                    if self.wall_halt.is_set():
+                        logger.info("Worker %d: shutdown signal during tab recovery, aborting", self.worker_id)
+                        return {"username": username, "tier": tier, "status": "aborted", "unique": 0, "total": 0, "posts": 0, "usernames": [], "enqueued": 0, "dead": False}
                     if not await self._recover_tab():
                         logger.error(
                             "Worker %d: tab recovery failed for %s",
@@ -499,7 +513,15 @@ class Worker:
                         # hang workers forever; real shutdown is via wall_halt.
                         logger.info("Worker %d: queue empty 10m — exiting", self.worker_id)
                         break
-                    await asyncio.sleep(QUEUE_POLL_INTERVAL)
+                    # Fast-abort sleep: wake every 1s to check for shutdown signal
+                    sleep_deadline = time.monotonic() + QUEUE_POLL_INTERVAL
+                    while time.monotonic() < sleep_deadline:
+                        if self.wall_halt.is_set():
+                            logger.info("Worker %d: wall_halt during sleep, exiting", self.worker_id)
+                            break
+                        await asyncio.sleep(1.0)
+                    if self.wall_halt.is_set():
+                        break
                     continue
 
                 # Abort immediately if shutdown was signaled between the while
@@ -725,11 +747,31 @@ class Worker:
             # Close our tab on exit — the login session lives in the Chrome
             # profile dir, so closing the tab does NOT log us out. Leaving tabs
             # open is what accumulates across runs and OOMs Chrome.
-            # Use shield to prevent cancellation from interrupting tab cleanup.
-            try:
-                await asyncio.shield(self._close_tab())
-            except Exception:  # noqa: BLE001, S110
-                pass  # Best effort
+            #
+            # Fast shutdown: if wall_halt was set (SIGINT/drain complete), don't
+            # use asyncio.shield and don't retry — just close via the HTTP
+            # endpoint with a short timeout. There's no benefit to cleanly closing
+            # tabs during shutdown; it just wastes time.
+            if self.wall_halt.is_set():
+                # Shutdown path: fast close, no shield, no retry
+                if self.target_id:
+                    try:
+                        from agent import close_tab
+                        await asyncio.wait_for(
+                            close_tab(self.browser_ws, self.target_id),
+                            timeout=5.0,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self.target_id = None
+                    self.ws_url = None
+            else:
+                # Normal exit path: shield the close so cancellation doesn't
+                # leave tabs orphaned
+                try:
+                    await asyncio.shield(self._close_tab())
+                except Exception:  # noqa: BLE001, S110
+                    pass  # Best effort
             # Clear busy_event so a coordinator Task.cancel() mid-crawl cannot
             # leave busy_events[i] stuck True and block drain_complete forever
             # (Gap 5 — verified: only the inner busy_event.clear() sites ran;
