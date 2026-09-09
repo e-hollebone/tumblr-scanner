@@ -144,4 +144,14 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 | **Fix (commit `f76d35d`):** Added `--no-startup-window` flag to the Chrome launch in `chrome_lifecycle.py:352`. This prevents Chrome from creating a startup window that gets restored by the window server. The `--remote-debugging-port` still works normally.
 
 ### 2026-09-09 — Pre-flight URL still empty: awaiting diagnostic run
-- **Fix (commit `c759fc2`):** Promoted `Page.enable`/`Page.navigate` debug logs to INFO, added `exceptionDetails` check for JS evaluation errors, committed all diagnostic changes. Awaiting user run to inspect raw CDP response and identify why `location.href` returns empty string.
+| **Fix (commit `c759fc2`):** Promoted `Page.enable`/`Page.navigate` debug logs to INFO, added `exceptionDetails` check for JS evaluation errors, committed all diagnostic changes. Awaiting user run to inspect raw CDP response and identify why `location.href` returns empty string.
+
+### 2026-09-09 — Slow shutdown on SIGINT (Ctrl+C takes minutes)
+- **Claim:** SIGINT (Ctrl+C) during crawl takes too long to shut down — workers keep retrying CDP operations (45s Page.navigate timeout + 30s tab recovery × MAX_RECOVERY retries) instead of aborting immediately. The `asyncio.shield(self._close_tab())` in the finally block also prevents cancellation during tab cleanup.
+- **Evidence:** User reported shutdown taking too long; workers continue retrying after wall_halt is set. The retry loop in `_crawl_with_recovery()` (`worker.py:362`) doesn't check `wall_halt.is_set()` between attempts, and the `asyncio.sleep()` calls in retry paths can't be interrupted.
+- **Fix (commit `d766c78`):**
+  1. Added `wall_halt.is_set()` check at the top of each retry attempt in `_crawl_with_recovery` — returns immediately with status="aborted"
+  2. Added `wall_halt.is_set()` checks after wall retry sleep and during tab recovery sleep — returns immediately instead of retrying
+  3. Replaced `asyncio.shield(self._close_tab())` with a 5s fire-and-forget `close_tab` on shutdown path (no shield, no retry)
+  4. Queue-empty sleep now wakes every 1s to check for `wall_halt` instead of blocking for 10s
+- **Verification:** `py_compile` clean on `worker.py`. Awaiting live run to confirm SIGINT shuts down in seconds, not minutes.
