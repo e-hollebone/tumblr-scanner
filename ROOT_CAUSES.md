@@ -114,4 +114,19 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
   2. If any check fails, polls every 10s for up to 300s (5 min) — user can log in to Tumblr in the Chrome window during this wait.
   3. Only returns True (all checks pass) → THEN seeds queue + starts workers.
   4. If timeout expires, proceeds anyway with a warning so the user can Ctrl+C and log in.
-- **Verification:** `py_compile` clean on `queue_integration.py`. Awaiting live run to confirm pre-flight gate blocks until T0 is verified.
+| **Verification:** `py_compile` clean on `queue_integration.py`. Awaiting live run to confirm pre-flight gate blocks until T0 is verified.
+
+### 2026-09-09 — Pre-flight T0 login gate: URL always empty, never detects successful login
+- **Claim:** After deploying pre-flight login wall gate (commit `09f8906`), the gate correctly waited for login. User logged in to Tumblr in the Chrome window, but the pre-flight never detected success — it kept logging `Pre-flight: T0 blog the-smallest-kitten-cravings not in URL ()` with empty URL `()` for the full 5-minute timeout, then proceeded anyway to the workers (who all hit the wall again).
+- **Evidence:**
+  - `~/.hermes/logs/tumblr-scanner.log`: 29 consecutive `not in URL ()` log lines from 14:04:03 to 14:07:05. The URL captured by `Runtime.evaluate` was always `""` (empty string).
+  - `detect_login_wall_detail("")` returns `False` (empty URL is not a login wall), so the gate fell through to the blog-name-in-URL check, which failed because `target_blog` ("the-smallest-kitten-cravings") is not in `""`.
+- **Root cause (two bugs):**
+  1. **Page not navigated/loaded:** `_new_tab_url()` calls `Target.createTarget` with a URL param, but the pre-flight immediately ran `Runtime.evaluate` without waiting for the page to load. `location.href` was empty because the page hadn't navigated yet. The poll-and-reload code used `Page.reload` without first calling `Page.enable` — so the reload silently did nothing, and the URL stayed perpetually empty.
+  2. **Blog name matching stripped hyphens from URL but not from target_blog:** Line 121 stripped `-` and `_` from `final_url` but not from `target_blog`. Even if the URL were populated, `the-smallest-kitten-cravings` (with hyphens) would never be found in `thesmallestkittencravings` (hyphens stripped).
+- **Fix (commit `6c3fc81`):**
+  1. Added `Page.enable` before `Page.navigate` in the pre-flight polling loop.
+  2. Replaced broken `Page.reload` with explicit `Page.navigate` + `loadResponse=True` (blocks until page finishes loading), matching the pattern used in `worker.py:172`.
+  3. Added inner poll loop that waits for non-empty URL + page text content before running checks (SPA renders in stages).
+  4. Fixed blog-name matching: `target_blog.lower().replace("-","").replace("_","")` not in stripped URL — now strips hyphens/underscores from both sides.
+- **Verification:** `py_compile` clean on `queue_integration.py`. Awaiting live run with login to confirm gate detects successful login and proceeds to workers.
