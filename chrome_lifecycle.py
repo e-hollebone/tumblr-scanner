@@ -349,6 +349,7 @@ def restart_chrome() -> dict[str, Any]:
                 f"--user-data-dir={CHROME_PROFILE_DIR}",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--no-startup-window",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
