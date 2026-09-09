@@ -170,7 +170,7 @@ async def close_tab(browser_ws: str, target_id: str) -> None:
         return
 
     client = CDPClient(browser_ws_url)
-    await client.start()
+    await asyncio.wait_for(client.start(), timeout=30.0)
     try:
         await client.send.Target.closeTarget(params={"targetId": target_id})
         logger.info("Closed tab targetId=%s", target_id)

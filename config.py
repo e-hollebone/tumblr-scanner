@@ -51,7 +51,7 @@ WORKER_STALL_TIMEOUT = 180.0
 
 CDP_COMMAND_TIMEOUT = 15.0
 CONTENT_WAIT_TIMEOUT = 30.0
-MAX_RECOVERY_PER_BLOG = 1
+MAX_RECOVERY_PER_BLOG = 3
 
 # Login-wall confirmation (fix A): a detected wall is treated as a *soft*
 # signal and retried before halting the whole pipeline. Tumblr's rate-limit /

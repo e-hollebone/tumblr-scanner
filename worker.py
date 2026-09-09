@@ -167,7 +167,7 @@ class Worker:
         url = f"https://www.tumblr.com/{username}?offset={offset}"
 
         client = CDPClient(self.ws_url)
-        await client.start()
+        await asyncio.wait_for(client.start(), timeout=30.0)
         try:
             await cdp_send(client, "Page.navigate", {"url": url, "loadResponse": True}, timeout=45.0)
 
@@ -245,7 +245,7 @@ class Worker:
                 from cdp_wrapper import cdp_send
                 if self.ws_url:
                     client = CDPClient(self.ws_url)
-                    await client.start()
+                    await asyncio.wait_for(client.start(), timeout=30.0)
                     try:
                         await cdp_send(client, "Page.navigate", {"url": "about:blank"}, timeout=15.0)
                     finally:

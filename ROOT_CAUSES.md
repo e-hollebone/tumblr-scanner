@@ -3,7 +3,8 @@
 Rule: after every run/analysis/failure, append a date-stamped entry and refresh the Open/unresolved section.
 
 ## Open / Unresolved
-- **Stale Chrome reuse causing dead CDP WebSocket connections (2026-09-08):** `restart_chrome()` reuses a long-running Chrome process whose WebSocket server has degraded. Fix applied (CDP health check + auto-relaunch) but needs live run verification. Until then, manually kill Chrome before each run: `kill CHROME_PID` where PID found via `ps aux | grep "chrome_profile"`.
+- **Stale Chrome reuse + WebSocket handshakes under 10-tab load (2026-09-08, 2026-09-09):** `restart_chrome()` CDP health probe fix (`232d820`) + `client.start()` 30s timeout wrapper + `MAX_RECOVERY_PER_BLOG=3` both applied but need live run verification. Worker should kill stale Chrome before each run if it fails to connect.
+- Worker shutdown path still uses tab target IDs from a pre-shutdown Chrome state; if the coordinator halts while a worker is mid-blog, any later tab lookup can fail with `Tab targetId=... not found in /json/list`. This is tolerated as a shutdown-side error, but it still counts as a non-zero `errors` drain stat.
 - Login-wall retry fix is still pending implementation.
 - Startup bring-up hardening is now in place for tab-open handshake timeouts; needs a live 10-tab run to verify all workers recover under Chrome startup load.
 - Queue overflow at 10000 items is dropping discovered blogs during active crawl — fixed: overflow gate now counts active work (pending+in_progress) only; threshold raised to 50000; T0/T1 always bypass overflow gate, only T2+ is droppable.
@@ -70,3 +71,19 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
   2. In `restart_chrome()`, after the reuse path closes stale tabs, call `_probe_cdp_health(running_port)`. If it fails, `kill_chrome()` + fall through to fresh-launch path. The login session persists in `--user-data-dir` on disk, so killing Chrome does NOT lose authentication.
   3. `queue_mode()` already handles non-`"ok"` status with a warning — but now `restart_chrome()` always returns `status: "ok"` after relaunching fresh, so workers will connect to a healthy browser.
 - **Verification:** `py_compile` clean on `chrome_lifecycle.py`. Awaiting live run to confirm: Chrome will now be fully killed + relaunched when the reused instance has a dead CDP WebSocket server.
+
+### 2026-09-09 — WebSocket handshake timeouts under 10-tab load: 10s default open_timeout too short
+- **Claim:** After Chrome restart fix applied (commit `232d820`), fresh `run.py` at 13:13 on port 9223 still fails ~90% of blogs with "timed out during opening handshake" on offset 0. Root Chrome process (PID 13987) launched fresh at 13:13:32, CDP health probe passed, but individual workers can't establish WebSocket connections under concurrent load.
+- **Evidence:**
+  - `worker_events.log`: `chrome_restart | {"reused": false, "killed": 0, "port": 9223, "login_wall": false}` — fresh Chrome launched correctly.
+  - `tumblr-scanner.log`: 529 "opening handshake" timeouts, 6 "Runtime.evaluate timed out after 15.0s" errors, 225 "tab recovery exhausted". Only 3/30 blogs succeeded (angiecan, susseari27, kingkianon).
+  - All failures are on offset 0 (first page of each blog), confirming the issue is tab WebSocket connection establishment, not content loading.
+  - Workers 0-9 all start `blog_start` at ~same time, each calling `CDPClient(ws_url).start()` → `websockets.connect()` simultaneously. Chrome 152's WebSocket server can't handle 10 concurrent handshakes, causing many to exceed the 10s default `open_timeout`.
+- **Root cause:** Two compounding issues:
+  1. `worker.py navigate_to()` (line 172) calls `await client.start()` with NO timeout wrapper. The `websockets` library default `open_timeout` is 10s — too short when 10 workers compete for Chrome's WebSocket server. (Note: `_new_tab_url()` in `agent.py` already wraps `client.start()` with `asyncio.wait_for(..., 30.0)`, but `navigate_to`, `probe_page_zero`, and `close_tab` do not.)
+  2. `MAX_RECOVERY_PER_BLOG = 1` in `config.py:54` — workers get exactly 1 retry attempt. When the WebSocket timeout hits, recovery opens a new tab (via `_new_tab_url`, which has the 30s timeout), but the same `navigate_to` `client.start()` call fails again with the same 10s timeout.
+- **Fix (applied in this session):**
+  1. `worker.py navigate_to()` and `probe_page_zero()`: wrapped `client.start()` in `asyncio.wait_for(..., timeout=30.0)` — matching the pattern already used in `agent._new_tab_url()`.
+  2. `agent.py close_tab()`: same timeout wrapper for the browser-level CDPClient connection.
+  3. `config.py`: raised `MAX_RECOVERY_PER_BLOG` from 1 to 3 — gives workers 3 retry attempts when the WebSocket server is under load, instead of failing permanently on the first handshake timeout.
+- **Verification:** `py_compile` clean on `worker.py`, `agent.py`, `config.py`. Awaiting live `--tabs 10` run to confirm handshake timeout failure rate drops.
