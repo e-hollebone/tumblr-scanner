@@ -96,15 +96,15 @@ async def _preflight_t0_login_check(
                 await _aio.wait_for(client.start(), timeout=30.0)
                 try:
                     # Enable Page domain, then navigate explicitly to the T0 blog.
-                    logger.debug("Pre-flight: enabling Page domain")
+                    logger.info("Pre-flight: enabling Page domain")
                     await cdp_send(client, "Page.enable", {}, timeout=10.0)
-                    logger.debug("Pre-flight: navigating to https://www.tumblr.com/%s", target_blog)
+                    logger.info("Pre-flight: navigating to https://www.tumblr.com/%s", target_blog)
                     nav_result = await cdp_send(
                         client, "Page.navigate",
                         {"url": f"https://www.tumblr.com/{target_blog}"},
                         timeout=45.0,
                     )
-                    logger.debug("Pre-flight: Page.navigate returned: %s", nav_result)
+                    logger.info("Pre-flight: Page.navigate returned: %s", nav_result)
 
                     # Poll for page content to appear (SPA may still be rendering)
                     page_ready = False
@@ -129,6 +129,12 @@ async def _preflight_t0_login_check(
                             )
                             # Debug: log the raw CDP result
                             logger.info("Pre-flight: raw CDP result: %s", result)
+                            # Check for JS execution errors
+                            if result.get("result", {}).get("result", {}).get("exceptionDetails"):
+                                logger.info(
+                                    "Pre-flight: JS exception: %s",
+                                    result.get("result", {}).get("result", {}).get("exceptionDetails"),
+                                )
                             val = result.get("result", {}).get("result", {}).get("value", "{}")
                             # Also try direct path if the nested one is empty
                             if not val or val == "{}":
