@@ -98,3 +98,20 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
   - The initial `_open_tab()` call in `run()` (line 484) is unaffected because `_open_tab()` internally sets `self.ws_url, self.target_id` correctly at lines 94 and 107-109. The bug only triggers in the **recovery path**.
 - **Fix (applied in this session):** Swapped the assignment in `_recover_tab()` from `self.target_id, self.ws_url = ...` to `self.ws_url, self.target_id = ...` — matching the return order of `_open_tab()`.
 - **Verification:** `py_compile` clean on `worker.py`. Awaiting live `--tabs 10` run to confirm blogs succeed after tab recovery.
+
+### 2026-09-09 — Login wall not gated: all 10 workers hit wall simultaneously
+- **Claim:** After fixing handshake timeouts and tab ID swap (commits `cf393e6`, `1a9c1dc`), fresh run still fails: 27 tabs opened but none progress past initial tumblr.com home page. All workers hit the login wall at the same time, churn through MAX_RECOVERY retries, and fail.
+- **Evidence:**
+  - `~/.hermes/logs/tumblr-scanner.log`: Workers log `LOGIN WALL DETECTED` for multiple blogs simultaneously at startup.
+  - `worker_events.log`: 27 `tab_opened` events, 0 successful `blog_done` with `status=ok` for the first wave.
+  - The `_probe_login_wall()` in `chrome_lifecycle.py` only checks `tumblr.com` redirect URL — it doesn't verify the T0 seed blog actually loads. Workers start immediately and all hit the same unauthenticated state.
+- **Root cause:** `queue_mode()` seeds T0 and immediately starts all 10 workers. There is no pre-flight gate to verify the login session is actually valid before unleashing the full worker pool. When the session expired or Chrome didn't carry the saved login state, every worker hits the wall at once.
+- **Fix (applied in this session):**
+  1. Added `_preflight_t0_login_check()` in `queue_integration.py` — opens 1 tab to the T0 blog and checks:
+     - URL is not a `/login` or `/signup` redirect (login wall)
+     - Blog name appears in the URL (confirmed at the right page, not a redirect)
+     - 20+ posts rendered (`[data-cell-id]` count)
+  2. If any check fails, polls every 10s for up to 300s (5 min) — user can log in to Tumblr in the Chrome window during this wait.
+  3. Only returns True (all checks pass) → THEN seeds queue + starts workers.
+  4. If timeout expires, proceeds anyway with a warning so the user can Ctrl+C and log in.
+- **Verification:** `py_compile` clean on `queue_integration.py`. Awaiting live run to confirm pre-flight gate blocks until T0 is verified.
