@@ -141,4 +141,7 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 
 ### 2026-09-09 — Chrome focus steal on tab open
 - **Claim:** When Chrome opens a new tab via `Target.createTarget`, macOS restores the Chrome window to the foreground, stealing focus from other apps.
-- **Fix (commit `f76d35d`):** Added `--no-startup-window` flag to the Chrome launch in `chrome_lifecycle.py:352`. This prevents Chrome from creating a startup window that gets restored by the window server. The `--remote-debugging-port` still works normally.
+| **Fix (commit `f76d35d`):** Added `--no-startup-window` flag to the Chrome launch in `chrome_lifecycle.py:352`. This prevents Chrome from creating a startup window that gets restored by the window server. The `--remote-debugging-port` still works normally.
+
+### 2026-09-09 — Pre-flight URL still empty: awaiting diagnostic run
+- **Fix (commit `c759fc2`):** Promoted `Page.enable`/`Page.navigate` debug logs to INFO, added `exceptionDetails` check for JS evaluation errors, committed all diagnostic changes. Awaiting user run to inspect raw CDP response and identify why `location.href` returns empty string.
