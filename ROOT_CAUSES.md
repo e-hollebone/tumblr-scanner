@@ -129,4 +129,12 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
   2. Replaced broken `Page.reload` with explicit `Page.navigate` + `loadResponse=True` (blocks until page finishes loading), matching the pattern used in `worker.py:172`.
   3. Added inner poll loop that waits for non-empty URL + page text content before running checks (SPA renders in stages).
   4. Fixed blog-name matching: `target_blog.lower().replace("-","").replace("_","")` not in stripped URL — now strips hyphens/underscores from both sides.
-- **Verification:** `py_compile` clean on `queue_integration.py`. Awaiting live run with login to confirm gate detects successful login and proceeds to workers.
+| **Verification:** `py_compile` clean on `queue_integration.py`. Awaiting live run with login to confirm gate detects successful login and proceeds to workers.
+
+### 2026-09-09 — Pre-flight URL still empty after fix, diagnosing CDP response structure
+- **Claim:** After applying fix (commit `6c3fc81`), the pre-flight URL is still always empty `url=` on every poll cycle. User logged in to Tumblr successfully ("no login wall"), but `Runtime.evaluate` returns empty `location.href` consistently.
+- **Evidence:**
+  - `~/.hermes/logs/tumblr-scanner.log`: `cdp_use.client` "Connecting" message appears (WebSocket connects), no `TabDeadError` or `CDP check failed` warnings. But `Runtime.evaluate` returns result with empty URL on all 20s sub-deadline polls across every ~30s outer cycle.
+  - URL is `""` (empty string), not `"about:blank"` — suggests the evaluate call succeeds but the response structure doesn't match the expected `result.result.value` path.
+- **Likely root cause:** The `cdp_use` CDPClient's `Runtime.evaluate` response format may differ from what the code expects. The code extracts via `result.get("result", {}).get("result", {}).get("value", {})` but the actual response might be `result.get("result", {}).get("value", {})` (one fewer nesting level). When the first extraction returns `"{}"`, `json.loads("{}")` gives `{}` and all fields default to empty/0.
+- **Fix (commit `d3f026c`):** Added INFO-level logging of the raw CDP result, added alternate result-path fallback extraction, removed `loadResponse=True` from `Page.navigate` (it's not a wait-for-load flag), and added `Page.enable` before navigate. Awaiting live `--verbose` run to inspect raw CDP response and identify the correct response structure.
