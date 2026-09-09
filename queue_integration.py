@@ -96,13 +96,15 @@ async def _preflight_t0_login_check(
                 await _aio.wait_for(client.start(), timeout=30.0)
                 try:
                     # Enable Page domain, then navigate explicitly to the T0 blog.
-                    # Use loadResponse=True to block until the page finishes loading.
+                    logger.debug("Pre-flight: enabling Page domain")
                     await cdp_send(client, "Page.enable", {}, timeout=10.0)
-                    await cdp_send(
+                    logger.debug("Pre-flight: navigating to https://www.tumblr.com/%s", target_blog)
+                    nav_result = await cdp_send(
                         client, "Page.navigate",
-                        {"url": f"https://www.tumblr.com/{target_blog}", "loadResponse": True},
+                        {"url": f"https://www.tumblr.com/{target_blog}"},
                         timeout=45.0,
                     )
+                    logger.debug("Pre-flight: Page.navigate returned: %s", nav_result)
 
                     # Poll for page content to appear (SPA may still be rendering)
                     page_ready = False
@@ -111,36 +113,51 @@ async def _preflight_t0_login_check(
                     posts_rendered = 0
                     sub_deadline = time.monotonic() + 20.0
                     while time.monotonic() < sub_deadline:
-                        result = await cdp_send(
-                            client,
-                            "Runtime.evaluate",
-                            {
-                                "expression": (
-                                    "JSON.stringify({url: location.href, "
-                                    "text: (document.body ? document.body.innerText : '').slice(0, 500), "
-                                    "posts: document.querySelectorAll('[data-cell-id]').length})"
-                                ),
-                                "returnByValue": True,
-                            },
-                            timeout=15.0,
-                        )
-                        val = result.get("result", {}).get("result", {}).get("value", "{}")
-                        import json as _json
-                        snap = _json.loads(val)
-                        final_url = snap.get("url", "")
-                        page_text = snap.get("text", "")
-                        posts_rendered = snap.get("posts", 0)
+                        try:
+                            result = await cdp_send(
+                                client,
+                                "Runtime.evaluate",
+                                {
+                                    "expression": (
+                                        "JSON.stringify({url: location.href, "
+                                        "text: (document.body ? document.body.innerText : '').slice(0, 500), "
+                                        "posts: document.querySelectorAll('[data-cell-id]').length})"
+                                    ),
+                                    "returnByValue": True,
+                                },
+                                timeout=15.0,
+                            )
+                            # Debug: log the raw CDP result
+                            logger.info("Pre-flight: raw CDP result: %s", result)
+                            val = result.get("result", {}).get("result", {}).get("value", "{}")
+                            # Also try direct path if the nested one is empty
+                            if not val or val == "{}":
+                                alt_val = result.get("result", {}).get("value", "{}")
+                                if alt_val and alt_val != "{}":
+                                    logger.info("Pre-flight: using alternate result path: %s", alt_val)
+                                    val = alt_val
+                            import json as _json
+                            snap = _json.loads(val)
+                            final_url = snap.get("url", "")
+                            page_text = snap.get("text", "")
+                            posts_rendered = snap.get("posts", 0)
+                            logger.debug(
+                                "Pre-flight: evaluated — url=%s, posts=%d, text_len=%d",
+                                final_url[:80], posts_rendered, len(page_text),
+                            )
 
-                        # If we have a URL and some page text, we're ready to check
-                        if final_url and (page_text or posts_rendered > 0):
-                            page_ready = True
-                            break
+                            # If we have a URL and some page text, we're ready to check
+                            if final_url and (page_text or posts_rendered > 0):
+                                page_ready = True
+                                break
+                        except Exception as eval_exc:  # noqa: BLE001
+                            logger.debug("Pre-flight: Runtime.evaluate failed: %s", eval_exc)
                         await _aio.sleep(1.0)
 
                     if not page_ready:
                         logger.info(
-                            "Pre-flight: T0 blog %s page not ready (url=%s) — waiting...",
-                            target_blog, final_url[:80],
+                            "Pre-flight: T0 blog %s page not ready (url=%s, posts=%d) — waiting...",
+                            target_blog, final_url[:80], posts_rendered,
                         )
                     else:
                         is_wall, reason = detect_login_wall_detail(page_text, "", final_url)
