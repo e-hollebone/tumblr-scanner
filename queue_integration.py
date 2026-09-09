@@ -87,71 +87,91 @@ async def _preflight_t0_login_check(
         )
         logger.info("Pre-flight: opened tab %s for T0 blog %s", target_id, target_blog)
 
+        # Give the page time to start loading after tab creation
+        await _aio.sleep(2.0)
+
         while time.monotonic() < deadline:
             try:
                 client = CDPClient(ws_url)
                 await _aio.wait_for(client.start(), timeout=30.0)
                 try:
-                    result = await cdp_send(
-                        client,
-                        "Runtime.evaluate",
-                        {
-                            "expression": (
-                                "JSON.stringify({url: location.href, "
-                                "text: (document.body ? document.body.innerText : '').slice(0, 500), "
-                                "posts: document.querySelectorAll('[data-cell-id]').length})"
-                            ),
-                            "returnByValue": True,
-                        },
-                        timeout=15.0,
+                    # Enable Page domain, then navigate explicitly to the T0 blog.
+                    # Use loadResponse=True to block until the page finishes loading.
+                    await cdp_send(client, "Page.enable", {}, timeout=10.0)
+                    await cdp_send(
+                        client, "Page.navigate",
+                        {"url": f"https://www.tumblr.com/{target_blog}", "loadResponse": True},
+                        timeout=45.0,
                     )
-                    val = result.get("result", {}).get("result", {}).get("value", "{}")
-                    import json as _json
-                    snap = _json.loads(val)
-                    final_url = snap.get("url", "")
-                    page_text = snap.get("text", "")
-                    posts_rendered = snap.get("posts", 0)
-                    is_wall, reason = detect_login_wall_detail(page_text, "", final_url)
 
-                    if is_wall:
-                        logger.info(
-                            "Pre-flight: T0 blog %s behind login wall (reason=%s, url=%s) — waiting for user login...",
-                            target_blog, reason, final_url[:80],
+                    # Poll for page content to appear (SPA may still be rendering)
+                    page_ready = False
+                    final_url = ""
+                    page_text = ""
+                    posts_rendered = 0
+                    sub_deadline = time.monotonic() + 20.0
+                    while time.monotonic() < sub_deadline:
+                        result = await cdp_send(
+                            client,
+                            "Runtime.evaluate",
+                            {
+                                "expression": (
+                                    "JSON.stringify({url: location.href, "
+                                    "text: (document.body ? document.body.innerText : '').slice(0, 500), "
+                                    "posts: document.querySelectorAll('[data-cell-id]').length})"
+                                ),
+                                "returnByValue": True,
+                            },
+                            timeout=15.0,
                         )
-                    elif target_blog not in final_url.lower().replace("-", "").replace("_", ""):
+                        val = result.get("result", {}).get("result", {}).get("value", "{}")
+                        import json as _json
+                        snap = _json.loads(val)
+                        final_url = snap.get("url", "")
+                        page_text = snap.get("text", "")
+                        posts_rendered = snap.get("posts", 0)
+
+                        # If we have a URL and some page text, we're ready to check
+                        if final_url and (page_text or posts_rendered > 0):
+                            page_ready = True
+                            break
+                        await _aio.sleep(1.0)
+
+                    if not page_ready:
                         logger.info(
-                            "Pre-flight: T0 blog %s not in URL (%s) — may be a redirect, waiting...",
+                            "Pre-flight: T0 blog %s page not ready (url=%s) — waiting...",
                             target_blog, final_url[:80],
                         )
-                    elif posts_rendered < 20:
-                        logger.info(
-                            "Pre-flight: T0 blog %s loaded but only %d posts rendered (url=%s) — waiting for full render...",
-                            target_blog, posts_rendered, final_url[:80],
-                        )
                     else:
-                        logger.info(
-                            "Pre-flight: T0 blog %s verified (%d posts, url=%s) — proceeding to workers",
-                            target_blog, posts_rendered, final_url[:80],
-                        )
-                        return True
+                        is_wall, reason = detect_login_wall_detail(page_text, "", final_url)
+                        if is_wall:
+                            logger.info(
+                                "Pre-flight: T0 blog %s behind login wall (reason=%s, url=%s) — waiting for user login...",
+                                target_blog, reason, final_url[:80],
+                            )
+                        elif target_blog.lower().replace("-", "").replace("_", "") not in final_url.lower().replace("-", "").replace("_", ""):
+                            logger.info(
+                                "Pre-flight: T0 blog %s not in URL (%s) — may be a redirect, waiting...",
+                                target_blog, final_url[:80],
+                            )
+                        elif posts_rendered < 20:
+                            logger.info(
+                                "Pre-flight: T0 blog %s loaded but only %d posts rendered (url=%s) — waiting for full render...",
+                                target_blog, posts_rendered, final_url[:80],
+                            )
+                        else:
+                            logger.info(
+                                "Pre-flight: T0 blog %s verified (%d posts, url=%s) — proceeding to workers",
+                                target_blog, posts_rendered, final_url[:80],
+                            )
+                            return True
                 finally:
                     await client.stop()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pre-flight: CDP check failed for %s: %s — retrying", target_blog, exc)
 
-            # Wait and reload the page to re-check after potential login
+            # Wait and re-check after potential login
             await _aio.sleep(LOGIN_WALL_POLL_INTERVAL)
-            try:
-                client = CDPClient(ws_url)
-                await _aio.wait_for(client.start(), timeout=30.0)
-                try:
-                    await cdp_send(
-                        client, "Page.reload", {"ignoreCache": True}, timeout=15.0
-                    )
-                finally:
-                    await client.stop()
-            except Exception:  # noqa: BLE001
-                pass
 
     finally:
         if target_id:
