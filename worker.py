@@ -306,7 +306,7 @@ class Worker:
 
         for attempt in range(MAX_RECOVERY_PER_BLOG):
             try:
-                self.target_id, self.ws_url = await self._open_tab()
+                self.ws_url, self.target_id = await self._open_tab()
                 return True
             except Exception as exc:  # noqa: BLE001
                 logger.warning(

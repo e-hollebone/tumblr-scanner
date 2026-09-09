@@ -3,7 +3,7 @@
 Rule: after every run/analysis/failure, append a date-stamped entry and refresh the Open/unresolved section.
 
 ## Open / Unresolved
-- **Stale Chrome reuse + WebSocket handshakes under 10-tab load (2026-09-08, 2026-09-09):** `restart_chrome()` CDP health probe fix (`232d820`) + `client.start()` 30s timeout wrapper + `MAX_RECOVERY_PER_BLOG=3` both applied but need live run verification. Worker should kill stale Chrome before each run if it fails to connect.
+- **Stale Chrome reuse + WebSocket handshakes under 10-tab load (2026-09-08, 2026-09-09):** `restart_chrome()` CDP health probe fix (`232d820`) + `client.start()` 30s timeout wrapper + `MAX_RECOVERY_PER_BLOG=3` + tab_id/ws_url swap fix in `_recover_tab()` all committed (`cf393e6`), need live run verification. Worker should kill stale Chrome before each run if it fails to connect.
 - Worker shutdown path still uses tab target IDs from a pre-shutdown Chrome state; if the coordinator halts while a worker is mid-blog, any later tab lookup can fail with `Tab targetId=... not found in /json/list`. This is tolerated as a shutdown-side error, but it still counts as a non-zero `errors` drain stat.
 - Login-wall retry fix is still pending implementation.
 - Startup bring-up hardening is now in place for tab-open handshake timeouts; needs a live 10-tab run to verify all workers recover under Chrome startup load.
@@ -87,3 +87,14 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
   2. `agent.py close_tab()`: same timeout wrapper for the browser-level CDPClient connection.
   3. `config.py`: raised `MAX_RECOVERY_PER_BLOG` from 1 to 3 — gives workers 3 retry attempts when the WebSocket server is under load, instead of failing permanently on the first handshake timeout.
 - **Verification:** `py_compile` clean on `worker.py`, `agent.py`, `config.py`. Awaiting live `--tabs 10` run to confirm handshake timeout failure rate drops.
+
+### 2026-09-09 — Tab ID / WS URL swap in _recover_tab causes every retry to fail
+- **Claim:** Second run after timeout fix (PID 16489, started 13:31) still fails ~90% of blogs, but with a NEW error: `Tab targetId=ws://127.0.0.1:9223/devtools/page/XXX not found in /json/list`. Tabs open fine (targetId logged in `tab_opened` events) but `_refresh_ws_url` can never find them because `self.target_id` contains the full WebSocket URL instead of the hex target ID.
+- **Evidence:**
+  - `worker_events.log`: `tab_opened | {"target_id": "0708E06684D0CC91131462B780EE9186"}` — correct hex ID at open time.
+  - `tumblr-scanner.log`: `Failed to refresh WS URL: Tab targetId=ws://127.0.0.1:9223/devtools/page/0708E06684D0CC91131462B780EE9186 not found in /json/list` — `self.target_id` is the WS URL, not the hex ID.
+  - `/json/list` returns `id` as hex (`0708E06684D0CC91131462B780EE9186`) but comparison is against the WS URL — so the lookup NEVER matches, even on the first attempt after recovery.
+- **Root cause:** `worker.py _recover_tab()` line 309: `self.target_id, self.ws_url = await self._open_tab()`. But `_open_tab()` returns `(ws_url, target_id)` — the return order is `(ws_url, target_id)`. So the assignment **swaps** the two: `self.target_id` gets the WS URL, and `self.ws_url` gets the hex target ID. Every `navigate_to` call after recovery then compares the WS URL against `/json/list`'s `id` field and never finds a match.
+  - The initial `_open_tab()` call in `run()` (line 484) is unaffected because `_open_tab()` internally sets `self.ws_url, self.target_id` correctly at lines 94 and 107-109. The bug only triggers in the **recovery path**.
+- **Fix (applied in this session):** Swapped the assignment in `_recover_tab()` from `self.target_id, self.ws_url = ...` to `self.ws_url, self.target_id = ...` — matching the return order of `_open_tab()`.
+- **Verification:** `py_compile` clean on `worker.py`. Awaiting live `--tabs 10` run to confirm blogs succeed after tab recovery.
