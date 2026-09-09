@@ -2,12 +2,13 @@
 
 Architecture:
   1. Fresh Chrome restart (dedicated profile, never touches user's Chrome).
-  2. Seed blog is the FIRST queue item. Workers start immediately.
-  3. Each worker owns ONE tab for its entire lifetime.
-  4. Worker pulls a blog → crawls page-by-page → enqueues discoveries.
-  5. The moment the seed worker finishes page 0 and enqueues depth-1 names,
+  2. Pre-flight login wall gate: open 1 tab to T0 blog, BLOCK if login wall.
+  3. Seed blog is the FIRST queue item. Workers start immediately.
+  4. Each worker owns ONE tab for its entire lifetime.
+  5. Worker pulls a blog → crawls page-by-page → enqueues discoveries.
+  6. The moment the seed worker finishes page 0 and enqueues depth-1 names,
      idle workers pick them up. No T0→T1→T2 gate.
-  6. Parallelism starts at first extraction.
+  7. Parallelism starts at first extraction.
 
 Workers poll the queue. When empty, they sleep briefly and retry. If the
 queue stays empty past QUEUE_EMPTY_TIMEOUT, the worker exits.
@@ -40,6 +41,130 @@ from eventlog import info as ev, warn as ev_warn, error as ev_err
 from status_server import publish as _publish_status, start_status_server as _start_status_server
 
 logger = logging.getLogger("queue-pipeline")
+
+
+# ------------------------------------------------------------------ #
+# Pre-flight login wall gate
+# ------------------------------------------------------------------ #
+
+# How long to wait for the user to log in before giving up.
+LOGIN_WALL_WAIT_TIMEOUT = 300.0  # 5 minutes — user has time to sign in
+LOGIN_WALL_POLL_INTERVAL = 10.0  # re-check every 10s while waiting
+
+
+async def _preflight_t0_login_check(
+    browser_ws: str,
+    target_blog: str,
+) -> bool:
+    """Open one tab to the T0 blog and wait for login wall to clear.
+
+    This is a blocking gate: Chrome is started with 1 tab navigated to the
+    seed blog. If a login wall is detected (Tumblr redirects to /login),
+    we poll every ``LOGIN_WALL_POLL_INTERVAL`` seconds until the wall
+    clears or ``LOGIN_WALL_WAIT_TIMEOUT`` elapses. Only after the T0 blog
+    loads successfully is the worker pool allowed to start — otherwise all
+    10 workers would immediately hit the same wall and churn.
+
+    Returns True if T0 is accessible (no wall), False if timed out waiting.
+
+    Args:
+        browser_ws: browser HTTP endpoint (e.g. ``http://127.0.0.1:9223``).
+        target_blog: the T0 seed blog username.
+    """
+    from agent import _new_tab_url, close_tab, detect_login_wall_detail
+    from cdp_use import CDPClient
+    from cdp_wrapper import cdp_send
+    import asyncio as _aio
+
+    ws_url, target_id = None, None
+    deadline = time.monotonic() + LOGIN_WALL_WAIT_TIMEOUT
+
+    try:
+        # Open a single tab to the T0 blog. _new_tab_url accepts the
+        # browser HTTP endpoint (it calls _extract_browser_ws internally).
+        ws_url, target_id = await _new_tab_url(
+            browser_ws, f"https://www.tumblr.com/{target_blog}"
+        )
+        logger.info("Pre-flight: opened tab %s for T0 blog %s", target_id, target_blog)
+
+        while time.monotonic() < deadline:
+            try:
+                client = CDPClient(ws_url)
+                await _aio.wait_for(client.start(), timeout=30.0)
+                try:
+                    result = await cdp_send(
+                        client,
+                        "Runtime.evaluate",
+                        {
+                            "expression": (
+                                "JSON.stringify({url: location.href, "
+                                "text: (document.body ? document.body.innerText : '').slice(0, 500), "
+                                "posts: document.querySelectorAll('[data-cell-id]').length})"
+                            ),
+                            "returnByValue": True,
+                        },
+                        timeout=15.0,
+                    )
+                    val = result.get("result", {}).get("result", {}).get("value", "{}")
+                    import json as _json
+                    snap = _json.loads(val)
+                    final_url = snap.get("url", "")
+                    page_text = snap.get("text", "")
+                    posts_rendered = snap.get("posts", 0)
+                    is_wall, reason = detect_login_wall_detail(page_text, "", final_url)
+
+                    if is_wall:
+                        logger.info(
+                            "Pre-flight: T0 blog %s behind login wall (reason=%s, url=%s) — waiting for user login...",
+                            target_blog, reason, final_url[:80],
+                        )
+                    elif target_blog not in final_url.lower().replace("-", "").replace("_", ""):
+                        logger.info(
+                            "Pre-flight: T0 blog %s not in URL (%s) — may be a redirect, waiting...",
+                            target_blog, final_url[:80],
+                        )
+                    elif posts_rendered < 20:
+                        logger.info(
+                            "Pre-flight: T0 blog %s loaded but only %d posts rendered (url=%s) — waiting for full render...",
+                            target_blog, posts_rendered, final_url[:80],
+                        )
+                    else:
+                        logger.info(
+                            "Pre-flight: T0 blog %s verified (%d posts, url=%s) — proceeding to workers",
+                            target_blog, posts_rendered, final_url[:80],
+                        )
+                        return True
+                finally:
+                    await client.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pre-flight: CDP check failed for %s: %s — retrying", target_blog, exc)
+
+            # Wait and reload the page to re-check after potential login
+            await _aio.sleep(LOGIN_WALL_POLL_INTERVAL)
+            try:
+                client = CDPClient(ws_url)
+                await _aio.wait_for(client.start(), timeout=30.0)
+                try:
+                    await cdp_send(
+                        client, "Page.reload", {"ignoreCache": True}, timeout=15.0
+                    )
+                finally:
+                    await client.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    finally:
+        if target_id:
+            try:
+                await close_tab(browser_ws, target_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+    logger.error(
+        "Pre-flight: login wall timeout (%.0fs) exceeded for T0 blog %s — proceeding anyway",
+        LOGIN_WALL_WAIT_TIMEOUT, target_blog,
+    )
+    return False
 
 
 def _index_lock_path(path: Path) -> Path:
@@ -488,9 +613,11 @@ async def queue_mode(
     """Run the queue-mode pipeline: fresh Chrome, worker pool, parallel from first extraction.
 
     1. Kill + restart Chrome
-    2. Enqueue the seed blog as the FIRST queue item
-    3. Start the worker pool — workers pull from the queue immediately
-    4. The seed blog is just another queue item; workers crawl it, enqueue
+    2. Pre-flight login wall gate: open 1 tab to T0 blog, wait if wall detected
+    3. Repair stale queue entries from prior crashed runs
+    4. Enqueue the seed blog as the FIRST queue item (tier 0)
+    5. Start the worker pool — workers pull from the queue immediately
+    6. The seed blog is just another queue item; workers crawl it, enqueue
        discoveries, and other workers pick them up — no staging gate
 
     Args:
@@ -531,6 +658,28 @@ async def queue_mode(
     if repaired:
         logger.info("Step 0: repaired %d stale queue entries", repaired)
         ev("pipeline", "queue_repaired", entries=repaired)
+
+    # Step 1.5: Pre-flight login wall gate for T0.
+    # Open ONE tab to the seed blog and verify it loads (no login wall).
+    # If Tumblr redirects to /login, BLOCK here — wait for the user to log in
+    # — before starting the worker pool. This prevents all 10 workers from
+    # simultaneously hitting the wall and churning through MAX_RECOVERY
+    # retries on every blog.
+    # The login session lives in --user-data-dir on disk; the user can open
+    # Chrome (port 9222/9223) and log in to Tumblr. This pre-flight polls
+    # until the T0 blog's final URL is no longer a login/signup redirect.
+    logger.info("Step 1.5: Pre-flight login wall check for T0 blog: %s", target_blog)
+    t0_accessible = await _preflight_t0_login_check(actual_browser_ws, target_blog)
+    ev("pipeline", "t0_preflight", blog=target_blog, accessible=t0_accessible)
+    if not t0_accessible:
+        # The user may not have logged in yet; we still proceed so they can
+        # use Ctrl+C to stop and log in, but most workers will hit the wall
+        # and halt per the existing LoginWallDetected path.
+        logger.warning(
+            "T0 blog %s not accessible after pre-flight timeout — "
+            "workers will likely hit login wall. Consider logging in to Tumblr first.",
+            target_blog,
+        )
 
     # Step 2: Seed the queue with the target blog (tier 0).
     # T0 is always force-reindexed regardless of index state so new posts
