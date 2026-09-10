@@ -232,6 +232,7 @@ class Worker:
         in-flight requests from the render poll, surfacing as TabDeadError.
         """
         from cdp_use import CDPClient
+        from cdp_wrapper import cdp_send
 
         if self._cdp_client is not None:
             # Sanity-check: if the cached client is not started, discard it.
@@ -264,6 +265,15 @@ class Worker:
         )
         client = CDPClient(self.ws_url)
         await asyncio.wait_for(client.start(), timeout=3.0)
+        # Enable the Page domain so Page.navigate events fire correctly and
+        # Runtime.evaluate has a stable execution context. Without this, the
+        # page may be in a transitional state where JS evaluation times out
+        # or returns stale data from the previous loaded page.
+        try:
+            await cdp_send(client, "Page.enable", {}, timeout=5.0)
+            logger.debug("Worker %d: Page.enable sent", self.worker_id)
+        except Exception as _exc:  # noqa: BLE001
+            logger.debug("Worker %d: Page.enable failed (non-fatal): %s", self.worker_id, _exc)
         self._cdp_client = client
         logger.info(
             "Worker %d: CDP client started successfully",
@@ -321,6 +331,13 @@ class Worker:
                 self.worker_id,
                 username,
             )
+            # Brief wait for initial HTML to commit before first render poll.
+            # Page.navigate returns as soon as the navigation command is accepted —
+            # the page hasn't loaded yet. Without this delay, the first Runtime.evaluate
+            # fires against about:blank or the previous page, and on a loaded Chrome
+            # (10 tabs) the early polls can time out at 3s, causing all 12s of render
+            # polling to silently fail with empty results.
+            await asyncio.sleep(1.0)
 
             # ---- Render convergence gate (fast + deterministic) ----
             # Tumblr is an SPA: text can appear before post cells finish
@@ -367,7 +384,7 @@ class Worker:
                             ),
                             "returnByValue": True,
                         },
-                        timeout=3.0,
+                        timeout=5.0,
                     )
                     logger.debug(
                         "Worker %d: render poll raw result keys=%s for %s",
@@ -478,7 +495,7 @@ class Worker:
                         deadline - time.monotonic(),
                     )
                 except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail during render poll; best-effort
-                    logger.debug("Render poll JS evaluation failed for %s: %s", self._current_username, _exc)
+                    logger.warning("Render poll JS evaluation failed for %s: %s", self._current_username, _exc)
                 try:
                     await asyncio.wait_for(self.wall_halt.wait(), timeout=0.5)
                 except TimeoutError:
