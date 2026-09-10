@@ -446,7 +446,8 @@ async def crawl_blog(
     # First page: use pre-fetched HTML if provided (from reindex probe),
     # otherwise navigate_fn. Subsequent pages: use fetch_page_fn.
     first_page = True
-    for offset in range(0, post_limit, 20):
+    offset = 0
+    while offset < post_limit:
         if unique_count >= unique_limit or total_count >= total_limit or posts_processed >= post_limit:
             break
 
@@ -516,6 +517,13 @@ async def crawl_blog(
             on_page(username, page_usernames, tier)
         if on_progress:
             on_progress(f"page_fetched:{username}:offset:{offset}:posts:{page_posts}:unique:{page_unique}")
+
+        # Dynamic offset: Tumblr returns a variable number of posts per
+        # offset page (not always 20). Advance by the actual count so
+        # the next request fetches the correct slice. If a page returned
+        # 0 posts (shouldn't happen — detect_end_of_posts would have
+        # caught it), fall back to 20 to avoid an infinite loop.
+        offset += page_posts if page_posts > 0 else 20
 
         # Random delay between pages (interruptible on shutdown)
         delay = random.uniform(delay_min, delay_max)

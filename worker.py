@@ -276,7 +276,7 @@ class Worker:
         if self._cdp_client is not None:
             try:
                 await self._cdp_client.stop()
-            except Exception as _exc:  # noqa: BLE001
+            except (asyncio.CancelledError, Exception) as _exc:  # noqa: BLE001
                 logger.debug("CDP client stop failed: %s", _exc)
             self._cdp_client = None
 
@@ -451,7 +451,20 @@ class Worker:
                     if url_stable and text_present and posts_rendered:
                         posts_ready = True
                         self._render_complete = True
+                        logger.debug(
+                            "Worker %d: render CONVERGED for %s — "
+                            "url_stable=%s text_len=%d posts=%d",
+                            self.worker_id, username,
+                            url_stable, last_text_len, best_posts,
+                        )
                         break
+                    logger.debug(
+                        "Worker %d: render poll %s offset %d — "
+                        "url_stable=%s text_len=%d posts=%d (cap %.1fs left)",
+                        self.worker_id, username, offset,
+                        url_stable, last_text_len, best_posts,
+                        deadline - time.monotonic(),
+                    )
                 except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail during render poll; best-effort
                     logger.debug("Render poll JS evaluation failed for %s: %s", self._current_username, _exc)
                 try:
@@ -681,6 +694,19 @@ class Worker:
                 )
                 raise
             except TabDeadError as exc:
+                # Shutdown-related fatal errors must NOT be retried — the
+                # CDP client is already stopping/closed, so retrying would
+                # only hit ConnectionError('Client is stopping').
+                if "shutdown" in str(exc).lower() or self.wall_halt.is_set():
+                    logger.info(
+                        "Worker %d: shutdown-related abort for %s: %s",
+                        self.worker_id, username, exc,
+                    )
+                    return {
+                        "username": username, "tier": tier,
+                        "status": "aborted", "unique": 0, "total": 0, "posts": 0,
+                        "usernames": [], "enqueued": 0, "dead": False,
+                    }
                 logger.warning(
                     "Worker %d: tab died for %s (attempt %d/%d): %s",
                     self.worker_id,
@@ -749,8 +775,19 @@ class Worker:
                     "dead_reason": f"unexpected_error:{type(exc).__name__}",
                     "source_blog": None,
                 }
-
-        # If we got here, recovery failed completely
+            except asyncio.CancelledError:
+                # Coordinator cancels worker tasks on shutdown (t.cancel()).
+                # Convert to a clean abort dict so the finally block in run()
+                # can close the tab without leaving a dangling CDP future.
+                logger.info(
+                    "Worker %d: CancelledError during crawl of %s — aborting",
+                    self.worker_id, username,
+                )
+                return {
+                    "username": username, "tier": tier,
+                    "status": "aborted", "unique": 0, "total": 0, "posts": 0,
+                    "usernames": [], "enqueued": 0, "dead": False,
+                }
         return {
             "username": username,
             "tier": tier,
@@ -1050,8 +1087,11 @@ class Worker:
                         close_tab(self.browser_ws, self.target_id),
                         timeout=5.0,
                     )
-                except Exception as _exc:  # noqa: BLE001
-                    logger.debug("Worker %d: tab close failed during shutdown: %s", self.worker_id, _exc)
+                except (asyncio.CancelledError, Exception) as _exc:  # noqa: BLE001
+                    logger.debug(
+                        "Worker %d: tab close failed during shutdown: %s",
+                        self.worker_id, _exc,
+                    )
                 self.target_id = None
                 self.ws_url = None
             # Clear busy_event so a coordinator Task.cancel() mid-crawl cannot
