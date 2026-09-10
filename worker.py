@@ -209,11 +209,24 @@ class Worker:
         from cdp_use import CDPClient
 
         if self._cdp_client is not None:
-            return self._cdp_client
+            # Sanity-check: if the cached client is not started, discard it.
+            # This can happen if a previous start() timed out after we
+            # assigned self._cdp_client but before the await returned.
+            try:
+                # Quick health check — send a no-op command.
+                # If the client is dead, this raises and we recreate.
+                await asyncio.wait_for(
+                    self._cdp_client.send_raw("Runtime.evaluate", {"expression": "1"}),
+                    timeout=2.0,
+                )
+                return self._cdp_client
+            except Exception:
+                self._cdp_client = None
         if not self.ws_url:
             raise TabDeadError("No WS URL for CDP client")
-        self._cdp_client = CDPClient(self.ws_url)
-        await asyncio.wait_for(self._cdp_client.start(), timeout=3.0)
+        client = CDPClient(self.ws_url)
+        await asyncio.wait_for(client.start(), timeout=3.0)
+        self._cdp_client = client
         return self._cdp_client
 
     async def _stop_cdp_client(self) -> None:
@@ -289,6 +302,7 @@ class Worker:
                             ),
                             "returnByValue": True,
                         },
+                        timeout=3.0,
                     )
                     # cdp_use returns result.result.value (double-nested),
                     # not result.result.result.value (triple-nested). Try the
@@ -396,6 +410,7 @@ class Worker:
                     "expression": "JSON.stringify({html: document.documentElement.outerHTML, url: location.href})",
                     "returnByValue": True,
                 },
+                timeout=5.0,
             )
             payload = result.get("result", {}).get("value", "{}")
             try:
