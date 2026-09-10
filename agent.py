@@ -23,30 +23,24 @@ import json
 import logging
 import random
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from cdp_use import CDPClient
-from cdp_wrapper import TabDeadError, cdp_send
 
 from cache import (
     CACHE_DIR,
-    append_log,
-    index_status,
-    load_entry,
-    save_entry,
 )
+from cdp_wrapper import TabDeadError, cdp_send
 from config import (
-    CDP_COMMAND_TIMEOUT,
     CONTENT_WAIT_TIMEOUT,
     DEAD_PHRASES,
     DELAY_MAX,
     DELAY_MIN,
     END_PHRASES,
-    LOGIN_WALL_PHRASES,
 )
-from extractor import check_limit, extract_from_html
-from eventlog import info as ev, warn as ev_warn, error as ev_err
+from extractor import extract_from_html
 
 logger = logging.getLogger("tumblr-agent")
 
@@ -117,28 +111,28 @@ async def _new_tab_url(browser_ws: str, target_url: str) -> tuple[str, str]:
             try:
                 import urllib.request as _urllib
 
-                with _urllib.urlopen(f"{base}/json/list", timeout=5) as resp:
+                with _urllib.urlopen(f"{base}/json/list", timeout=5) as resp:  # noqa: ASYNC210 — sync HTTP for tab discovery during polling loop
                     targets = json.loads(resp.read())
                 for t in targets:
                     if t.get("type") == "page" and t.get("id") == target_id:
                         ws_url = t.get("webSocketDebuggerUrl")
                         if ws_url:
                             return ws_url, target_id
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _exc:  # noqa: BLE001 — urllib/JSON errors during polling; retry loop
+                logger.debug("Tab %s not yet available: %s", target_id, _exc)
 
         try:
             await close_tab(browser_ws, target_id)
-        except Exception:
-            pass
+        except Exception as _exc:  # noqa: BLE001 — best-effort tab cleanup before raising
+            logger.debug("Failed to close tab %s during error path: %s", target_id, _exc)
         raise RuntimeError(
             f"Timed out waiting for new tab {target_url} (targetId={target_id})"
         )
     except Exception:
         try:
             await create_client.stop()
-        except Exception:
-            pass
+        except Exception as _exc:  # noqa: BLE001 — client may be half-connected; best-effort
+            logger.debug("Failed to stop create_client: %s", _exc)
         raise
 
 
@@ -154,13 +148,13 @@ async def close_tab(browser_ws: str, target_id: str) -> None:
     # HTTP fallback always works (doesn't need the tab's CDP WS)
     try:
         base = browser_ws.replace("ws://", "http://").rstrip("/")
-        urllib.request.urlopen(
+        urllib.request.urlopen(  # noqa: ASYNC210 — sync HTTP fallback for tab close
             f"{base}/json/close/{target_id}", timeout=5
         )
         logger.info("Closed tab %s via HTTP", target_id)
         return
-    except Exception:
-        pass
+    except Exception as _exc:  # noqa: BLE001 — HTTP fallback may fail; fall through to CDP
+        logger.debug("HTTP close failed for tab %s: %s", target_id, _exc)
 
     browser_ws_url = _extract_browser_ws(browser_ws)
     if not browser_ws_url:
@@ -227,8 +221,8 @@ async def fetch_page_html(
             if phrase in snap_text:
                 logger.info("DEAD (early): %s offset %d — phrase '%s'", username, offset, phrase)
                 return "", snap_url
-    except Exception:
-        pass  # If the quick check fails, fall through to normal flow
+    except Exception as _exc:  # noqa: BLE001 — quick-check polling; fall through to normal flow
+        logger.debug("Quick dead-phrase check failed for %s: %s", username, _exc)
     # ----------------------------------------------------------------------
     SCROLL_DEADLINE = time.monotonic() + 30.0
     prev_cells = -1
@@ -248,8 +242,8 @@ async def fetch_page_html(
                     "returnByValue": True,
                 },
             )
-        except Exception:
-            pass
+        except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail during scroll; best-effort
+            logger.debug("Scroll JS evaluation failed for %s: %s", username, _exc)
         await asyncio.sleep(1.5)
         try:
             res = await cdp_send(
@@ -261,7 +255,8 @@ async def fetch_page_html(
                 },
             )
             cell_count = int(res.get("result", {}).get("value", 0) or 0)
-        except Exception:
+        except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail; default to 0 cells
+            logger.debug("Cell count JS evaluation failed: %s", _exc)
             cell_count = 0
         if cell_count == prev_cells:
             stable_rounds += 1
@@ -274,7 +269,6 @@ async def fetch_page_html(
     deadline = time.monotonic() + CONTENT_WAIT_TIMEOUT
     last_text = ""
     while time.monotonic() < deadline:
-        await asyncio.sleep(1)
         try:
             result = await cdp_send(
                 client,
@@ -289,8 +283,9 @@ async def fetch_page_html(
                 last_text = new_text
                 if len(new_text) > 100:
                     break
-        except Exception:
-            pass
+        except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail during content wait; fall through
+            logger.debug("Content wait JS evaluation failed for %s: %s", username, _exc)
+        await asyncio.sleep(1)
 
     if len(last_text) <= 100:
         logger.warning(
@@ -314,7 +309,8 @@ async def fetch_page_html(
             data = json.loads(payload)
             html = data.get("html", "")
             final_url = data.get("url", "")
-        except Exception:
+        except (json.JSONDecodeError, TypeError) as _exc:
+            logger.debug("JSON parse failed for %s: %s", username, _exc)
             html = payload
             final_url = ""
         return html, final_url
@@ -340,9 +336,7 @@ def detect_login_wall(page_text: str, html: str = "", url: str = "") -> bool:
     u = url.lower()
     if "login" in u or "signup" in u:
         return True
-    if "content_warning_wall" in u:
-        return True
-    return False
+    return "content_warning_wall" in u
 
 
 def detect_login_wall_detail(page_text: str, html: str = "", url: str = "") -> tuple[bool, str]:
@@ -407,6 +401,8 @@ async def crawl_blog(
     on_page: callable | None = None,
     should_exit: callable | None = None,
     on_progress: callable | None = None,
+    first_html: str | None = None,
+    first_url: str | None = None,
 ) -> dict[str, Any]:
     """Crawl a single blog from start to stop condition.
 
@@ -447,15 +443,18 @@ async def crawl_blog(
     dead = False
     dead_reason = ""
 
-    # First page: use navigate_fn (navigates to blog URL)
-    # Subsequent pages: use fetch_page_fn
+    # First page: use pre-fetched HTML if provided (from reindex probe),
+    # otherwise navigate_fn. Subsequent pages: use fetch_page_fn.
     first_page = True
     for offset in range(0, post_limit, 20):
         if unique_count >= unique_limit or total_count >= total_limit or posts_processed >= post_limit:
             break
 
         try:
-            if first_page:
+            if first_page and first_html is not None:
+                html, final_url = first_html, first_url or ""
+                first_page = False
+            elif first_page:
                 html, final_url = await navigate_fn(username, offset)
                 first_page = False
             else:
@@ -477,10 +476,10 @@ async def crawl_blog(
         page_text = ""
         try:
             # Extract text from HTML for detection
-            import re
-            page_text = re.sub(r"<[^>]+>", "", html)[:5000]
-        except Exception:
-            pass
+            import re as _re
+            page_text = _re.sub(r"<[^>]+>", "", html)[:5000]
+        except Exception as _exc:  # noqa: BLE001 — regex fallback if HTML is malformed
+            logger.debug("HTML text extraction failed for %s: %s", username, _exc)
 
         if detect_dead(page_text):
             logger.info("DEAD: %s at offset %d — no content", username, offset)
@@ -518,10 +517,33 @@ async def crawl_blog(
         if on_progress:
             on_progress(f"page_fetched:{username}:offset:{offset}:posts:{page_posts}:unique:{page_unique}")
 
-        # Random delay between pages
+        # Random delay between pages (interruptible on shutdown)
         delay = random.uniform(delay_min, delay_max)
         logger.debug("Delay %.1fs before next page for %s", delay, username)
-        await asyncio.sleep(delay)
+        # Break delay into 1s chunks so wall_halt can interrupt quickly
+        delay_end = time.monotonic() + delay
+        aborted = False
+        while time.monotonic() < delay_end:
+            if should_exit and should_exit():
+                logger.info("Crawl aborted for %s (shutdown signal) at offset %d", username, offset)
+                aborted = True
+                break
+            await asyncio.sleep(min(1.0, delay_end - time.monotonic()))
+        if aborted:
+            return {
+                "username": username,
+                "tier": tier,
+                "status": "aborted",
+                "unique_count": unique_count,
+                "total_count": total_count,
+                "posts_processed": posts_processed,
+                "usernames": list(all_usernames),
+                "all_occurrences": list(all_occurrences),
+                "per_page": list(per_page),
+                "dead": dead,
+                "dead_reason": dead_reason,
+                "source_blog": source_blog,
+            }
 
         # Check stop conditions
         if unique_count >= unique_limit or total_count >= total_limit or posts_processed >= post_limit:

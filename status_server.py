@@ -10,8 +10,8 @@ already calls, so this is a drop-in replacement for the HTML dashboard.
 from __future__ import annotations
 
 import json
-import time
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -123,7 +123,17 @@ def _render(s: dict, last_events: list[str]) -> str:
             flag = ""
             if st == "stalled":
                 flag = "  ← STALLED"
-            lines.append(f"w{wid:<2} {st.upper():6} {cur:28}  {tier_s}lag {lag_s}{flag}")
+            r = w.get("render", {})
+            if r:
+                r_off = r.get("offset", "?")
+                r_posts = r.get("posts", "?")
+                r_cells = r.get("cells", "?")
+                r_done = r.get("render_complete", False)
+                r_flag = "✓" if r_done else "…"
+                render_str = f"  [offset {r_off} | {r_posts} posts | {r_cells} cells {r_flag}]"
+            else:
+                render_str = ""
+            lines.append(f"w{wid:<2} {st.upper():6} {cur:28}  {tier_s}lag {lag_s}{flag}{render_str}")
     else:
         lines.append("(workers not yet reported)")
 

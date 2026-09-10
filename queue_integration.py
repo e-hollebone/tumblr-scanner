@@ -21,12 +21,13 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from agent import LoginWallDetected
 from cache import index_status
+from cache import load_index as _load_index
 from chrome_lifecycle import restart_chrome
 from config import (
     INDEX_PATH,
@@ -35,10 +36,21 @@ from config import (
     WORKER_POOL_SIZE,
     WORKER_STALL_TIMEOUT,
 )
+from eventlog import error as ev_err
+from eventlog import info as ev
+from eventlog import warn as ev_warn
+from status_server import publish as _publish_status
+from status_server import start_status_server as _start_status_server
+from work_queue import (
+    _queue_lock,
+    _read_lines,
+    active_count,
+    enqueue,
+    in_progress_count,
+    pending_count,
+    queue_size,
+)
 from work_queue import cleanup as queue_cleanup
-from work_queue import active_count, enqueue, pending_count, in_progress_count, queue_size
-from eventlog import info as ev, warn as ev_warn, error as ev_err
-from status_server import publish as _publish_status, start_status_server as _start_status_server
 
 logger = logging.getLogger("queue-pipeline")
 
@@ -71,10 +83,12 @@ async def _preflight_t0_login_check(
         browser_ws: browser HTTP endpoint (e.g. ``http://127.0.0.1:9223``).
         target_blog: the T0 seed blog username.
     """
-    from agent import _new_tab_url, close_tab, detect_login_wall_detail
-    from cdp_use import CDPClient
-    from cdp_wrapper import cdp_send
     import asyncio as _aio
+
+    from cdp_use import CDPClient
+
+    from agent import _new_tab_url, close_tab, detect_login_wall_detail
+    from cdp_wrapper import cdp_send
 
     ws_url, target_id = None, None
     deadline = time.monotonic() + LOGIN_WALL_WAIT_TIMEOUT
@@ -111,6 +125,10 @@ async def _preflight_t0_login_check(
                     final_url = ""
                     page_text = ""
                     posts_rendered = 0
+                    # Track best sample: URL + text may appear before posts render
+                    best_url = ""
+                    best_text = ""
+                    best_posts = 0
                     sub_deadline = time.monotonic() + 20.0
                     while time.monotonic() < sub_deadline:
                         try:
@@ -121,26 +139,20 @@ async def _preflight_t0_login_check(
                                     "expression": (
                                         "JSON.stringify({url: location.href, "
                                         "text: (document.body ? document.body.innerText : '').slice(0, 500), "
-                                        "posts: document.querySelectorAll('[data-cell-id]').length})"
+                                        "posts: (function(){"
+                                        "var p=document.querySelectorAll('div[data-cell-id*=\"-post-\"]').length;"
+                                        "var a=document.querySelectorAll('article').length;"
+                                        "return Math.max(p,a);"
+                                        "}())})"
                                     ),
                                     "returnByValue": True,
                                 },
                                 timeout=15.0,
                             )
-                            # Debug: log the raw CDP result
-                            logger.info("Pre-flight: raw CDP result: %s", result)
-                            # Check for JS execution errors
-                            if result.get("result", {}).get("result", {}).get("exceptionDetails"):
-                                logger.info(
-                                    "Pre-flight: JS exception: %s",
-                                    result.get("result", {}).get("result", {}).get("exceptionDetails"),
-                                )
                             val = result.get("result", {}).get("result", {}).get("value", "{}")
-                            # Also try direct path if the nested one is empty
                             if not val or val == "{}":
                                 alt_val = result.get("result", {}).get("value", "{}")
                                 if alt_val and alt_val != "{}":
-                                    logger.info("Pre-flight: using alternate result path: %s", alt_val)
                                     val = alt_val
                             import json as _json
                             snap = _json.loads(val)
@@ -151,9 +163,17 @@ async def _preflight_t0_login_check(
                                 "Pre-flight: evaluated — url=%s, posts=%d, text_len=%d",
                                 final_url[:80], posts_rendered, len(page_text),
                             )
+                            # Track best sample
+                            if final_url and not best_url:
+                                best_url = final_url
+                            if page_text and not best_text:
+                                best_text = page_text
+                            best_posts = max(best_posts, posts_rendered)
 
-                            # If we have a URL and some page text, we're ready to check
-                            if final_url and (page_text or posts_rendered > 0):
+                            # Only declare ready when we have BOTH text AND posts.
+                            # Tumblr's SPA renders text before post cells appear, so
+                            # breaking on text alone causes false 0-post reads.
+                            if final_url and page_text and posts_rendered > 0:
                                 page_ready = True
                                 break
                         except Exception as eval_exc:  # noqa: BLE001
@@ -163,29 +183,29 @@ async def _preflight_t0_login_check(
                     if not page_ready:
                         logger.info(
                             "Pre-flight: T0 blog %s page not ready (url=%s, posts=%d) — waiting...",
-                            target_blog, final_url[:80], posts_rendered,
+                            target_blog, best_url[:80], best_posts,
                         )
                     else:
-                        is_wall, reason = detect_login_wall_detail(page_text, "", final_url)
+                        is_wall, reason = detect_login_wall_detail(best_text, "", best_url)
                         if is_wall:
                             logger.info(
                                 "Pre-flight: T0 blog %s behind login wall (reason=%s, url=%s) — waiting for user login...",
-                                target_blog, reason, final_url[:80],
+                                target_blog, reason, best_url[:80],
                             )
-                        elif target_blog.lower().replace("-", "").replace("_", "") not in final_url.lower().replace("-", "").replace("_", ""):
+                        elif target_blog.lower().replace("-", "").replace("_", "") not in best_url.lower().replace("-", "").replace("_", ""):
                             logger.info(
                                 "Pre-flight: T0 blog %s not in URL (%s) — may be a redirect, waiting...",
-                                target_blog, final_url[:80],
+                                target_blog, best_url[:80],
                             )
-                        elif posts_rendered < 1:
+                        elif best_posts < 1:
                             logger.info(
                                 "Pre-flight: T0 blog %s loaded but only %d posts rendered (url=%s) — waiting for full render...",
-                                target_blog, posts_rendered, final_url[:80],
+                                target_blog, best_posts, best_url[:80],
                             )
                         else:
                             logger.info(
                                 "Pre-flight: T0 blog %s verified (%d posts, url=%s) — proceeding to workers",
-                                target_blog, posts_rendered, final_url[:80],
+                                target_blog, best_posts, best_url[:80],
                             )
                             return True
                 finally:
@@ -200,8 +220,8 @@ async def _preflight_t0_login_check(
         if target_id:
             try:
                 await close_tab(browser_ws, target_id)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _exc:  # noqa: BLE001 — tab cleanup may fail during login wall timeout; best-effort
+                logger.debug("Login wall probe tab close failed: %s", _exc)
 
     logger.error(
         "Pre-flight: login wall timeout (%.0fs) exceeded for T0 blog %s — proceeding anyway",
@@ -274,27 +294,84 @@ def _enqueue_by_status(
     "full" (full crawl enqueued). Names already in the index are
     enqueued as "reindex" (FR-7 date probe decides skip-or-crawl);
     names not in the index are enqueued as "full".
+
+    Returns "fresh" if the blog was scanned today (no re-enqueue).
+    Returns "dup" if the username is already queued (enqueue() handles this
+    internally; this is a secondary guard).
     """
-    status = index_status(index_path, username)
-    # Overflow guard: T0/T1 always enqueued (seed + first-wave); only T2+ is
-    # droppable when the queue hits its depth limit to avoid unbounded growth.
-    at_overflow = pending_count(queue_path) + in_progress_count(queue_path) >= QUEUE_OVERFLOW_THRESHOLD
-    if at_overflow and tier >= 2:
-        logger.warning(
-            "Queue overflow (pending+in_progress %d >= %d) — skipping enqueue of %s (tier=%d)",
-            pending_count(queue_path) + in_progress_count(queue_path),
-            QUEUE_OVERFLOW_THRESHOLD,
-            username,
-            tier,
-        )
-        return "overflow"
+    # ---- Freshness + dedup gate: check index ----
+    # Uses fresh_days=0 to skip same-day scans — a blog scanned today is
+    # current, no need to re-index it in the same run.
+    status = index_status(index_path, username, fresh_days=0)
+
+    if status == "fresh":
+        return "fresh"
+
+    # ---- Queue dedup: check if already queued (pending/in_progress) ----
+    # This is a secondary guard — enqueue() also dedups, but we return
+    # "dup" here so the caller can skip its stats callback. The O(n) read
+    # only happens for stale/new items (fresh ones are already filtered
+    # above), so the hot path stays fast.
+    with _queue_lock:
+        q_lines = _read_lines(queue_path)
+    name_l = username.lower()
+    for ln in q_lines:
+        if ln.get("username", "").lower() == name_l and ln.get("state", "") != "done":
+            return "dup"
+
+    # Overflow guard: only check for stale (existing) entries; "new" entries
+    # bypass the overflow guard since they haven't been discovered before.
     if status == "stale":
+        at_overflow = (
+            pending_count(queue_path) + in_progress_count(queue_path)
+        ) >= QUEUE_OVERFLOW_THRESHOLD
+        if at_overflow and tier >= 2:
+            logger.warning(
+                "Queue overflow (pending+in_progress >= %d) — skipping enqueue of %s (tier=%d)",
+                QUEUE_OVERFLOW_THRESHOLD,
+                username,
+                tier,
+            )
+            return "overflow"
         enqueue(queue_path, username, state="", tier=tier, mode="reindex")
         logger.info("Enqueued %s (tier=%s, mode=reindex)", username, tier)
         return "reindex"
     enqueue(queue_path, username, state="", tier=tier, mode="full")
     logger.info("Enqueued %s (tier=%s, mode=full)", username, tier)
     return "full"
+
+
+def _reconcile_queue(queue_path: Path, index_path: Path) -> int:
+    """Reconcile the queue against the index at startup.
+
+    Removes pending/in_progress queue entries whose usernames are absent
+    from the index as "fresh" — i.e., they were never successfully scanned
+    and shouldn't linger in the queue. This is a one-time cleanup so
+    phantom entries from corrupted indexes or manual edits don't stall
+    the pipeline.
+    """
+    index = _load_index(index_path)
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.touch(exist_ok=True)
+    removed = 0
+    with _queue_lock:
+        lines = _read_lines(queue_path)
+        new_lines: list[dict[str, Any]] = []
+        for item in lines:
+            name = item.get("username", "").lower()
+            state = item.get("state", "")
+            # Keep: done items (harmless), and any username present in index
+            # (scanned at some point, may need reindex).
+            # Remove: pending/in_progress entries not in index at all.
+            if state in ("", "in_progress") and name not in index:
+                removed += 1
+                logger.info("Reconcile: removed %s from queue (not in index)", name)
+                continue
+            new_lines.append(item)
+        if removed:
+            from work_queue import _write_lines
+            _write_lines(queue_path, new_lines)
+    return removed
 
 
 def _next_tier(current: int) -> int:
@@ -360,7 +437,8 @@ async def _drain_queue(
                 return 0
             with open(idx_path, encoding="utf-8") as _f:
                 return len(_json.load(_f))
-        except Exception:
+        except Exception as _exc:  # noqa: BLE001 — index file may be corrupted; treat as 0 entries
+            logger.debug("Index count read failed for %s: %s", idx_path, _exc)
             return 0
 
     # Start the live status dashboard (operator watches it from Preview; no
@@ -417,20 +495,27 @@ async def _drain_queue(
                     _live[key] += 1
         return _cb
 
-    worker_tasks = [
-        asyncio.create_task(
-            Worker(
-                worker_id=i,
-                browser_ws=browser_ws,
-                cache_dir=cache_dir,
-                index_path=index_path,
-                wall_halt=wall_halt,
-                busy_event=busy_events[i],
-                progress_cb=_make_progress_cb(i),
-                set_current_cb=_make_set_current_cb(i),
-                stats_cb=_make_stats_cb(),
-            ).run(queue_path)
+    # Track Worker instances so the coordinator can read their render state
+    # for the live dashboard (offset, post count, render convergence).
+    worker_instances: list[Worker] = []
+
+    async def _run_worker(instances: list[Worker], wid: int):
+        w = Worker(
+            worker_id=wid,
+            browser_ws=browser_ws,
+            cache_dir=cache_dir,
+            index_path=index_path,
+            wall_halt=wall_halt,
+            busy_event=busy_events[wid],
+            progress_cb=_make_progress_cb(wid),
+            set_current_cb=_make_set_current_cb(wid),
+            stats_cb=_make_stats_cb(),
         )
+        instances.append(w)
+        return await w.run(queue_path)
+
+    worker_tasks = [
+        asyncio.create_task(_run_worker(worker_instances, i))
         for i in range(pool_size)
     ]
 
@@ -444,7 +529,10 @@ async def _drain_queue(
     workers_silent = False
     stalled_restarted: set[int] = set()
     while not wall_halt.is_set():
-        await asyncio.sleep(2.0)
+        try:
+            await asyncio.wait_for(wall_halt.wait(), timeout=2.0)
+        except TimeoutError:
+            pass
         loop_count += 1
         qsize = active_count(queue_path)
         crawling = any(e.is_set() for e in busy_events)
@@ -515,13 +603,17 @@ async def _drain_queue(
                 status = "idle"
             if status == "stalled" and (last_stall is None or lag > last_stall["silent_s"]):
                 last_stall = {"worker_id": i, "silent_s": lag}
-            workers_status.append({
+            entry = {
                 "id": i,
                 "status": status,
                 "current": current_blog.get(i),
                 "tier": current_tier.get(i),
                 "lag_s": round(lag, 1),
-            })
+            }
+            # Include render state from the worker instance if available
+            if i < len(worker_instances):
+                entry["render"] = worker_instances[i].render_state()
+            workers_status.append(entry)
         _publish_status(
             queue_pending=active_count(queue_path),
             queue_in_progress=sum(1 for e in busy_events if e.is_set()),
@@ -543,6 +635,8 @@ async def _drain_queue(
                 if busy_events[i].is_set()
                 and (now := time.monotonic()) - progress_at[i] > 30
             ]
+            if stalled:
+                ev_warn("coordinator", "worker_stall", stalled=stalled)
             logger.info(
                 "Coordinator loop #%d: qsize=%d crawling=%s idle_since=%s "
                 "progress_lag=%s",
@@ -611,6 +705,10 @@ async def _drain_queue(
         drain_complete=True,
     )
 
+    # Cancel all worker tasks to unblock them immediately on shutdown.
+    # Workers' finally blocks handle tab cleanup with a short timeout.
+    for t in worker_tasks:
+        t.cancel()
     results = await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     # Aggregate stats
@@ -691,6 +789,15 @@ async def queue_mode(
     logger.info("Using browser endpoint: %s", actual_browser_ws)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 0a: Reconcile index ↔ queue — remove any queue entries whose
+    # usernames no longer exist in the index as "new" (fresh) entries.
+    # This is a startup sanity check so the queue doesn't accumulate
+    # phantom entries from a corrupted index or manual edits.
+    reconciled = _reconcile_queue(QUEUE_PATH, INDEX_PATH)
+    if reconciled:
+        logger.info("Step 0a: reconciled %d phantom queue entries", reconciled)
+        ev("pipeline", "queue_reconciled", entries=reconciled)
 
     # Step 0: Repair the queue before seeding. A prior run that died on the
     # login wall (or crashed) leaves items stuck in "in_progress" with no

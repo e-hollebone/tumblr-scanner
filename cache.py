@@ -135,20 +135,31 @@ def index_register(
 def index_status(
     index_path: Path,
     username: str,
+    fresh_days: float | None = None,
 ) -> str:
     """Two-way index status for a username.
 
-    There is no recrawl-window/age check. Index membership alone governs
-    dedup (per user directive - the 7-day concept was dropped).
+    There is no recrawl-window/age check by default.
+    Pass fresh_days=N to treat entries scanned within N days as "fresh"
+    (skip re-enqueue).
 
     Returns:
-        "stale" — in index, scanned before today → reindex (date probe)
-        "new"   — not in index → full crawl
+        "fresh"  — in index, scanned_at within fresh_days window
+        "stale"  — in index, scanned_at older than fresh_days (or no limit)
+        "new"    — not in index
     """
     index = load_index(index_path)
     entry = index.get(username)
     if not entry:
         return "new"
+    if fresh_days is not None and entry.get("scanned_at"):
+        try:
+            scanned = datetime.fromisoformat(entry["scanned_at"])
+            days_old = (datetime.now(timezone.utc) - scanned).total_seconds() / 86400
+            if days_old <= fresh_days:
+                return "fresh"
+        except (ValueError, TypeError):
+            pass
     return "stale"
 
 

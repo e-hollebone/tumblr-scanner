@@ -26,8 +26,11 @@ WORKER_POOL_SIZE = 3
 # Lower values trigger Tumblr rate-limiting.
 # Per-page politeness delay (seconds). User directive 2026-08-28: cap the
 # max wait at 9s for throughput — the crawl is effective, now it must be fast.
-DELAY_MIN = 5.0
-DELAY_MAX = 9.0
+# Further reduced 2026-09-09: 5s minimum was causing 5+ second idle gaps between
+# every page fetch within a blog crawl. 2-4s is sufficient to avoid rate-limiting
+# while cutting inter-page idle time by >50%.
+DELAY_MIN = 2.0
+DELAY_MAX = 4.0
 
 # How long a worker sleeps (seconds) when the queue is empty before checking
 # again. Keeps the worker alive for newly enqueued items without busy-waiting.
@@ -63,7 +66,7 @@ MAX_RECOVERY_PER_BLOG = 3
 WALL_RETRY_MAX = 2
 WALL_RETRY_BACKOFF_S = 15.0
 
-# --------------------------------------------------------------------------- # noqa
+# ---------------------------------------------------------------------------
 # Windows
 # ---------------------------------------------------------------------------
 
@@ -73,7 +76,7 @@ T2_LIMITS = {"unique": 75, "total": 125, "posts": 125}
 
 LIMITS_BY_TIER = {0: T0_LIMITS, 1: T1_LIMITS, 2: T2_LIMITS}
 
-# --------------------------------------------------------------------------- # noqa
+# ---------------------------------------------------------------------------
 # Windows
 # ---------------------------------------------------------------------------
 

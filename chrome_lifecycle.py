@@ -22,6 +22,7 @@ logger = logging.getLogger("chrome-lifecycle")
 # Uses the absolute CACHE_DIR-based profile path from config so the launch
 # directory no longer matters.
 from config import CHROME_USER_DATA_DIR
+
 CHROME_PROFILE_DIR = CHROME_USER_DATA_DIR
 CHROME_DEBUG_PORT = 9222
 CHROME_FALLBACK_PORTS = [9223, 9224, 9225, 9226]
@@ -79,7 +80,8 @@ def cleanup_tabs(port: int | None = None) -> int:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=5) as resp:
             targets = json.loads(resp.read())
-    except Exception:
+    except Exception as _exc:  # noqa: BLE001 — Chrome may be unreachable; treat as 0 tabs
+        logger.debug("Tab discovery failed on port %d: %s", port, _exc)
         return 0
     closed = 0
     for t in targets:
@@ -89,8 +91,8 @@ def cleanup_tabs(port: int | None = None) -> int:
                     f"http://127.0.0.1:{port}/json/close/{t['id']}", timeout=5
                 )
                 closed += 1
-            except Exception:
-                pass
+            except Exception as _exc:  # noqa: BLE001 — individual tab close may fail; skip it
+                logger.debug("Failed to close tab %s on port %d: %s", t["id"], port, _exc)
     if closed:
         logger.info("cleanup_tabs: closed %d stale tab(s) on port %d", closed, port)
     return closed
@@ -146,6 +148,60 @@ def _find_available_port() -> int:
     return CHROME_DEBUG_PORT
 
 
+def _minimize_chrome_window(port: int) -> None:
+    """Minimize Chrome's window so it can't steal GUI focus.
+
+    Uses the Chromium window management CDP command if available;
+    falls back to macOS AppleScript. Best-effort only.
+    """
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(
+            f"http://127.0.0.1:{port}/json/new?about:blank", timeout=5
+        ) as resp:
+            info = json.loads(resp.read())
+        blank_ws = info.get("webSocketDebuggerUrl", "")
+        tab_id = info.get("id")
+        if blank_ws:
+            import asyncio as _aio
+
+            import websockets
+
+            async def _minimize() -> None:
+                async with websockets.connect(
+                    blank_ws, open_timeout=5, close_timeout=3
+                ) as ws:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "id": 1,
+                                "method": "Browser.setWindowBounds",
+                                "params": {
+                                    "windowId": 1,
+                                    "bounds": {
+                                        "windowState": "minimized",
+                                    },
+                                },
+                            }
+                        )
+                    )
+                    await ws.recv()
+
+            try:
+                _aio.run(_minimize())
+            except Exception as _exc:  # noqa: BLE001 — minimize may fail; best-effort focus suppression
+                logger.debug("Chrome minimize failed: %s", _exc)
+        if tab_id:
+            try:
+                _ur.urlopen(
+                    f"http://127.0.0.1:{port}/json/close/{tab_id}", timeout=5
+                )
+            except Exception as _exc:  # noqa: BLE001 — tab may already be closed; best-effort
+                logger.debug("Probe tab close failed for %s: %s", tab_id, _exc)
+    except Exception as _exc:  # noqa: BLE001 — best-effort; if minimization fails, focus-steal guard is weaker
+        logger.debug("Probe tab lifecycle failed on port %d: %s", port, _exc)
+
+
 def _probe_login_wall(port: int) -> bool:
     """Probe a fresh Chrome tab on ``port`` for a login wall.
 
@@ -154,11 +210,11 @@ def _probe_login_wall(port: int) -> bool:
     """
     import urllib.request as _ur
     try:
-        ws_url, tab_id = None, None
+        _ws_url, tab_id = None, None
         with _ur.urlopen(f"http://127.0.0.1:{port}/json/new?https://www.tumblr.com/", timeout=5) as resp:
             info = json.loads(resp.read())
             tab_id = info.get("id")
-            ws_url = info.get("webSocketDebuggerUrl")
+            info.get("webSocketDebuggerUrl")
         if not tab_id:
             return False
         # Wait for the redirect to settle — the login page takes a moment
@@ -171,20 +227,20 @@ def _probe_login_wall(port: int) -> bool:
                 for t in targets:
                     if t.get("id") == tab_id:
                         final_url = t.get("url", "")
-                        if "login" in final_url.lower() or "signup" in final_url.lower():
-                            return True
-                        return False
-        except Exception:
+                        return bool("login" in final_url.lower() or "signup" in final_url.lower())
+        except Exception as _exc:  # noqa: BLE001 — tab may disappear; treat as no wall
+            logger.debug("Login probe URL fetch failed for tab %s: %s", tab_id, _exc)
             return False
         return False
-    except Exception:
+    except Exception as _exc:  # noqa: BLE001 — Chrome unreachable or tab creation failed
+        logger.debug("Login probe failed on port %d: %s", port, _exc)
         return False
     finally:
         if tab_id:
             try:
                 _ur.urlopen(f"http://127.0.0.1:{port}/json/close/{tab_id}", timeout=5)
-            except Exception:
-                pass
+            except Exception as _exc:  # noqa: BLE001 — cleanup may fail if Chrome is dead
+                logger.debug("Failed to close probe tab %s: %s", tab_id, _exc)
 
 
 def _our_chrome_port() -> int | None:
@@ -206,8 +262,8 @@ def _our_chrome_port() -> int | None:
             ) as resp:
                 json.loads(resp.read())
             return port
-        except Exception:
-            pass
+        except Exception as _exc:  # noqa: BLE001 — port responds but not CDP; try next
+            logger.debug("Port %d version check failed: %s", port, _exc)
     return None
 
 
@@ -233,7 +289,8 @@ def _probe_cdp_health(port: int) -> bool:
                 info = json.loads(resp.read())
             ws_url = info.get("webSocketDebuggerUrl", "")
             return ws_url or None
-        except Exception:
+        except Exception as _exc:  # noqa: BLE001 — tab creation may fail; server unhealthy
+            logger.debug("CDP health probe tab creation failed on port %d: %s", port, _exc)
             return None
 
     def _close_tab(target_id: str) -> None:
@@ -241,8 +298,8 @@ def _probe_cdp_health(port: int) -> bool:
             urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/json/close/{target_id}", timeout=5,
             )
-        except Exception:
-            pass
+        except Exception as _exc:  # noqa: BLE001 — tab may already be gone; best-effort cleanup
+            logger.debug("CDP health probe tab close failed for %s: %s", target_id, _exc)
 
     ws_url = _create_tab()
     if not ws_url:
@@ -268,7 +325,8 @@ def _probe_cdp_health(port: int) -> bool:
                 result = json.loads(resp_raw)
                 val = result.get("result", {}).get("result", {}).get("value")
                 return val == 2
-        except Exception:
+        except Exception as _exc:  # noqa: BLE001 — WebSocket roundtrip may fail; server unhealthy
+            logger.debug("CDP health WS roundtrip failed on port %d: %s", port, _exc)
             return False
 
     healthy = asyncio.run(_ws_roundtrip())
@@ -298,11 +356,10 @@ def restart_chrome() -> dict[str, Any]:
             "Our Chrome already running on port %d — reusing (session preserved)",
             running_port,
         )
-        # Close ALL leaked tabs at init. The Tumblr login session lives in the
-        # Chrome profile dir, NOT in an open tab — closing tabs does NOT log us
-        # out. This prevents the per-run tab accumulation that OOMs Chrome.
-        closed = cleanup_tabs(running_port)
-        logger.info("Reuse-mode: closed %d stale tab(s) before launch", closed)
+        # Do NOT close existing tabs. Workers reuse their persistent tabs
+        # across blogs; killing them forces recreation, which triggers
+        # Chrome window activation on macOS via Target.createTarget.
+        # The login session lives in --user-data-dir, not in open tabs.
 
         # Validate the reused Chrome actually accepts live CDP connections.
         # A stale Chrome instance can still answer /json/list and create tabs,
@@ -310,6 +367,7 @@ def restart_chrome() -> dict[str, Any]:
         # CDPClient.start() with "timed out during opening handshake".
         if _probe_cdp_health(running_port):
             login_wall = _probe_login_wall(running_port)
+            _minimize_chrome_window(running_port)
             return {
                 "killed": 0,
                 "remaining_after_kill": 0,
@@ -383,7 +441,7 @@ def restart_chrome() -> dict[str, Any]:
                         info = json.loads(resp.read())
                     except (json.JSONDecodeError, OSError):
                         pass
-                    return {
+                    result = {
                         "killed": kill_result["killed"],
                         "remaining_after_kill": kill_result["remaining"],
                         "restarted": True,
@@ -393,6 +451,11 @@ def restart_chrome() -> dict[str, Any]:
                         "status": "ok",
                         "login_wall": login_wall,
                     }
+                    # Minimize Chrome's window to prevent focus steal (NFR-4).
+                    # Target.createTarget on a visible window brings Chrome to
+                    # the foreground; a minimized window stays out of the way.
+                    _minimize_chrome_window(port)
+                    return result
             except (urllib.error.URLError, OSError):
                 pass
 

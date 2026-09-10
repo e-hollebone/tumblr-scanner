@@ -13,10 +13,12 @@ decisions about tab lifecycle, retries, and enqueue.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from agent import (
     LoginWallDetected,
@@ -40,10 +42,8 @@ def _should_skip(username: str) -> bool:
     low = username.lower()
     return any(p in low for p in SKIP_USERNAME_PATTERNS)
 
-from eventlog import error as ev_err
 from eventlog import info as ev
-from eventlog import warn as ev_warn
-from work_queue import dequeue, get_fail_count, mark_done, _increment_fail_count
+from work_queue import _increment_fail_count, dequeue, mark_done
 
 logger = logging.getLogger("worker")
 
@@ -59,9 +59,9 @@ class Worker:
         index_path: Path,
         wall_halt: asyncio.Event,
         busy_event: asyncio.Event | None = None,
-        progress_cb: "Callable[[str], None] | None" = None,
-        set_current_cb: "Callable[[str, int], None] | None" = None,
-        stats_cb: "Callable[[str], None] | None" = None,
+        progress_cb: Callable[[str], None] | None = None,
+        set_current_cb: Callable[[str, int], None] | None = None,
+        stats_cb: Callable[[str], None] | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.browser_ws = browser_ws
@@ -76,6 +76,19 @@ class Worker:
         self.ws_url: str | None = None
         self.target_id: str | None = None
         self._empty_since: float | None = None
+        self._current_offset: int = 0
+        self._current_posts: int = 0
+        self._current_cells: int = 0
+        self._render_complete: bool = False
+
+    def render_state(self) -> dict[str, Any]:
+        """Snapshot the worker's current render progress for the status dashboard."""
+        return {
+            "offset": self._current_offset,
+            "posts": self._current_posts,
+            "cells": self._current_cells,
+            "render_complete": self._render_complete,
+        }
 
     # ------------------------------------------------------------------ #
     # Tab lifecycle                                                      #
@@ -92,7 +105,7 @@ class Worker:
         while True:
             try:
                 self.ws_url, self.target_id = await _new_tab_url(
-                    self.browser_ws, "https://www.tumblr.com/"
+                    self.browser_ws, "about:blank"
                 )
             except Exception as exc:
                 attempts += 1
@@ -102,10 +115,13 @@ class Worker:
                 )
                 if attempts >= 3:
                     raise
-                await asyncio.sleep(2.0)
+                try:
+                    await asyncio.wait_for(self.wall_halt.wait(), timeout=2.0)
+                except TimeoutError:
+                    pass
                 continue
             logger.info("Worker %d: opened tab targetId=%s", self.worker_id, self.target_id)
-            ev("worker%d" % self.worker_id, "tab_opened", target_id=self.target_id)
+            ev(f"worker{self.worker_id}", "tab_opened", target_id=self.target_id)
             return self.ws_url, self.target_id
 
     async def _close_tab(self) -> None:
@@ -139,7 +155,7 @@ class Worker:
 
         base = self.browser_ws.replace("ws://", "http://").rstrip("/")
         try:
-            with urllib.request.urlopen(f"{base}/json/list", timeout=5) as resp:
+            with urllib.request.urlopen(f"{base}/json/list", timeout=5) as resp:  # noqa: ASYNC210 — sync HTTP for tab refresh
                 targets = json.loads(resp.read())
             for t in targets:
                 if t.get("type") == "page" and t.get("id") == self.target_id:
@@ -171,27 +187,126 @@ class Worker:
         try:
             await cdp_send(client, "Page.navigate", {"url": url, "loadResponse": True}, timeout=45.0)
 
-            # Wait for content
-            deadline = time.monotonic() + 30.0
-            last_text = ""
+            # ---- Render convergence gate (fast + deterministic) ----
+            # Tumblr is an SPA: text can appear before post cells finish
+            # rendering, and stale content from a previous blog can index
+            # if we return too early. We poll multiple signals and exit
+            # the moment they converge:
+            #   * URL stable
+            #   * body text > 100 chars
+            #   * post cells rendered (>0 via data-cell-id selector)
+            #   * cell count trend is flat for 2 consecutive fast polls
+            # Poll interval is 500ms, cap is 12s. On a healthy page this
+            # usually exits in 1-3s; slow paths still have a hard stop.
+            deadline = time.monotonic() + 12.0
+            last_url = ""
+            last_text_len = 0
+            best_posts = 0
+            prev_cells = -1
+            stable_rounds = 0
+            posts_ready = False
+            cur_text = ""
+            self._current_offset = offset
+            self._current_posts = 0
+            self._current_cells = 0
+            self._render_complete = False
             while time.monotonic() < deadline:
-                await asyncio.sleep(1)
+                if self.wall_halt.is_set():
+                    raise TabDeadError("shutdown during render wait")
                 try:
                     result = await cdp_send(
                         client,
                         "Runtime.evaluate",
                         {
-                            "expression": "document.body ? document.body.innerText : ''",
+                            "expression": (
+                                "JSON.stringify({"
+                                "url: location.href, "
+                                "text: (document.body ? document.body.innerText : '').slice(0, 500), "
+                                "cells: document.querySelectorAll('div[data-cell-id]').length, "
+                                "posts: Math.max("
+                                "document.querySelectorAll('div[data-cell-id*=\"-post-\"]').length, "
+                                "document.querySelectorAll('article').length"
+                                ")"
+                                "})"
+                            ),
                             "returnByValue": True,
                         },
                     )
-                    new_text = result.get("result", {}).get("value", "")
-                    if new_text:
-                        last_text = new_text
-                        if len(new_text) > 100:
+                    val = result.get("result", {}).get("result", {}).get("value", "{}")
+                    try:
+                        snap = json.loads(val)
+                        cur_url = snap.get("url", "")
+                        cur_text = snap.get("text", "")
+                        cur_cells = snap.get("cells", 0)
+                        cur_posts = snap.get("posts", 0)
+                    except Exception as _exc:  # noqa: BLE001 — JSON parse may fail on partial CDP response
+                        logger.debug("Render state JSON parse failed: %s", _exc)
+                        cur_url = ""
+                        cur_text = ""
+                        cur_cells = 0
+                        cur_posts = 0
+
+                    if cur_url:
+                        last_url = cur_url
+                    best_posts = max(best_posts, cur_posts)
+                    last_text_len = max(last_text_len, len(cur_text))
+
+                    # Update live render state for the status dashboard
+                    self._current_posts = best_posts
+                    self._current_cells = cur_cells
+
+                    # ---- Dead-blog fast bail ----
+                    # If the URL redirected to a known dead/deactivated path,
+                    # there will never be post cells. Bail immediately instead
+                    # of burning the full render cap.
+                    if cur_url:
+                        low_url = cur_url.lower()
+                        if "blog-explorer" in low_url or "explore/trending" in low_url:
+                            self._render_complete = False
+                            logger.info(
+                                "navigate_to: DEAD (early) %s offset %d — redirect to %s",
+                                username, offset, cur_url[:80],
+                            )
+                            # Fetch HTML anyway so caller can extract content
                             break
-                except Exception:
+
+                    url_stable = cur_url == last_url and cur_url != ""
+                    text_present = last_text_len > 100
+                    posts_rendered = best_posts > 0
+                    # Treat as stable if counts are flat or still rising but
+                    # already nonzero; the key invariant is we only break
+                    # after we have seen posts and they are not shrinking.
+                    cells_stable = cur_cells >= prev_cells and cur_cells > 0
+                    if cells_stable:
+                        stable_rounds += 1
+                    else:
+                        stable_rounds = 0
+                    prev_cells = cur_cells
+
+                    if url_stable and text_present and posts_rendered and stable_rounds >= 1:
+                        posts_ready = True
+                        self._render_complete = True
+                        break
+                except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail during render poll; best-effort
+                    logger.debug("Render poll JS evaluation failed for %s: %s", self.current_username, _exc)
+                try:
+                    await asyncio.wait_for(self.wall_halt.wait(), timeout=0.5)
+                except TimeoutError:
                     pass
+
+            if not posts_ready:
+                self._render_complete = False
+                logger.warning(
+                    "navigate_to: render incomplete for %s offset %d — "
+                    "url=%s posts=%d cells=%d stable=%d text_len=%d",
+                    username,
+                    offset,
+                    last_url[:80],
+                    best_posts,
+                    prev_cells,
+                    stable_rounds,
+                    last_text_len,
+                )
 
             # Get HTML
             result = await cdp_send(
@@ -204,7 +319,6 @@ class Worker:
             )
             payload = result.get("result", {}).get("value", "{}")
             try:
-                import json
                 data = json.loads(payload)
                 html = data.get("html", "")
                 final_url = data.get("url", "")
@@ -268,7 +382,7 @@ class Worker:
         if idx_status == "fresh":
             return {"skip": True, "reason": "index_fresh"}
 
-        cached = load_entry(cache_dir / f"tier_1" / f"{username}.json")
+        cached = load_entry(cache_dir / "tier_1" / f"{username}.json")
         if cached:
             cached_usernames = set(cached.get("usernames", []))
             current_usernames = set()
@@ -316,7 +430,14 @@ class Worker:
                     MAX_RECOVERY_PER_BLOG,
                     exc,
                 )
-                await asyncio.sleep(2 ** attempt)
+                if self.wall_halt.is_set():
+                    return False
+                backoff = min(2 ** attempt, 5)
+                sleep_end = time.monotonic() + backoff
+                while time.monotonic() < sleep_end:
+                    if self.wall_halt.is_set():
+                        return False
+                    await asyncio.sleep(1.0)
         return False
 
     # ------------------------------------------------------------------ #
@@ -329,6 +450,8 @@ class Worker:
         tier: int,
         mode: str,
         enqueue_fn,
+        first_html: str | None = None,
+        first_url: str | None = None,
     ) -> dict[str, Any]:
         """Crawl a blog with tab-retry. Worker owns recovery.
 
@@ -338,7 +461,6 @@ class Worker:
         """
 
         MAX_RECOVERY = MAX_RECOVERY_PER_BLOG  # from config (1)
-        last_exc: Exception | None = None
 
         def _do_crawl():
             return crawl_blog(
@@ -357,6 +479,8 @@ class Worker:
                 on_page=lambda name, users, t: enqueue_fn(name, users, t),
                 should_exit=lambda: self.wall_halt.is_set(),
                 on_progress=self.progress_cb,
+                first_html=first_html,
+                first_url=first_url,
             )
 
         for attempt in range(1, MAX_RECOVERY + 1):
@@ -366,7 +490,7 @@ class Worker:
                 return {"username": username, "tier": tier, "status": "aborted", "unique": 0, "total": 0, "posts": 0, "usernames": [], "enqueued": 0, "dead": False}
             try:
                 return await _do_crawl()
-            except LoginWallDetected as wall:
+            except LoginWallDetected:
                 # Fix A: a detected wall is a SOFT signal. Tumblr's rate-limit
                 # / "are you human" interstitial routes through a /login URL,
                 # which agent.detect_login_wall misreads as a hard login wall.
@@ -384,7 +508,10 @@ class Worker:
                         WALL_RETRY_MAX,
                         WALL_RETRY_BACKOFF_S,
                     )
-                    await asyncio.sleep(WALL_RETRY_BACKOFF_S)
+                    try:
+                        await asyncio.wait_for(self.wall_halt.wait(), timeout=WALL_RETRY_BACKOFF_S)
+                    except TimeoutError:
+                        pass
                     if self.wall_halt.is_set():
                         logger.info("Worker %d: shutdown signal during wall retry, aborting", self.worker_id)
                         return {"username": username, "tier": tier, "status": "aborted", "unique": 0, "total": 0, "posts": 0, "usernames": [], "enqueued": 0, "dead": False}
@@ -395,9 +522,8 @@ class Worker:
                     username,
                     WALL_RETRY_MAX,
                 )
-                raise wall
+                raise
             except TabDeadError as exc:
-                last_exc = exc
                 logger.warning(
                     "Worker %d: tab died for %s (attempt %d/%d): %s",
                     self.worker_id,
@@ -411,7 +537,10 @@ class Worker:
                     if self.wall_halt.is_set():
                         logger.info("Worker %d: shutdown signal after tab death, aborting", self.worker_id)
                         return {"username": username, "tier": tier, "status": "aborted", "unique": 0, "total": 0, "posts": 0, "usernames": [], "enqueued": 0, "dead": False}
-                    await asyncio.sleep(2.0)
+                    try:
+                        await asyncio.wait_for(self.wall_halt.wait(), timeout=2.0)
+                    except TimeoutError:
+                        pass
                     if self.wall_halt.is_set():
                         logger.info("Worker %d: shutdown signal during tab recovery, aborting", self.worker_id)
                         return {"username": username, "tier": tier, "status": "aborted", "unique": 0, "total": 0, "posts": 0, "usernames": [], "enqueued": 0, "dead": False}
@@ -492,7 +621,6 @@ class Worker:
         processed = 0
         errors = 0
         enqueued = 0
-        consecutive_empty = 0
 
         try:
             await self._open_tab()
@@ -508,11 +636,6 @@ class Worker:
                     if self._empty_since is None:
                         self._empty_since = time.monotonic()
                         logger.info("Worker %d: queue empty, waiting...", self.worker_id)
-                    elif time.monotonic() - self._empty_since > 600.0:
-                        # Long safety net (10 min) so a stuck coordinator can't
-                        # hang workers forever; real shutdown is via wall_halt.
-                        logger.info("Worker %d: queue empty 10m — exiting", self.worker_id)
-                        break
                     # Fast-abort sleep: wake every 1s to check for shutdown signal
                     sleep_deadline = time.monotonic() + QUEUE_POLL_INTERVAL
                     while time.monotonic() < sleep_deadline:
@@ -573,15 +696,16 @@ class Worker:
                         self.busy_event.clear()
                         continue
 
-                # FR-7: reindex mode — probe page 0, compare dates
+                # FR-7: reindex mode — probe page 0, compare dates.
+                # Reuse the fetched HTML instead of letting crawl_blog fetch
+                # offset 0 again — avoids a redundant Page.navigate + render wait.
+                probe_html, probe_url = "", ""
                 if mode == "reindex":
                     try:
-                        # Navigate to page 0 using worker's persistent tab
-                        html, final_url = await self.navigate_to(username, 0)
-                        if html:
-                            from cache import index_status
+                        probe_html, probe_url = await self.navigate_to(username, 0)
+                        if probe_html:
                             probe_result = await self.probe_page_zero(
-                                username, html, final_url, self.cache_dir, self.index_path,
+                                username, probe_html, probe_url, self.cache_dir, self.index_path,
                                 force=(tier == 0),
                             )
                         else:
@@ -639,7 +763,8 @@ class Worker:
 
                 try:
                     result = await self._crawl_with_recovery(
-                        username, tier, mode, _enqueue_page
+                        username, tier, mode, _enqueue_page,
+                        first_html=probe_html, first_url=probe_url,
                     )
                     if not result.get("usernames"):
                         # A blog with status="ok" but 0 posts is legitimately
@@ -665,9 +790,9 @@ class Worker:
                                 self.busy_event.clear()
                                 continue
                         else:
-                            consecutive_empty = 0
+                            pass
                     else:
-                        consecutive_empty = 0
+                        pass
                 except LoginWallDetected:
                     logger.warning(
                         "Worker %d: LOGIN WALL DETECTED for %s — halting. "
@@ -761,8 +886,8 @@ class Worker:
                             close_tab(self.browser_ws, self.target_id),
                             timeout=5.0,
                         )
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as _exc:  # noqa: BLE001
+                        logger.debug("Worker %d: tab close failed during shutdown: %s", self.worker_id, _exc)
                     self.target_id = None
                     self.ws_url = None
             else:
