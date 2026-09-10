@@ -3,7 +3,7 @@
 One Worker instance per thread in the pool. Each worker:
   1. Opens ONE Chrome tab at startup (reused across all blogs).
   2. Polls the queue; for each blog, crawls via the agent library.
-  3. Owns tab recovery: on TabDeadError, closes the dead tab, opens a new one, retries.
+  3. Owns tab recovery: on TabDeadError, opens a new tab, retries.
   4. Closes its tab only on exit.
 
 The agent (`agent.py`) is a pure CDP library — it accepts a connected
