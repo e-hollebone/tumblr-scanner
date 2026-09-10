@@ -256,7 +256,7 @@ class Worker:
         # Use persistent CDP client — create once, reuse for all navigations
         client = await self._ensure_cdp_client()
         try:
-            await cdp_send(client, "Page.navigate", {"url": url}, timeout=5.0)
+            await cdp_send(client, "Page.navigate", {"url": url}, timeout=15.0)
 
             # ---- Render convergence gate (fast + deterministic) ----
             # Tumblr is an SPA: text can appear before post cells finish
@@ -273,7 +273,7 @@ class Worker:
             last_url = ""
             last_text_len = 0
             best_posts = 0
-            prev_cells = -1
+            prev_posts = -1
             stable_rounds = 0
             posts_ready = False
             cur_text = ""
@@ -293,7 +293,6 @@ class Worker:
                                 "JSON.stringify({"
                                 "url: location.href, "
                                 "text: (document.body ? document.body.innerText : '').slice(0, 500), "
-                                "cells: document.querySelectorAll('div[data-cell-id]').length, "
                                 "posts: Math.max("
                                 "document.querySelectorAll('div[data-cell-id*=\"-post-\"]').length, "
                                 "document.querySelectorAll('article').length"
@@ -367,15 +366,15 @@ class Worker:
                     url_stable = cur_url == last_url and cur_url != ""
                     text_present = last_text_len > 100
                     posts_rendered = best_posts > 0
-                    # Treat as stable if counts are flat or still rising but
+                    # Posts are stable when count is flat or still rising but
                     # already nonzero; the key invariant is we only break
                     # after we have seen posts and they are not shrinking.
-                    cells_stable = cur_cells >= prev_cells and cur_cells > 0
-                    if cells_stable:
+                    posts_stable = best_posts >= prev_posts and best_posts > 0
+                    if posts_stable:
                         stable_rounds += 1
                     else:
                         stable_rounds = 0
-                    prev_cells = cur_cells
+                    prev_posts = best_posts
 
                     if url_stable and text_present and posts_rendered and stable_rounds >= 1:
                         posts_ready = True
@@ -392,12 +391,12 @@ class Worker:
                 self._render_complete = False
                 logger.warning(
                     "navigate_to: render incomplete for %s offset %d — "
-                    "url=%s posts=%d cells=%d stable=%d text_len=%d",
+                    "url=%s posts=%d prev_posts=%d stable=%d text_len=%d",
                     username,
                     offset,
                     last_url[:80],
                     best_posts,
-                    prev_cells,
+                    prev_posts,
                     stable_rounds,
                     last_text_len,
                 )
