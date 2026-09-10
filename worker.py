@@ -423,6 +423,7 @@ class Worker:
                     # bail within ~500ms instead of waiting for full render.
                     if cur_text and not posts_ready:
                         low_text = cur_text.lower()
+                        _found_dead = False
                         for phrase in DEAD_PHRASES:
                             if phrase in low_text:
                                 self._render_complete = False
@@ -430,10 +431,11 @@ class Worker:
                                     "navigate_to: DEAD (phrase) %s offset %d — '%s'",
                                     username, offset, phrase,
                                 )
+                                _found_dead = True
                                 break
-                        else:
-                            continue
-                        break
+                        if _found_dead:
+                            break  # out of render-poll while loop
+                        # else: no dead phrase — fall through to convergence
 
                     url_stable = cur_url == last_url and cur_url != ""
                     text_present = last_text_len > 100
