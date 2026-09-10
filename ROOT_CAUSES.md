@@ -34,6 +34,15 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 - **Fix:** Changed extraction to try triple-nested first, fall back to double-nested. Matches the pattern already used elsewhere in the codebase.
 - **Verification:** `py_compile` clean; `test_async.py` passes; zero new ruff errors; committed as `debece8`.
 
+### 2026-09-09 — _ensure_cdp_client assigned dead client before start() completed, causing tab flashing
+- **Claim:** Every run opens and closes tabs repeatedly despite code that should reuse a single tab per worker. Logs show `navigate_to failed: 'Worker' object has no attribute 'current_username'` and `CDP command Runtime.evaluate timed out after 15.0s` followed by `tab recovery exhausted`.
+- **Evidence:** Live run logs show 225+ CDP connects for 10 workers. Each `navigate_to` call creates a new tab via `_recover_tab()`. The `cdp_send` calls in the render poll use `cdp_wrapper`'s default `timeout=15.0`, not the 3s/5s values that were edited in other call sites.
+- **Root cause (two bugs):**
+  1. `_ensure_cdp_client()` assigned `self._cdp_client = CDPClient(self.ws_url)` BEFORE `await client.start()` returned. If `start()` timed out, the dead client stayed cached — the next `navigate_to` call returned the cached dead client, which raised `Client is not started. Call start() first` → `TabDeadError` → `_recover_tab()` opened a new tab → focus steal.
+  2. `cdp_wrapper.cdp_send` defaults to `timeout=15.0`. The render poll's `cdp_send` calls (lines 275, 392) didn't pass an explicit timeout, so they used the 15s default. The `Page.navigate` call at line 246 had `timeout=5.0`, but the subsequent render poll evaluations silently used 15s — explaining why logs still showed `timed out after 15.0s` after the 5s navigation timeout was applied.
+- **Fix:** `_ensure_cdp_client()` now sanity-checks the cached client with a 2s probe before returning; recreates if dead. Assigns `self._cdp_client` only after `start()` succeeds. Render poll `cdp_send` calls now use explicit `timeout=3.0` and `timeout=5.0` respectively.
+- **Verification:** `py_compile` clean; `test_async.py` passes (dequeued: 4, errors: 0); zero new ruff errors; committed as `ff7c8dc`.
+
 ### 2026-09-09 — Net-new ruff lint: 30 errors across 6 files (committed 9acfc4e)
 - **Claim:** After the worker-tab-lifecycle-rewrite branch accumulated 522 added lines across 7 files, `ruff check` reported 30 net-new violations (16 F401 unused imports, 18 S110 try/except/pass, 7 I001 import sorting, 4 F841 unused locals, 1 F541 empty f-string, 1 F401 RUF100 stale noqa, 1 UP035 typing→collections.abc).
 - **Evidence:** `ruff check` output captured in `/tmp/ruff_out.txt` (1433 lines, 30 distinct error locations). `py_compile` passed on all 7 files. `test_async.py` passed (14 dequeued, 14 done, 0 errors, 0 malformed) after fixes.
