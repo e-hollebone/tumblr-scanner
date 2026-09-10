@@ -5,7 +5,7 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 ## Open / Unresolved
 - Worker shutdown path still uses tab target IDs from a pre-shutdown Chrome state; if the coordinator halts while a worker is mid-blog, any later tab lookup can fail with `Tab targetId=... not found in /json/list`. This is tolerated as a shutdown-side error, but it still counts as a non-zero `errors` drain stat.
 - T0 index entry in `cache/index.json` shows `status: error, dead: true, unique: 0, total: 0` from a prior failed live run; will update on next successful T0 reindex.
-- CR-1: `probe_page_zero` regex `re.findall(r'"([^"]+)"', html)` extracts all quoted strings as usernames | `worker.py:650` — reindex skip optimization broken; every blog fully crawled.
+- CR-1: ~~`probe_page_zero` regex extracts all quoted strings as usernames | `worker.py:649` — reindex skip optimization broken; every blog fully crawled.~~ — RESOLVED 2026-09-10: replaced with Tumblr-specific `@handle` and `data-username` patterns.
 - CR-3: `_crawl_with_recovery` returns inconsistent dict shapes (missing keys on some paths) | `worker.py:690-720` — caller crashes on missing keys.
 - CR-4: ~~`navigate_to` render poll has no max-iterations guard | `worker.py:440-460` — infinite loop on non-converging pages.~~ — RESOLVED 2026-09-10: render poll loop is now bounded by `deadline = time.monotonic() + 3.0` (reduced from 12s), which serves as a hard time-based max-iterations guard. Loop exits when deadline passes regardless of poll count.
 - CR-5: `fresh_days=0` in `index_status` — `days_old <= fresh_days` with `days_old=0.003` fails | `cache.py:159` + `queue_integration.py:304` — same-run duplicate enqueue.
@@ -26,6 +26,12 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 - **Evidence:** Sub-agent code review (deleg_d2d2aff4) identified the discrepancy. Verified `cdp_use.CDPClient.send_raw()` returns raw CDP response dict at `cdp_use/__init__.py`. The render poll already used double-nested with fallback; only the HTML fetch was single-nested.
 - **Fix:** Changed `worker.py:581` from `result.get("result", {}).get("value", "{}")` → `result.get("result", {}).get("result", {}).get("value", "{}")`. Applied same fix to 3 CDP response extraction sites in `agent.py:fetch_page_html` (lines 214, 257, 281, 307) for consistency. Updated test mocks in `tests/test_dead_phrase.py` (2 locations) from single-nested to double-nested to match real CDP protocol shape.
 |- **Verification:** All 48 tests pass (`.venv/bin/python3 -m pytest tests/ -v --tb=short --timeout=15`); `py_compile` clean on `worker.py`, `agent.py`; `ruff check tests/` passes.
+
+### 2026-09-10 — CR-1: probe_page_zero regex matched all strings, not just usernames (resolved)
+|- **Claim:** `probe_page_zero` used `re.findall(r'\"([^\"]+)\"', html)` which matches every quoted string in the page HTML (post slugs, URLs, timestamps, JSON keys), not just usernames. This made the reindex skip check think usernames were always different from the cached set, so every blog was fully crawled even in reindex mode.
+|- **Evidence:** The regex `r'"([^"]+)"'` is a generic JSON string matcher — it has no awareness of Tumblr's username format. On a page with hundreds of JSON strings (post data, API responses embedded in script tags), it extracts dozens of false-positive "usernames" that only happen to start with `@`.
+|- **Fix:** Replaced the broad regex with Tumblr-specific patterns: `@([a-zA-Z0-9\-_]+)` matches `@handle` mentions, and `data-username=[\"']([a-zA-Z0-9\-_]+)[\"']` matches `data-username` attribute values. Both are lowercased for comparison against the cached username set. Also added `timeout=10.0` to all 5 `cdp_send` calls in `agent.py:fetch_page_html()` (dead code path, fixed for consistency).
+|- **Verification:** `py_compile` clean on `worker.py`, `agent.py`; 48/48 tests pass; no new ruff errors on modified lines.
 
 ### 2026-09-10 — Render poll + Page.navigate timeout reductions (worker.py)
 |- **Claim:** Session summary (d2, node 293) directed reducing Page.navigate timeout from 15s→5s and render poll convergence cap from 12s→3s, but the current code still had `timeout=15.0` on Page.navigate (line 329) and `deadline = time.monotonic() + 12.0` (line 407). These had not yet been applied.
