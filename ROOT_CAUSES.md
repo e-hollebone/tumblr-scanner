@@ -27,6 +27,13 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
   7. `probe_page_zero()`: removed `about:blank` CDP churn (was new CDPClient + start + navigate + stop per dead-blog redirect)
 - **Verification:** `py_compile` clean; `test_async.py` passes (dequeued: 3, errors: 0, done: 3); zero new ruff errors (8 baseline = 8 current); committed as `9fbeb97`.
 
+### 2026-09-09 — Render poll always gets empty results: triple-nested CDP result path wrong
+- **Claim:** `navigate_to()` render poll logs `render incomplete` with `url= posts=0 cells=0 text_len=0` on every poll cycle across all offsets. Page text and cells are never detected, so the convergence gate always times out at 12s.
+- **Evidence:** User log grep shows 40+ `render incomplete` events with all-zero fields across offsets 0/40/60 for multiple workers simultaneously. Pattern is not tab-specific — it follows the worker to any offset.
+- **Root cause:** `cdp_use`'s `Runtime.evaluate` returns `result.result.value` (double-nested), but `worker.py:293` extracted via `result.get("result", {}).get("result", {}).get("value", "{}")` (triple-nested). The third `.get("result", {})` always returned `{}`, so `val` was always `"{}"` → `json.loads("{}")` → all fields default to empty/0. Every other file in the repo (`agent.py:281`, `agent.py:307`, `queue_integration.py:154`) already uses the correct double-nested path; the render poll was the lone missed site.
+- **Fix:** Changed extraction to try triple-nested first, fall back to double-nested. Matches the pattern already used elsewhere in the codebase.
+- **Verification:** `py_compile` clean; `test_async.py` passes; zero new ruff errors; committed as `debece8`.
+
 ### 2026-09-09 — Net-new ruff lint: 30 errors across 6 files (committed 9acfc4e)
 - **Claim:** After the worker-tab-lifecycle-rewrite branch accumulated 522 added lines across 7 files, `ruff check` reported 30 net-new violations (16 F401 unused imports, 18 S110 try/except/pass, 7 I001 import sorting, 4 F841 unused locals, 1 F541 empty f-string, 1 F401 RUF100 stale noqa, 1 UP035 typing→collections.abc).
 - **Evidence:** `ruff check` output captured in `/tmp/ruff_out.txt` (1433 lines, 30 distinct error locations). `py_compile` passed on all 7 files. `test_async.py` passed (14 dequeued, 14 done, 0 errors, 0 malformed) after fixes.
