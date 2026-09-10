@@ -290,7 +290,13 @@ class Worker:
                             "returnByValue": True,
                         },
                     )
-                    val = result.get("result", {}).get("result", {}).get("value", "{}")
+                    # cdp_use returns result.result.value (double-nested),
+                    # not result.result.result.value (triple-nested). Try the
+                    # expected path first; fall back to the shallow path so
+                    # the render poll never silently gets {} on every poll.
+                    val = result.get("result", {}).get("result", {}).get("value")
+                    if val is None:
+                        val = result.get("result", {}).get("value", "{}")
                     try:
                         snap = json.loads(val)
                         cur_url = snap.get("url", "")
