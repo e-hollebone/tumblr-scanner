@@ -322,11 +322,11 @@ class Worker:
         )
         try:
             logger.info(
-                "Worker %d: Page.navigate -> %s (timeout=15s)",
+                "Worker %d: Page.navigate -> %s (timeout=5s)",
                 self.worker_id,
                 url,
             )
-            await cdp_send(client, "Page.navigate", {"url": url}, timeout=15.0)
+            await cdp_send(client, "Page.navigate", {"url": url}, timeout=5.0)
             logger.info(
                 "Worker %d: Page.navigate returned for %s, starting render poll",
                 self.worker_id,
@@ -336,7 +336,7 @@ class Worker:
             # Page.navigate returns as soon as the navigation command is accepted —
             # the page hasn't loaded yet. Without this delay, the first Runtime.evaluate
             # fires against about:blank or the previous page, and on a loaded Chrome
-            # (10 tabs) the early polls can time out at 3s, causing all 12s of render
+            # (10 tabs) the early polls can time out at 3s, causing all 3s of render
             # polling to silently fail with empty results.
             await asyncio.sleep(1.0)
 
@@ -344,8 +344,7 @@ class Worker:
             # Fast-path: after a brief initial load delay, do a single
             # Runtime.evaluate to check if the page already shows a
             # known dead-phrase. If so, we can bail immediately without
-            # running the full 12s render-convergence poll — saving
-            # ~12s per dead/dead-walled blog across 10 concurrent tabs.
+            # running the full 3s render-convergence poll — saving
             try:
                 early = await cdp_send(
                     client,
@@ -403,9 +402,9 @@ class Worker:
             #   * body text > 100 chars
             #   * post cells rendered (>0 via data-cell-id selector)
             #   * cell count trend is flat for 2 consecutive fast polls
-            # Poll interval is 500ms, cap is 12s. On a healthy page this
+            # Poll interval is 500ms, cap is 3s. On a healthy page this
             # usually exits in 1-3s; slow paths still have a hard stop.
-            deadline = time.monotonic() + 12.0
+            deadline = time.monotonic() + 3.0
             last_url = ""
             last_text_len = 0
             best_posts = 0
