@@ -132,13 +132,21 @@ class Worker:
         attempts = 0
         while True:
             try:
+                logger.info("Worker %d: opening new tab (about:blank)...", self.worker_id)
                 self.ws_url, self.target_id = await _new_tab_url(
                     self.browser_ws, "about:blank"
+                )
+                logger.info(
+                    "Worker %d: _new_tab_url returned ws_url=%s target_id=%s",
+                    self.worker_id,
+                    self.ws_url[:60] if self.ws_url else None,
+                    self.target_id,
                 )
                 # Hide Chrome window to prevent focus steal from
                 # Target.createTarget on macOS. Done immediately after tab
                 # creation, which is when the activation occurs.
                 _hide_chrome_window()
+                logger.info("Worker %d: _hide_chrome_window() called", self.worker_id)
             except Exception as exc:
                 attempts += 1
                 logger.error(
@@ -189,14 +197,31 @@ class Worker:
         try:
             with urllib.request.urlopen(f"{base}/json/list", timeout=5) as resp:  # noqa: ASYNC210 — sync HTTP for tab refresh
                 targets = json.loads(resp.read())
+            logger.info(
+                "Worker %d: /json/list returned %d targets, looking for target_id=%s",
+                self.worker_id,
+                len(targets),
+                self.target_id,
+            )
             for t in targets:
                 if t.get("type") == "page" and t.get("id") == self.target_id:
                     new_ws = t.get("webSocketDebuggerUrl")
                     if new_ws:
                         self.ws_url = new_ws
+                        logger.info(
+                            "Worker %d: _refresh_ws_url success, new_ws=%s",
+                            self.worker_id,
+                            new_ws[:60],
+                        )
                         return
             raise RuntimeError(f"Tab targetId={self.target_id} not found in /json/list")
         except Exception as exc:
+            logger.warning(
+                "Worker %d: _refresh_ws_url failed: %s (target_id=%s)",
+                self.worker_id,
+                exc,
+                self.target_id,
+            )
             raise RuntimeError(f"Failed to refresh WS URL: {exc}") from exc
 
     async def _ensure_cdp_client(self) -> Any:
@@ -219,14 +244,31 @@ class Worker:
                     self._cdp_client.send_raw("Runtime.evaluate", {"expression": "1"}),
                     timeout=2.0,
                 )
+                logger.debug(
+                    "Worker %d: _ensure_cdp_client reused cached client",
+                    self.worker_id,
+                )
                 return self._cdp_client
             except Exception:
+                logger.warning(
+                    "Worker %d: cached CDP client dead, recreating",
+                    self.worker_id,
+                )
                 self._cdp_client = None
         if not self.ws_url:
             raise TabDeadError("No WS URL for CDP client")
+        logger.info(
+            "Worker %d: creating new CDP client for ws_url=%s",
+            self.worker_id,
+            self.ws_url[:60] if self.ws_url else None,
+        )
         client = CDPClient(self.ws_url)
         await asyncio.wait_for(client.start(), timeout=3.0)
         self._cdp_client = client
+        logger.info(
+            "Worker %d: CDP client started successfully",
+            self.worker_id,
+        )
         return self._cdp_client
 
     async def _stop_cdp_client(self) -> None:
@@ -252,11 +294,33 @@ class Worker:
             raise TabDeadError("No WS URL available")
 
         url = f"https://www.tumblr.com/{username}?offset={offset}"
+        logger.info(
+            "Worker %d: navigate_to start blog=%s offset=%d ws_url=%s",
+            self.worker_id,
+            username,
+            offset,
+            self.ws_url[:60] if self.ws_url else None,
+        )
 
         # Use persistent CDP client — create once, reuse for all navigations
         client = await self._ensure_cdp_client()
+        logger.info(
+            "Worker %d: _ensure_cdp_client() returned client for %s",
+            self.worker_id,
+            username,
+        )
         try:
+            logger.info(
+                "Worker %d: Page.navigate -> %s (timeout=15s)",
+                self.worker_id,
+                url,
+            )
             await cdp_send(client, "Page.navigate", {"url": url}, timeout=15.0)
+            logger.info(
+                "Worker %d: Page.navigate returned for %s, starting render poll",
+                self.worker_id,
+                username,
+            )
 
             # ---- Render convergence gate (fast + deterministic) ----
             # Tumblr is an SPA: text can appear before post cells finish
@@ -277,6 +341,7 @@ class Worker:
             stable_rounds = 0
             posts_ready = False
             cur_text = ""
+            poll_count = 0
             self._current_offset = offset
             self._current_posts = 0
             self._current_cells = 0
@@ -284,6 +349,7 @@ class Worker:
             while time.monotonic() < deadline:
                 if self.wall_halt.is_set():
                     raise TabDeadError("shutdown during render wait")
+                poll_count += 1
                 try:
                     result = await cdp_send(
                         client,
@@ -302,6 +368,12 @@ class Worker:
                             "returnByValue": True,
                         },
                         timeout=3.0,
+                    )
+                    logger.debug(
+                        "Worker %d: render poll raw result keys=%s for %s",
+                        self.worker_id,
+                        list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+                        username,
                     )
                     # cdp_use returns result.result.value (double-nested),
                     # not result.result.result.value (triple-nested). Try the
@@ -421,6 +493,13 @@ class Worker:
                 final_url = ""
             return html, final_url
         except Exception as exc:
+            import traceback as _tb
+            logger.error(
+                "navigate_to failed for %s: %s\n%s",
+                username,
+                exc,
+                _tb.format_exc(),
+            )
             raise TabDeadError(f"navigate_to failed: {exc}") from exc
         finally:
             # No client.stop() — the CDP client is persistent for the worker's
@@ -702,6 +781,11 @@ class Worker:
 
         try:
             await self._open_tab()
+            logger.info(
+                "Worker %d: tab opened, waiting 500ms for Chrome to register tab",
+                self.worker_id,
+            )
+            await asyncio.sleep(0.5)
 
             while not self.wall_halt.is_set():
                 item = dequeue(queue_path)
@@ -799,11 +883,13 @@ class Worker:
                             self.busy_event.clear()
                             continue
                     except Exception as exc:
+                        import traceback
                         logger.warning(
-                            "Worker %d: reindex probe failed for %s: %s",
+                            "Worker %d: reindex probe failed for %s: %s\n%s",
                             self.worker_id,
                             username,
                             exc,
+                            traceback.format_exc(),
                         )
 
                 limits = LIMITS_BY_TIER.get(tier)
