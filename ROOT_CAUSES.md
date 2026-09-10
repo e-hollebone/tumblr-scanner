@@ -244,3 +244,12 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
   3. Replaced `asyncio.shield(self._close_tab())` with a 5s fire-and-forget `close_tab` on shutdown path (no shield, no retry)
   4. Queue-empty sleep now wakes every 1s to check for `wall_halt` instead of blocking for 10s
 - **Verification:** `py_compile` clean on `worker.py`. Awaiting live run to confirm SIGINT shuts down in seconds, not minutes.
+### 2026-09-09 — Render convergence gate never satisfied: cells selector always returned 0, Page.navigate timeout too aggressive
+- **Claim:** Every blog hit "render incomplete" warnings (`cells=-1`, `posts=17`, `stable=0`) and the render poll exhausted the 12s cap on every page. Combined with 5s Page.navigate timeout, this caused tab deaths → recovery → new tabs → focus steal.
+- **Evidence:** Live run logs show `render incomplete for <blog> offset <N> — url=... posts=17 cells=-1 stable=0 text_len=499` on every single blog including T0. The `cells` value is always 0 (logged as -1 because `prev_cells` was initialized to -1 and never updated since the selector returned 0). The convergence gate required `cells > 0 AND stable`, which was impossible to satisfy.
+- **Root cause:** The `div[data-cell-id]` selector used for the cell-count stability check doesn't match current Tumblr markup — it returns 0 elements on every poll. Meanwhile the `posts` selector (`div[data-cell-id*="-post-"]` + `article` fallback) correctly returns 15-17 posts. The stability check was keying off the wrong signal. Additionally, `Page.navigate` timeout of 5s was too aggressive for cold Tumblr connections under 10-tab load, causing immediate `Page.navigate timed out after 5.0s` on workers 2, 3, 5 before the render poll even started.
+- **Fix:**
+  1. Removed the `cells` selector from the render poll JS entirely; stability check now keys off `posts` count (`best_posts >= prev_posts AND best_posts > 0`).
+  2. Renamed `prev_cells` → `prev_posts`, updated convergence condition and log format.
+  3. Raised `Page.navigate` timeout from 5s to 15s for cold connections under concurrent load.
+- **Verification:** `py_compile` clean; `test_async.py` passes (dequeued: 4, errors: 0); zero new ruff errors; committed as `dfdc966`.
