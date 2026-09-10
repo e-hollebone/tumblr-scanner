@@ -448,7 +448,7 @@ class Worker:
                         stable_rounds = 0
                     prev_posts = best_posts
 
-                    if url_stable and text_present and posts_rendered and stable_rounds >= 1:
+                    if url_stable and text_present and posts_rendered:
                         posts_ready = True
                         self._render_complete = True
                         break
