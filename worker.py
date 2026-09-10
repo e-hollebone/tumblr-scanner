@@ -382,6 +382,16 @@ class Worker:
                     val = result.get("result", {}).get("result", {}).get("value")
                     if val is None:
                         val = result.get("result", {}).get("value", "{}")
+                    # DEBUG: log raw CDP response shape to diagnose empty render polls
+                    logger.debug(
+                        "Worker %d: render poll raw response for %s — "
+                        "result_keys=%s val_type=%s val_repr=%r",
+                        self.worker_id,
+                        username,
+                        list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+                        type(val).__name__,
+                        val[:200] if isinstance(val, str) else repr(val)[:200],
+                    )
                     try:
                         snap = json.loads(val)
                         cur_url = snap.get("url", "")
