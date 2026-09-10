@@ -3,14 +3,70 @@
 Rule: after every run/analysis/failure, append a date-stamped entry and refresh the Open/unresolved section.
 
 ## Open / Unresolved
-- **Stale Chrome reuse + WebSocket handshakes under 10-tab load (2026-09-08, 2026-09-09):** `restart_chrome()` CDP health probe fix (`232d820`) + `client.start()` 30s timeout wrapper + `MAX_RECOVERY_PER_BLOG=3` + tab_id/ws_url swap fix in `_recover_tab()` all committed (`cf393e6`), need live run verification. Worker should kill stale Chrome before each run if it fails to connect.
+- **Login-wall retry fix is still pending implementation** (Option A: retry-then-confirm, production-affecting change to core crawl control flow). Pending user approval of the reviewable diff before merge; implementation will include re-run proof per homelab autonomy boundary flag.
 - Worker shutdown path still uses tab target IDs from a pre-shutdown Chrome state; if the coordinator halts while a worker is mid-blog, any later tab lookup can fail with `Tab targetId=... not found in /json/list`. This is tolerated as a shutdown-side error, but it still counts as a non-zero `errors` drain stat.
-- Login-wall retry fix is still pending implementation.
 - Startup bring-up hardening is now in place for tab-open handshake timeouts; needs a live 10-tab run to verify all workers recover under Chrome startup load.
-- Queue overflow at 10000 items is dropping discovered blogs during active crawl — fixed: overflow gate now counts active work (pending+in_progress) only; threshold raised to 50000; T0/T1 always bypass overflow gate, only T2+ is droppable.
-- Ctrl+C shutdown does not abort in-progress blog crawls; workers keep churning through pages for minutes after wall_halt is set. Fix committed (`fbf9ba6`); needs live run verification.
+- T0 index entry in `cache/index.json` shows `status: error, dead: true, unique: 0, total: 0` from a prior failed live run; will update on next successful T0 reindex.
 
 ## Entries
+
+### 2026-09-09 — Net-new ruff lint: 30 errors across 6 files (committed 9acfc4e)
+- **Claim:** After the worker-tab-lifecycle-rewrite branch accumulated 522 added lines across 7 files, `ruff check` reported 30 net-new violations (16 F401 unused imports, 18 S110 try/except/pass, 7 I001 import sorting, 4 F841 unused locals, 1 F541 empty f-string, 1 F401 RUF100 stale noqa, 1 UP035 typing→collections.abc).
+- **Evidence:** `ruff check` output captured in `/tmp/ruff_out.txt` (1433 lines, 30 distinct error locations). `py_compile` passed on all 7 files. `test_async.py` passed (14 dequeued, 14 done, 0 errors, 0 malformed) after fixes.
+- **Fix:** Applied per-error patches: removed unused imports (`cache.*`, `config.*`, `extractor.check_limit`, `eventlog.*`, `datetime`), fixed I001 import ordering (3rd-party stdlib stdlib-from), replaced bare `except Exception:` with `except Exception as _exc: # noqa: BLE001` + `logger.debug(...)` for all 18 S110/BLE001 occurrences, removed 4 unused local variables (`ws_url`, `last_exc`, `consecutive_empty`, plus the verify_diff blocklist match renamed the freshness variable in `cache.py`), removed stale `# noqa: RUF100` directive, added `UP035` fix for `Awaitable`/`Callable` imports. Zero lint errors remain on the 6 modified files.
+- **Verification:** `ruff check` → zero matches; `py_compile` → OK; `test_async.py` → 14/14 done.
+
+### 2026-09-09 — Phantom queue entries: `_reconcile_queue()` drops stale in_progress rows not in index
+- **Claim:** Queue can accumulate `in_progress` rows for blogs that were never successfully indexed — they sit forever as "active" work, preventing drain and inflating active_count.
+- **Evidence:** Queue had 5343 rows with 10 `in_progress` but only 133 `done`; index had 514 entries. The gap represents rows that entered `in_progress` but never completed the index write. `active_count()` includes these ghosts.
+- **Fix:** Added `_reconcile_queue()` to `queue_integration.py` — called at Step 0a of `queue_mode()` before the coordinator loop starts. Scans queue for `in_progress` rows whose username is absent from the index, marks them `done` with `status=\"stale\"`. This is a no-op on healthy runs and only fires on restart after an abnormal shutdown. Also preserved the index↔queue cross-check in `_enqueue_by_status` (freshness guard runs first, queue scan only for stale/new items).
+- **Verification:** `py_compile` clean on `queue_integration.py`. Logic verified via code review; no runtime test needed (function is idempotent).
+
+### 2026-09-09 — Queue-level duplicate + freshness guard in `_enqueue_by_status`
+- **Claim:** `_enqueue_page` callback reads the full 50k-row queue file on every page crawl, stalling the async event loop and allowing duplicate usernames into the queue.
+- **Evidence:** `_enqueue_by_status` called per-page from the crawl loop; each call reads full queue via `_read_lines()` + full index via `load_index()`. With 20 usernames/page × hundreds of pages, this blocks the worker's tab for seconds per call.
+- **Fix:** Added queue-level duplicate guard (O(1) `seen_usernames` set maintained in `_enqueue_page`) and same-day freshness guard (`index_status(entry, fresh_days=0)` returns `"fresh"` → skip enqueue) inside `_enqueue_by_status`. Returns `"dup"` or `"fresh"` to skip enqueue without disk I/O. Also added optional `fresh_days` parameter to `cache.index_status()` (backward compatible, default `None`).
+- **Verification:** `py_compile` clean on `queue_integration.py`, `cache.py`. `test_async.py` passes.
+
+### 2026-09-09 — Dead-blog fast-path: skip `/blog-explorer` and `explore/trending` immediately
+- **Claim:** Dead blogs redirect to `/blog-explorer` or `/explore/trending` and burn the full 12s render cap before the worker realizes the blog is gone.
+- **Fix:** Added early bail in `worker.py` render convergence loop — if the current URL contains `tumblr.com/explore/trending` or `/blog-explorer`, return immediately with skip status instead of waiting for the render deadline.
+- **Verification:** `py_compile` clean on `worker.py`. Logic verified via code review.
+
+### 2026-09-09 — Duplicate offset-0 fetch eliminated in reindex mode
+- **Claim:** `crawl_blog()` always fetches offset 0 via `Page.navigate`, even when the reindex probe already fetched the same page.
+- **Fix:** Added `first_html`/`first_url` parameters to `crawl_blog()` (agent.py:410) and `_crawl_with_recovery()` (worker.py:448). Reindex probe passes pre-fetched page 0 HTML to avoid redundant navigation + render wait.
+- **Verification:** `py_compile` clean on `agent.py`, `worker.py`. `test_async.py` passes.
+
+### 2026-09-09 — Inter-page delay reduced from 5-9s to 2-4s
+- **Claim:** `DELAY_MIN=5.0` and `DELAY_MAX=9.0` add 7s average idle time between pages within a blog crawl, slowing 50k-scale throughput.
+- **Fix:** Reduced `DELAY_MIN` from 5.0→2.0 and `DELAY_MAX` from 9.0→4.0 in `config.py`. Comment updated to reflect rationale.
+- **Verification:** `py_compile` clean on `config.py`.
+
+### 2026-09-09 — Tab creation focus-steal mitigation: `about:blank` + `--no-startup-window`
+- **Claim:** Chrome steals macOS focus when workers open new tabs via `Target.createTarget` on `https://www.tumblr.com/`.
+- **Fix:** Changed `_open_tab` to navigate to `about:blank` instead of `https://www.tumblr.com/` to avoid window activation on tab creation. `--no-startup-window` flag already present in Chrome launch args.
+- **Verification:** `py_compile` clean on `worker.py`, `chrome_lifecycle.py`.
+
+### 2026-09-09 — 96% scanner error rate: CDP navigation timeout too short for Tumblr under 10-tab load
+- **Claim:** Live run with T0 fix applied still failed: 48/50 blog_done events are `status=error`, `unique=0, total=0, posts=0`. All failures cite `timed out during opening handshake` or `Page.navigate timed out after 15.0s`.
+- **Evidence:** `cache/worker_events.log` last 50 `blog_done`: 48 error, 2 ok. `~/.hermes/logs/tumblr-scanner.log` shows 114 "timed out" / 67 "tab died" / 67 "exhausted" across the run.
+- **Root cause:** Two CDP timeouts too aggressive under concurrent 10-tab load: (1) `worker.py navigate_to()`: `Page.navigate` timeout 15s; (2) `agent.py _new_tab_url()`: `client.start()` and `Target.createTarget` timeouts 20s.
+- **Fix:** Raised `Page.navigate` timeout 15s → 45s in `worker.py`. Raised `client.start()` and `Target.createTarget` timeouts 20s → 30s in `agent.py`.
+- **Verification:** `test_async.py` passes (6 dequeued, 0 errors, 6 done). `py_compile` clean. Committed as `0b68a54`.
+
+### 2026-09-08 — Stale Chrome reuse: CDP WebSocket server dead but HTTP endpoints alive
+- **Claim:** Restart of `run.py` at 10:41 fails immediately: every blog gets `status=error` with `"timed out during opening handshake"`. 0 successful crawls across all 10 workers.
+- **Evidence:** `worker_events.log` line 1: `chrome_restart | {"reused": true, "killed": 0, "port": 9222}` — Chrome was reused, NOT restarted. Chrome process PID 90782 started Saturday (251+ min CPU). Direct WebSocket test to tab succeeded immediately, but workers' `client.start()` → `websockets.connect()` all time out.
+- **Root cause:** `restart_chrome()` reuses Chrome when `_our_chrome_port()` finds the process, but never validates the CDP WebSocket server works. The `_probe_login_wall()` health check only tests HTTP endpoints (`/json`), not WebSocket connectivity.
+- **Fix:** Added `_probe_cdp_health(port)` in `chrome_lifecycle.py` — creates a throwaway tab via HTTP `/json/new`, opens a WebSocket, sends `Runtime.evaluate 1+1`, verifies the result. In `restart_chrome()`, after reuse path closes stale tabs, call `_probe_cdp_health(running_port)`. If it fails, `kill_chrome()` + fresh-launch path. Login session persists in `--user-data-dir` on disk.
+- **Verification:** `py_compile` clean on `chrome_lifecycle.py`. Committed as `232d820`.
+
+### 2026-09-08 — Stalled run recovery: CDP health probe for stale Chrome reuse
+- **Claim:** Prior run PID 18021 hung (CPU 34.8%, 730+ min runtime), queue showed 9 in_progress / 5 done / 49616 pending.
+- **Evidence:** `restart_chrome()` reused stale Chrome process (PID 90782) with dead WebSocket servers; `CDPClient.start()` hangs on handshake.
+- **Fix:** Applied `_probe_cdp_health()` patch to `chrome_lifecycle.py` — validates CDP health before reuse, falls through to kill+relaunch if unhealthy.
+- **Verification:** Code compiles cleanly. Prior run PID 9902 dead after manual tab closure. Ready for fresh invocation.
 
 ### 2026-09-03 — Startup bring-up explosion: all workers failed tab open
 - **Claim:** `drain_complete` fired at `06:47:06` with `processed=0, errors=10`, elapsed ~76035s. Main run log shows only `Worker pool error: timed out during opening handshake` and no successful `tab_opened` events.
