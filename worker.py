@@ -644,12 +644,17 @@ class Worker:
         if cached:
             cached_usernames = set(cached.get("usernames", []))
             current_usernames = set()
-            # Extract usernames from current page
+            # Extract usernames from current page — Tumblr embeds blog
+            # names in @handle format and data-username attributes.
+            # The old regex r'"([^"]+)"' matched every JSON string in the
+            # page body (post slugs, URLs, timestamps), producing false
+            # positives that made the reindex skip fire incorrectly.
             import re
-            matches = re.findall(r'"([^"]+)"', html)
-            for m in matches:
-                if m.startswith("@"):
-                    current_usernames.add(m[1:].lower())
+            # Match @ username mentions and data-username="..." attributes
+            handles = re.findall(r'@([a-zA-Z0-9\-_]+)', html)
+            attrs = re.findall(r'data-username=["\']([a-zA-Z0-9\-_]+)["\']', html)
+            current_usernames.update(h.lower() for h in handles)
+            current_usernames.update(a.lower() for a in attrs)
 
             if cached_usernames == current_usernames:
                 return {"skip": True, "reason": "no_new_usernames"}

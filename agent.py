@@ -210,6 +210,7 @@ async def fetch_page_html(
                 "expression": "JSON.stringify({url: location.href, text: (document.body ? document.body.innerText : '').slice(0, 800)})",
                 "returnByValue": True,
             },
+            timeout=10.0,
         )
         snap = json.loads(res.get("result", {}).get("result", {}).get("value", "{}"))
         snap_url = snap.get("url", "")
@@ -241,6 +242,7 @@ async def fetch_page_html(
                     ),
                     "returnByValue": True,
                 },
+                timeout=10.0,
             )
         except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail during scroll; best-effort
             logger.debug("Scroll JS evaluation failed for %s: %s", username, _exc)
@@ -253,6 +255,7 @@ async def fetch_page_html(
                     "expression": "document.querySelectorAll('[data-cell-id]').length",
                     "returnByValue": True,
                 },
+                timeout=10.0,
             )
             cell_count = int(res.get("result", {}).get("result", {}).get("value", 0) or 0)
         except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail; default to 0 cells
@@ -277,6 +280,7 @@ async def fetch_page_html(
                     "expression": "document.body ? document.body.innerText : ''",
                     "returnByValue": True,
                 },
+                timeout=10.0,
             )
             new_text = result.get("result", {}).get("result", {}).get("value", "")
             if new_text:
@@ -303,6 +307,7 @@ async def fetch_page_html(
                 "expression": "JSON.stringify({html: document.documentElement.outerHTML, url: location.href})",
                 "returnByValue": True,
             },
+            timeout=10.0,
         )
         payload = result.get("result", {}).get("result", {}).get("value", "{}")
         try:
