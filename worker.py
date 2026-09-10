@@ -63,15 +63,15 @@ def _hide_chrome_window() -> None:
             [
                 "osascript",
                 "-e",
-                "tell application \"Google Chrome\" to set visible of front window to false",
+                'tell application "Google Chrome" to set visible of front window to false',
             ],
             timeout=3,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    except Exception:  # noqa: BLE001 — best-effort focus suppression
-        pass
+    except Exception as exc:  # noqa: BLE001 — best-effort focus suppression
+        logger.debug("Hide Chrome window failed: %s", exc)
 
 
 class Worker:
@@ -232,6 +232,7 @@ class Worker:
         in-flight requests from the render poll, surfacing as TabDeadError.
         """
         from cdp_use import CDPClient
+
         from cdp_wrapper import cdp_send
 
         if self._cdp_client is not None:
@@ -250,7 +251,7 @@ class Worker:
                     self.worker_id,
                 )
                 return self._cdp_client
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.warning(
                     "Worker %d: cached CDP client dead, recreating",
                     self.worker_id,
@@ -339,6 +340,60 @@ class Worker:
             # polling to silently fail with empty results.
             await asyncio.sleep(1.0)
 
+            # ---- Immediate dead-phrase check ----
+            # Fast-path: after a brief initial load delay, do a single
+            # Runtime.evaluate to check if the page already shows a
+            # known dead-phrase. If so, we can bail immediately without
+            # running the full 12s render-convergence poll — saving
+            # ~12s per dead/dead-walled blog across 10 concurrent tabs.
+            try:
+                early = await cdp_send(
+                    client,
+                    "Runtime.evaluate",
+                    {
+                        "expression": (
+                            "JSON.stringify({"
+                            "text: (document.body ? document.body.innerText : '').slice(0, 2000), "
+                            "url: location.href"
+                            "})"
+                        ),
+                        "returnByValue": True,
+                    },
+                    timeout=8.0,
+                )
+                early_text = ""
+                if isinstance(early, dict):
+                    val = early.get("result", {}).get("result", {}).get("value")
+                    if val is None:
+                        val = early.get("result", {}).get("value")
+                    if isinstance(val, str):
+                        # returnByValue: True returns a JSON-encoded string
+                        import json as _json
+                        try:
+                            parsed = _json.loads(val)
+                            early_text = parsed.get("text", "") if isinstance(parsed, dict) else val
+                        except (json.JSONDecodeError, ValueError):
+                            early_text = val
+                elif isinstance(early, str):
+                    early_text = early
+                if early_text:
+                    low_early = early_text.lower()
+                    _is_dead = any(phrase in low_early for phrase in DEAD_PHRASES)
+                    if _is_dead:
+                        logger.debug(
+                            "Worker %d: immediate dead-phrase hit for %s, "
+                            "skipping render poll",
+                            self.worker_id,
+                            username,
+                        )
+                        return "", ""
+            except Exception as _exc:  # noqa: BLE001
+                logger.debug(
+                    "Worker %d: early dead-phrase check failed (non-fatal): %s",
+                    self.worker_id,
+                    _exc,
+                )
+
             # ---- Render convergence gate (fast + deterministic) ----
             # Tumblr is an SPA: text can appear before post cells finish
             # rendering, and stale content from a previous blog can index
@@ -376,15 +431,13 @@ class Worker:
                                 "JSON.stringify({"
                                 "url: location.href, "
                                 "text: (document.body ? document.body.innerText : '').slice(0, 500), "
-                                "posts: Math.max("
-                                "document.querySelectorAll('div[data-cell-id*=\"-post-\"]').length, "
-                                "document.querySelectorAll('article').length"
-                                ")"
+                                "shell_articles: document.querySelectorAll('article').length, "
+                                "post_cells: document.querySelectorAll('div[data-cell-id*=\\\"-post-\\\"]').length"
                                 "})"
                             ),
                             "returnByValue": True,
                         },
-                        timeout=5.0,
+                        timeout=10.0,
                     )
                     logger.debug(
                         "Worker %d: render poll raw result keys=%s for %s",
@@ -413,8 +466,8 @@ class Worker:
                         snap = json.loads(val)
                         cur_url = snap.get("url", "")
                         cur_text = snap.get("text", "")
-                        cur_cells = snap.get("cells", 0)
-                        cur_posts = snap.get("posts", 0)
+                        cur_cells = snap.get("post_cells", 0)
+                        cur_posts = cur_cells
                     except Exception as _exc:  # noqa: BLE001 — JSON parse may fail on partial CDP response
                         logger.debug("Render state JSON parse failed: %s", _exc)
                         cur_url = ""
@@ -523,14 +576,14 @@ class Worker:
                     "expression": "JSON.stringify({html: document.documentElement.outerHTML, url: location.href})",
                     "returnByValue": True,
                 },
-                timeout=5.0,
+                timeout=10.0,
             )
-            payload = result.get("result", {}).get("value", "{}")
+            payload = result.get("result", {}).get("result", {}).get("value", "{}")
             try:
                 data = json.loads(payload)
                 html = data.get("html", "")
                 final_url = data.get("url", "")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 html = payload
                 final_url = ""
             return html, final_url
@@ -783,7 +836,7 @@ class Worker:
                         "dead_reason": "tab_recovery_exhausted",
                         "source_blog": None,
                     }
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "Worker %d: unexpected error crawling %s: %s",
                     self.worker_id,
@@ -846,12 +899,20 @@ class Worker:
         enqueued = 0
 
         try:
-            await self._open_tab()
-            logger.info(
-                "Worker %d: tab opened, waiting 500ms for Chrome to register tab",
-                self.worker_id,
-            )
-            await asyncio.sleep(0.5)
+            if self.target_id is not None and self.ws_url is not None:
+                # Tab was preset (e.g. worker 0 reusing the pre-flight T0 tab)
+                logger.info(
+                    "Worker %d: reusing preset tab targetId=%s (skipping _open_tab)",
+                    self.worker_id, self.target_id,
+                )
+                ev(f"worker{self.worker_id}", "tab_reused", target_id=self.target_id)
+            else:
+                await self._open_tab()
+                logger.info(
+                    "Worker %d: tab opened, waiting 500ms for Chrome to register tab",
+                    self.worker_id,
+                )
+                await asyncio.sleep(0.5)
 
             while not self.wall_halt.is_set():
                 item = dequeue(queue_path)
@@ -948,7 +1009,7 @@ class Worker:
                             processed += 1
                             self.busy_event.clear()
                             continue
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         import traceback
                         logger.warning(
                             "Worker %d: reindex probe failed for %s: %s\n%s",
@@ -970,7 +1031,7 @@ class Worker:
                 # NFR-9: refresh WS URL before each blog
                 await self._refresh_ws_url()
 
-                ev("worker%d" % self.worker_id, "blog_start", username=username, tier=tier, mode=mode)
+                ev(f"worker{self.worker_id}", "blog_start", username=username, tier=tier, mode=mode)
 
                 # Enqueue callback — called by agent per-page
                 def _enqueue_page(seed: str, users: list[str], t: int) -> None:
@@ -1030,12 +1091,12 @@ class Worker:
                         self.worker_id,
                         username,
                     )
-                    ev("worker%d" % self.worker_id, "login_wall", username=username, reason="LoginWallDetected-raised")
+                    ev(f"worker{self.worker_id}", "login_wall", username=username, reason="LoginWallDetected-raised")
                     self.wall_halt.set()
                     self.busy_event.clear()
                     logger.error("WORKER_TRACE: busy_event.clear after login_wall")
                     raise
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     logger.error(
                         "Worker %d: agent crashed for %s: %s",
                         self.worker_id,
@@ -1081,7 +1142,7 @@ class Worker:
                 }
                 _write_index(self.index_path, username, index_entry)
 
-                ev("worker%d" % self.worker_id, "blog_done", username=username, status=result.get("status"), unique=_u, total=_t, posts=_p, unchanged=_unchanged)
+                ev(f"worker{self.worker_id}", "blog_done", username=username, status=result.get("status"), unique=_u, total=_t, posts=_p, unchanged=_unchanged)
 
                 logger.info(
                     "Worker %d: done %s status=%s unique=%d%s",

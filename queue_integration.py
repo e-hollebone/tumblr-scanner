@@ -2,7 +2,8 @@
 
 Architecture:
   1. Fresh Chrome restart (dedicated profile, never touches user's Chrome).
-  2. Pre-flight login wall gate: open 1 tab to T0 blog, BLOCK if login wall.
+  2. Pre-flight login wall gate: open 1 tab to about:blank, check Tumblr homepage
+     for login wall. The tab is REUSED by worker 0 for the T0 crawl.
   3. Seed blog is the FIRST queue item. Workers start immediately.
   4. Each worker owns ONE tab for its entire lifetime.
   5. Worker pulls a blog → crawls page-by-page → enqueues discoveries.
@@ -67,17 +68,23 @@ LOGIN_WALL_POLL_INTERVAL = 10.0  # re-check every 10s while waiting
 async def _preflight_t0_login_check(
     browser_ws: str,
     target_blog: str,
-) -> bool:
-    """Open one tab to the T0 blog and wait for login wall to clear.
+) -> tuple[bool, str | None, str | None, Any | None]:
+    """Open one tab (about:blank) and verify Tumblr login wall has cleared.
 
-    This is a blocking gate: Chrome is started with 1 tab navigated to the
-    seed blog. If a login wall is detected (Tumblr redirects to /login),
-    we poll every ``LOGIN_WALL_POLL_INTERVAL`` seconds until the wall
-    clears or ``LOGIN_WALL_WAIT_TIMEOUT`` elapses. Only after the T0 blog
-    loads successfully is the worker pool allowed to start — otherwise all
-    10 workers would immediately hit the same wall and churn.
+    This is a blocking gate: a single tab is opened to about:blank, then
+    navigated to the Tumblr homepage (https://www.tumblr.com) to verify the
+    login session is valid. If a login wall is detected (redirect to /login
+    or login-wall phrases), we poll every LOGIN_WALL_POLL_INTERVAL seconds
+    until the wall clears or LOGIN_WALL_WAIT_TIMEOUT elapses. Only after
+    the homepage loads successfully is the worker pool allowed to start —
+    otherwise all workers would immediately hit the same wall and churn.
 
-    Returns True if T0 is accessible (no wall), False if timed out waiting.
+    The tab is NOT closed on success — the live CDP client is returned to the
+    caller so worker 0 can reuse it for the T0 crawl without a connect/
+    disconnect cycle. One tab, one CDP session, no churn.
+
+    Returns (accessible, ws_url, target_id, cdp_client).
+    On failure: (False, None, None, None).
 
     Args:
         browser_ws: browser HTTP endpoint (e.g. ``http://127.0.0.1:9223``).
@@ -91,143 +98,135 @@ async def _preflight_t0_login_check(
     from cdp_wrapper import cdp_send
 
     ws_url, target_id = None, None
+    tab_should_close = True  # True if preflight fails/times out — close tab
     deadline = time.monotonic() + LOGIN_WALL_WAIT_TIMEOUT
 
     try:
-        # Open a single tab to the T0 blog. _new_tab_url accepts the
-        # browser HTTP endpoint (it calls _extract_browser_ws internally).
+        # Open a single tab to about:blank. The login wall check then
+        # navigates to the Tumblr homepage (https://www.tumblr.com) to verify
+        # the login session is valid — NOT to the T0 blog. Worker 0 will
+        # take ownership of this tab and perform the actual T0 crawl
+        # (page-by-page extraction, username collection, indexing).
+        # Checking the homepage (not T0) avoids polluted page state before
+        # worker 0's render poll runs.
         ws_url, target_id = await _new_tab_url(
-            browser_ws, f"https://www.tumblr.com/{target_blog}"
+            browser_ws, "about:blank"
         )
-        logger.info("Pre-flight: opened tab %s for T0 blog %s", target_id, target_blog)
+        logger.info("Pre-flight: opened tab %s for login wall check", target_id)
 
-        # Give the page time to start loading after tab creation
-        await _aio.sleep(2.0)
+        # Give the tab time to register after creation
+        await _aio.sleep(1.0)
 
         while time.monotonic() < deadline:
+            client = CDPClient(ws_url)
             try:
-                client = CDPClient(ws_url)
                 await _aio.wait_for(client.start(), timeout=30.0)
-                try:
-                    # Enable Page domain, then navigate explicitly to the T0 blog.
-                    logger.info("Pre-flight: enabling Page domain")
-                    await cdp_send(client, "Page.enable", {}, timeout=10.0)
-                    logger.info("Pre-flight: navigating to https://www.tumblr.com/%s", target_blog)
-                    nav_result = await cdp_send(
-                        client, "Page.navigate",
-                        {"url": f"https://www.tumblr.com/{target_blog}"},
-                        timeout=45.0,
+                # Enable Page domain, then navigate to Tumblr homepage to
+                # check for login wall. We check the homepage (not T0) so
+                # the tab's page state is not polluted with T0's content
+                # before worker 0's render poll runs. Worker 0 will take
+                # ownership of this tab and perform the actual T0 crawl
+                # (page-by-page extraction, username collection, indexing).
+                logger.info("Pre-flight: enabling Page domain")
+                await cdp_send(client, "Page.enable", {}, timeout=10.0)
+                logger.info("Pre-flight: navigating to https://www.tumblr.com")
+                nav_result = await cdp_send(
+                    client, "Page.navigate",
+                    {"url": "https://www.tumblr.com"},
+                    timeout=45.0,
+                )
+                logger.info("Pre-flight: Page.navigate returned: %s", nav_result)
+
+                # Poll for page content to appear (SPA may still be rendering)
+                page_ready = False
+                final_url = ""
+                page_text = ""
+                best_url = ""
+                best_text = ""
+                sub_deadline = time.monotonic() + 20.0
+                while time.monotonic() < sub_deadline:
+                    try:
+                        result = await cdp_send(
+                            client,
+                            "Runtime.evaluate",
+                            {
+                                "expression": (
+                                    "JSON.stringify({url: location.href, "
+                                    "text: (document.body ? document.body.innerText : '').slice(0, 500)"
+                                    "})"
+                                ),
+                                "returnByValue": True,
+                            },
+                            timeout=15.0,
+                        )
+                        val = result.get("result", {}).get("result", {}).get("value", "{}")
+                        if not val or val == "{}":
+                            alt_val = result.get("result", {}).get("value", "{}")
+                            if alt_val and alt_val != "{}":
+                                val = alt_val
+                        import json as _json
+                        snap = _json.loads(val)
+                        final_url = snap.get("url", "")
+                        page_text = snap.get("text", "")
+                        logger.debug(
+                            "Pre-flight: evaluated — url=%s, text_len=%d",
+                            final_url[:80], len(page_text),
+                        )
+                        if final_url and not best_url:
+                            best_url = final_url
+                        if page_text and not best_text:
+                            best_text = page_text
+                        if final_url and page_text:
+                            page_ready = True
+                            break
+                    except Exception as eval_exc:  # noqa: BLE001
+                        logger.debug("Pre-flight: Runtime.evaluate failed: %s", eval_exc)
+                    await _aio.sleep(1.0)
+
+                if not page_ready:
+                    logger.info(
+                        "Pre-flight: page not ready (url=%s) — waiting...",
+                        best_url[:80],
                     )
-                    logger.info("Pre-flight: Page.navigate returned: %s", nav_result)
-
-                    # Poll for page content to appear (SPA may still be rendering)
-                    page_ready = False
-                    final_url = ""
-                    page_text = ""
-                    posts_rendered = 0
-                    # Track best sample: URL + text may appear before posts render
-                    best_url = ""
-                    best_text = ""
-                    best_posts = 0
-                    sub_deadline = time.monotonic() + 20.0
-                    while time.monotonic() < sub_deadline:
-                        try:
-                            result = await cdp_send(
-                                client,
-                                "Runtime.evaluate",
-                                {
-                                    "expression": (
-                                        "JSON.stringify({url: location.href, "
-                                        "text: (document.body ? document.body.innerText : '').slice(0, 500), "
-                                        "posts: (function(){"
-                                        "var p=document.querySelectorAll('div[data-cell-id*=\"-post-\"]').length;"
-                                        "var a=document.querySelectorAll('article').length;"
-                                        "return Math.max(p,a);"
-                                        "}())})"
-                                    ),
-                                    "returnByValue": True,
-                                },
-                                timeout=15.0,
-                            )
-                            val = result.get("result", {}).get("result", {}).get("value", "{}")
-                            if not val or val == "{}":
-                                alt_val = result.get("result", {}).get("value", "{}")
-                                if alt_val and alt_val != "{}":
-                                    val = alt_val
-                            import json as _json
-                            snap = _json.loads(val)
-                            final_url = snap.get("url", "")
-                            page_text = snap.get("text", "")
-                            posts_rendered = snap.get("posts", 0)
-                            logger.debug(
-                                "Pre-flight: evaluated — url=%s, posts=%d, text_len=%d",
-                                final_url[:80], posts_rendered, len(page_text),
-                            )
-                            # Track best sample
-                            if final_url and not best_url:
-                                best_url = final_url
-                            if page_text and not best_text:
-                                best_text = page_text
-                            best_posts = max(best_posts, posts_rendered)
-
-                            # Only declare ready when we have BOTH text AND posts.
-                            # Tumblr's SPA renders text before post cells appear, so
-                            # breaking on text alone causes false 0-post reads.
-                            if final_url and page_text and posts_rendered > 0:
-                                page_ready = True
-                                break
-                        except Exception as eval_exc:  # noqa: BLE001
-                            logger.debug("Pre-flight: Runtime.evaluate failed: %s", eval_exc)
-                        await _aio.sleep(1.0)
-
-                    if not page_ready:
+                else:
+                    # Check for login wall: redirect to /login or login phrases
+                    is_wall, reason = detect_login_wall_detail(best_text, "", best_url)
+                    low_url = best_url.lower()
+                    if is_wall or "/login" in low_url or "signup" in low_url:
                         logger.info(
-                            "Pre-flight: T0 blog %s page not ready (url=%s, posts=%d) — waiting...",
-                            target_blog, best_url[:80], best_posts,
+                            "Pre-flight: login wall detected (reason=%s, url=%s) — waiting for user login...",
+                            reason, best_url[:80],
                         )
                     else:
-                        is_wall, reason = detect_login_wall_detail(best_text, "", best_url)
-                        if is_wall:
-                            logger.info(
-                                "Pre-flight: T0 blog %s behind login wall (reason=%s, url=%s) — waiting for user login...",
-                                target_blog, reason, best_url[:80],
-                            )
-                        elif target_blog.lower().replace("-", "").replace("_", "") not in best_url.lower().replace("-", "").replace("_", ""):
-                            logger.info(
-                                "Pre-flight: T0 blog %s not in URL (%s) — may be a redirect, waiting...",
-                                target_blog, best_url[:80],
-                            )
-                        elif best_posts < 1:
-                            logger.info(
-                                "Pre-flight: T0 blog %s loaded but only %d posts rendered (url=%s) — waiting for full render...",
-                                target_blog, best_posts, best_url[:80],
-                            )
-                        else:
-                            logger.info(
-                                "Pre-flight: T0 blog %s verified (%d posts, url=%s) — proceeding to workers",
-                                target_blog, best_posts, best_url[:80],
-                            )
-                            return True
-                finally:
-                    await client.stop()
+                        logger.info(
+                            "Pre-flight: Tumblr homepage accessible (url=%s) — proceeding to workers",
+                            best_url[:80],
+                        )
+                        # Tab is verified good. Do NOT stop the CDP client —
+                        # return the live client to worker 0 so it can reuse
+                        # the same tab + CDP session. One tab, one session, no churn.
+                        logger.info("Pre-flight: returning live CDP client to worker 0 (no disconnect)")
+                        tab_should_close = False
+                        return True, ws_url, target_id, client
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Pre-flight: CDP check failed for %s: %s — retrying", target_blog, exc)
-
+                logger.warning("Pre-flight: CDP check failed: %s — retrying", exc)
+            # Stop the client on failure — the tab is still open but we get a
+            # fresh client on the next polling iteration.
+            await client.stop()
             # Wait and re-check after potential login
             await _aio.sleep(LOGIN_WALL_POLL_INTERVAL)
-
     finally:
-        if target_id:
+        if target_id and tab_should_close:
             try:
                 await close_tab(browser_ws, target_id)
             except Exception as _exc:  # noqa: BLE001 — tab cleanup may fail during login wall timeout; best-effort
                 logger.debug("Login wall probe tab close failed: %s", _exc)
 
     logger.error(
-        "Pre-flight: login wall timeout (%.0fs) exceeded for T0 blog %s — proceeding anyway",
-        LOGIN_WALL_WAIT_TIMEOUT, target_blog,
+        "Pre-flight: login wall timeout (%.0fs) exceeded — proceeding anyway",
+        LOGIN_WALL_WAIT_TIMEOUT,
     )
-    return False
+    return False, None, None, None
 
 
 def _index_lock_path(path: Path) -> Path:
@@ -388,6 +387,9 @@ async def _drain_queue(
     browser_ws: str,
     pool_size: int = WORKER_POOL_SIZE,
     wall_halt: asyncio.Event | None = None,
+    t0_ws_url: str | None = None,
+    t0_target_id: str | None = None,
+    t0_cdp_client: Any | None = None,
 ) -> dict[str, Any]:
     """Drain the queue using a pool of workers. Parallel from first extraction.
 
@@ -499,7 +501,10 @@ async def _drain_queue(
     # for the live dashboard (offset, post count, render convergence).
     worker_instances: list[Worker] = []
 
-    async def _run_worker(instances: list[Worker], wid: int):
+    async def _run_worker(instances: list[Worker], wid: int,
+                          preset_ws_url: str | None = None,
+                          preset_target_id: str | None = None,
+                          preset_cdp_client: Any | None = None):
         w = Worker(
             worker_id=wid,
             browser_ws=browser_ws,
@@ -511,11 +516,21 @@ async def _drain_queue(
             set_current_cb=_make_set_current_cb(wid),
             stats_cb=_make_stats_cb(),
         )
+        # Worker 0 reuses the preflight tab + CDP session when available.
+        if (preset_ws_url is not None and preset_target_id is not None
+                and preset_cdp_client is not None):
+            w.ws_url = preset_ws_url
+            w.target_id = preset_target_id
+            w._cdp_client = preset_cdp_client
+            logger.info("Worker 0: reusing preflight tab + CDP session (no reconnect)")
         instances.append(w)
         return await w.run(queue_path)
 
     worker_tasks = [
-        asyncio.create_task(_run_worker(worker_instances, i))
+        asyncio.create_task(_run_worker(worker_instances, i,
+                                        preset_ws_url=t0_ws_url if i == 0 else None,
+                                        preset_target_id=t0_target_id if i == 0 else None,
+                                        preset_cdp_client=t0_cdp_client if i == 0 else None))
         for i in range(pool_size)
     ]
 
@@ -754,7 +769,8 @@ async def queue_mode(
     """Run the queue-mode pipeline: fresh Chrome, worker pool, parallel from first extraction.
 
     1. Kill + restart Chrome
-    2. Pre-flight login wall gate: open 1 tab to T0 blog, wait if wall detected
+    2. Pre-flight login wall gate: open 1 tab to about:blank, check Tumblr homepage
+       for login wall. The tab is REUSED by worker 0 for the T0 crawl.
     3. Repair stale queue entries from prior crashed runs
     4. Enqueue the seed blog as the FIRST queue item (tier 0)
     5. Start the worker pool — workers pull from the queue immediately
@@ -809,18 +825,23 @@ async def queue_mode(
         logger.info("Step 0: repaired %d stale queue entries", repaired)
         ev("pipeline", "queue_repaired", entries=repaired)
 
-    # Step 1.5: Pre-flight login wall gate for T0.
-    # Open ONE tab to the seed blog and verify it loads (no login wall).
+    # Step 1.5: Pre-flight login wall gate.
+    # Open ONE tab to about:blank, navigate to https://www.tumblr.com to verify
+    # the login session is valid (no redirect to /login or login-wall phrases).
     # If Tumblr redirects to /login, BLOCK here — wait for the user to log in
     # — before starting the worker pool. This prevents all 10 workers from
     # simultaneously hitting the wall and churning through MAX_RECOVERY
     # retries on every blog.
+    # The verified tab is NOT closed — it is passed to worker 0, which will
+    # navigate it to T0 and perform the full crawl (page-by-page extraction,
+    # username collection, indexing). The tab is at the Tumblr homepage after
+    # the preflight check, so worker 0's navigate_to() handles the T0
+    # navigation + render poll from scratch.
     # The login session lives in --user-data-dir on disk; the user can open
-    # Chrome (port 9222/9223) and log in to Tumblr. This pre-flight polls
-    # until the T0 blog's final URL is no longer a login/signup redirect.
-    logger.info("Step 1.5: Pre-flight login wall check for T0 blog: %s", target_blog)
-    t0_accessible = await _preflight_t0_login_check(actual_browser_ws, target_blog)
-    ev("pipeline", "t0_preflight", blog=target_blog, accessible=t0_accessible)
+    # Chrome (port 9222/9223) and log in to Tumblr.
+    logger.info("Step 1.5: Pre-flight login wall check (Tumblr homepage)")
+    t0_accessible, t0_ws_url, t0_target_id, t0_cdp_client = await _preflight_t0_login_check(actual_browser_ws, target_blog)
+    ev("pipeline", "t0_preflight", blog=target_blog, accessible=t0_accessible, tab_reused=bool(t0_target_id))
     if not t0_accessible:
         # The user may not have logged in yet; we still proceed so they can
         # use Ctrl+C to stop and log in, but most workers will hit the wall
@@ -849,6 +870,9 @@ async def queue_mode(
         browser_ws=actual_browser_ws,
         pool_size=pool_size,
         wall_halt=wall_halt,
+        t0_ws_url=t0_ws_url,
+        t0_target_id=t0_target_id,
+        t0_cdp_client=t0_cdp_client,
     )
 
     total_elapsed = time.monotonic() - overall_start

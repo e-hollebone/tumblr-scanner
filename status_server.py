@@ -160,7 +160,7 @@ def _tail_events(log_path: Path, n: int = 8) -> list[str]:
             return []
         with open(log_path, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
     out: list[str] = []
     for line in lines[-(n * 4):]:
@@ -174,7 +174,7 @@ def _tail_events(log_path: Path, n: int = 8) -> list[str]:
         # ts like 2026-08-28T19:25:34.347-04:00
         try:
             t_part = ts_raw.split("T")[1].split(".")[0] if "T" in ts_raw else ts_raw[-8:]
-        except Exception:
+        except Exception:  # noqa: BLE001
             t_part = ts_raw[-8:]
         # rest = " INFO source | event | {json}"
         rest = line[bracket + 1:].strip()
@@ -185,7 +185,7 @@ def _tail_events(log_path: Path, n: int = 8) -> list[str]:
         evt = parts[1].strip()
         try:
             d = json.loads(parts[2].strip())
-        except Exception:
+        except Exception:  # noqa: BLE001
             d = {}
         username = d.get("username", "?")
         if evt == "page_fetched":

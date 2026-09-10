@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Companion search over the Tumblr index (cache/index.json).
 
 Lets you find whether a given username (the "target") is in the crawl index,
@@ -232,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         via = f" (via {r['via']})" if r["via"] else ""
         print(
             f"{r['match']:8} {r['target_blog']:42} t{r['tier']} "
-            f"{str(r['status']):12} u={r['unique']:>4} p={r['posts']:>4}{via}"
+            f"{r['status']!s:12} u={r['unique']:>4} p={r['posts']:>4}{via}"
         )
     return 0
 
