@@ -26,6 +26,7 @@ from agent import (
     crawl_blog,
 )
 from config import (
+    DEAD_PHRASES,
     DELAY_MAX,
     DELAY_MIN,
     LIMITS_BY_TIER,
@@ -46,6 +47,31 @@ from eventlog import info as ev
 from work_queue import _increment_fail_count, dequeue, mark_done
 
 logger = logging.getLogger("worker")
+
+
+def _hide_chrome_window() -> None:
+    """Hide Chrome's main window to prevent focus steal on macOS.
+
+    Called immediately after Target.createTarget, which is what triggers
+    the activation. Uses AppleScript to set Chrome's visible state to false.
+    Best-effort — fails silently if Chrome isn't the front app.
+    """
+    import subprocess
+
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                "tell application \"Google Chrome\" to set visible of front window to false",
+            ],
+            timeout=3,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 — best-effort focus suppression
+        pass
 
 
 class Worker:
@@ -75,6 +101,8 @@ class Worker:
 
         self.ws_url: str | None = None
         self.target_id: str | None = None
+        self._cdp_client: Any = None  # persistent CDP connection to our tab
+        self._current_username: str = ""
         self._empty_since: float | None = None
         self._current_offset: int = 0
         self._current_posts: int = 0
@@ -107,6 +135,10 @@ class Worker:
                 self.ws_url, self.target_id = await _new_tab_url(
                     self.browser_ws, "about:blank"
                 )
+                # Hide Chrome window to prevent focus steal from
+                # Target.createTarget on macOS. Done immediately after tab
+                # creation, which is when the activation occurs.
+                _hide_chrome_window()
             except Exception as exc:
                 attempts += 1
                 logger.error(
@@ -167,25 +199,51 @@ class Worker:
         except Exception as exc:
             raise RuntimeError(f"Failed to refresh WS URL: {exc}") from exc
 
+    async def _ensure_cdp_client(self) -> Any:
+        """Get or create the persistent CDPClient for our tab.
+
+        The client lives for the worker's lifetime — one connection per tab.
+        Creating/stopping per navigate caused races where client.stop() killed
+        in-flight requests from the render poll, surfacing as TabDeadError.
+        """
+        from cdp_use import CDPClient
+
+        if self._cdp_client is not None:
+            return self._cdp_client
+        if not self.ws_url:
+            raise TabDeadError("No WS URL for CDP client")
+        self._cdp_client = CDPClient(self.ws_url)
+        await asyncio.wait_for(self._cdp_client.start(), timeout=3.0)
+        return self._cdp_client
+
+    async def _stop_cdp_client(self) -> None:
+        """Stop the persistent CDP client if any."""
+        if self._cdp_client is not None:
+            try:
+                await self._cdp_client.stop()
+            except Exception as _exc:  # noqa: BLE001
+                logger.debug("CDP client stop failed: %s", _exc)
+            self._cdp_client = None
+
     async def navigate_to(self, username: str, offset: int = 0) -> tuple[str, str]:
         """Navigate worker's persistent tab to a Tumblr blog page.
 
         Returns (html, final_url). Raises TabDeadError on CDP failure.
+        Uses the worker's persistent CDP connection — no create/stop per call.
         """
-        from cdp_use import CDPClient
+        from cdp_wrapper import cdp_send
 
-        from cdp_wrapper import TabDeadError, cdp_send
-
+        self._current_username = username
         await self._refresh_ws_url()
         if not self.ws_url:
             raise TabDeadError("No WS URL available")
 
         url = f"https://www.tumblr.com/{username}?offset={offset}"
 
-        client = CDPClient(self.ws_url)
-        await asyncio.wait_for(client.start(), timeout=30.0)
+        # Use persistent CDP client — create once, reuse for all navigations
+        client = await self._ensure_cdp_client()
         try:
-            await cdp_send(client, "Page.navigate", {"url": url, "loadResponse": True}, timeout=45.0)
+            await cdp_send(client, "Page.navigate", {"url": url}, timeout=5.0)
 
             # ---- Render convergence gate (fast + deterministic) ----
             # Tumblr is an SPA: text can appear before post cells finish
@@ -270,6 +328,22 @@ class Worker:
                             # Fetch HTML anyway so caller can extract content
                             break
 
+                    # Immediate dead-phrase check on first non-empty text —
+                    # bail within ~500ms instead of waiting for full render.
+                    if cur_text and not posts_ready:
+                        low_text = cur_text.lower()
+                        for phrase in DEAD_PHRASES:
+                            if phrase in low_text:
+                                self._render_complete = False
+                                logger.info(
+                                    "navigate_to: DEAD (phrase) %s offset %d — '%s'",
+                                    username, offset, phrase,
+                                )
+                                break
+                        else:
+                            continue
+                        break
+
                     url_stable = cur_url == last_url and cur_url != ""
                     text_present = last_text_len > 100
                     posts_rendered = best_posts > 0
@@ -288,7 +362,7 @@ class Worker:
                         self._render_complete = True
                         break
                 except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail during render poll; best-effort
-                    logger.debug("Render poll JS evaluation failed for %s: %s", self.current_username, _exc)
+                    logger.debug("Render poll JS evaluation failed for %s: %s", self._current_username, _exc)
                 try:
                     await asyncio.wait_for(self.wall_halt.wait(), timeout=0.5)
                 except TimeoutError:
@@ -329,7 +403,10 @@ class Worker:
         except Exception as exc:
             raise TabDeadError(f"navigate_to failed: {exc}") from exc
         finally:
-            await client.stop()
+            # No client.stop() — the CDP client is persistent for the worker's
+            # lifetime. Stopping it here raced with in-flight requests from the
+            # render poll, causing empty ConnectionError on the next navigate.
+            pass
 
     async def fetch_page(self, username: str, offset: int) -> tuple[str, str]:
         """Fetch a page at offset using worker's persistent tab.
@@ -349,23 +426,11 @@ class Worker:
 
         # Check if blog is dead
         if "blog-explorer" in final_url.lower():
-            # Reset the persistent tab to a blank page so the stale redirect
-            # response does not carry into the next blog's navigation (Gap 3 —
-            # verified: prior code returned skip but left the tab on the
-            # blog-explorer redirect page).
-            try:
-                from cdp_use import CDPClient
-
-                from cdp_wrapper import cdp_send
-                if self.ws_url:
-                    client = CDPClient(self.ws_url)
-                    await asyncio.wait_for(client.start(), timeout=30.0)
-                    try:
-                        await cdp_send(client, "Page.navigate", {"url": "about:blank"}, timeout=15.0)
-                    finally:
-                        await client.stop()
-            except Exception:  # noqa: BLE001, S110
-                pass  # best effort; next navigate_to refreshes the WS anyway
+            # Do NOT reset the tab to about:blank here. The next
+            # navigate_to() call will navigate to the next blog URL
+            # directly. Creating a new CDPClient + client.start() +
+            # Page.navigate here is wasted CDP churn that can kill
+            # the tab and causes focus steal.
             return {"skip": True, "reason": "blog_explorer_redirect"}
 
         page_text = html.lower()
@@ -399,24 +464,17 @@ class Worker:
         return {"skip": False}
 
     async def _recover_tab(self) -> bool:
-        """Recover the worker's tab after a TabDeadError.
+        """Open a fresh tab after a TabDeadError.
 
-        Closes the dead tab (best effort), opens a new one.
-        Returns True on success, False on failure.
-
-        Tab-open bounded by MAX_RECOVERY_PER_BLOG: the inner open loop must
-        not exceed the outer recovery count, or a storm of _open_tab failures
-        leaks one tab per attempt (Gap 1 — verified in MoA eval).
+        The dead tab is NOT closed here — closing + reopening causes
+        macOS focus steal. Chrome will garbage-collect the dead tab
+        on its own. Worker lifecycle is strictly: one tab open at
+        worker start, one tab close at worker end.
         """
-        dead_id = self.target_id
-        if dead_id:
-            try:
-                from agent import close_tab
-                await close_tab(self.browser_ws, dead_id)
-            except Exception:  # noqa: BLE001, S110
-                pass  # Best effort
         self.target_id = None
         self.ws_url = None
+        # Stop the persistent CDP client — it was bound to the dead tab
+        await self._stop_cdp_client()
 
         for attempt in range(MAX_RECOVERY_PER_BLOG):
             try:
@@ -869,38 +927,29 @@ class Worker:
                     self.stats_cb("blogs_done")
 
         finally:
+            # Stop the persistent CDP client (if still connected)
+            await self._stop_cdp_client()
+            #
             # Close our tab on exit — the login session lives in the Chrome
             # profile dir, so closing the tab does NOT log us out. Leaving tabs
             # open is what accumulates across runs and OOMs Chrome.
             #
             # Fast shutdown: if wall_halt was set (SIGINT/drain complete), don't
             # use asyncio.shield and don't retry — just close via the HTTP
-            # endpoint with a short timeout. There's no benefit to cleanly closing
-            # tabs during shutdown; it just wastes time.
-            if self.wall_halt.is_set():
-                # Shutdown path: fast close, no shield, no retry
-                if self.target_id:
-                    try:
-                        from agent import close_tab
-                        await asyncio.wait_for(
-                            close_tab(self.browser_ws, self.target_id),
-                            timeout=5.0,
-                        )
-                    except Exception as _exc:  # noqa: BLE001
-                        logger.debug("Worker %d: tab close failed during shutdown: %s", self.worker_id, _exc)
-                    self.target_id = None
-                    self.ws_url = None
-            else:
-                # Normal exit path: shield the close so cancellation doesn't
-                # leave tabs orphaned
+            # endpoint with a short timeout.
+            if self.target_id:
                 try:
-                    await asyncio.shield(self._close_tab())
-                except Exception:  # noqa: BLE001, S110
-                    pass  # Best effort
+                    from agent import close_tab
+                    await asyncio.wait_for(
+                        close_tab(self.browser_ws, self.target_id),
+                        timeout=5.0,
+                    )
+                except Exception as _exc:  # noqa: BLE001
+                    logger.debug("Worker %d: tab close failed during shutdown: %s", self.worker_id, _exc)
+                self.target_id = None
+                self.ws_url = None
             # Clear busy_event so a coordinator Task.cancel() mid-crawl cannot
             # leave busy_events[i] stuck True and block drain_complete forever
-            # (Gap 5 — verified: only the inner busy_event.clear() sites ran;
-            # the finally path never cleared it on cancellation).
             try:
                 self.busy_event.clear()
             except Exception:  # noqa: BLE001, S110
