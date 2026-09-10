@@ -401,6 +401,9 @@ class Worker:
             #   * URL stable
             #   * body text > 100 chars
             #   * post cells rendered (>0 via data-cell-id selector)
+            #   * author links present (>0 via a[rel=author]) — skeleton cells
+            #     have no author links; this prevents false convergence on SPA
+            #     placeholder markup before real post content loads
             #   * cell count trend is flat for 2 consecutive fast polls
             # Poll interval is 500ms, cap is 3s. On a healthy page this
             # usually exits in 1-3s; slow paths still have a hard stop.
@@ -413,6 +416,7 @@ class Worker:
             posts_ready = False
             cur_text = ""
             poll_count = 0
+            best_author_links = 0
             self._current_offset = offset
             self._current_posts = 0
             self._current_cells = 0
@@ -431,7 +435,8 @@ class Worker:
                                 "url: location.href, "
                                 "text: (document.body ? document.body.innerText : '').slice(0, 500), "
                                 "shell_articles: document.querySelectorAll('article').length, "
-                                "post_cells: document.querySelectorAll('div[data-cell-id*=\\\"-post-\\\"]').length"
+                                "post_cells: document.querySelectorAll('div[data-cell-id*=\"-post-\"]').length, "
+                                "author_links: document.querySelectorAll('a[rel=\"author\"]').length"
                                 "})"
                             ),
                             "returnByValue": True,
@@ -466,6 +471,7 @@ class Worker:
                         cur_url = snap.get("url", "")
                         cur_text = snap.get("text", "")
                         cur_cells = snap.get("post_cells", 0)
+                        cur_author_links = snap.get("author_links", 0)
                         cur_posts = cur_cells
                     except Exception as _exc:  # noqa: BLE001 — JSON parse may fail on partial CDP response
                         logger.debug("Render state JSON parse failed: %s", _exc)
@@ -477,6 +483,7 @@ class Worker:
                     if cur_url:
                         last_url = cur_url
                     best_posts = max(best_posts, cur_posts)
+                    best_author_links = max(best_author_links, cur_author_links)
                     last_text_len = max(last_text_len, len(cur_text))
 
                     # Update live render state for the status dashboard
@@ -529,21 +536,22 @@ class Worker:
                         stable_rounds = 0
                     prev_posts = best_posts
 
-                    if url_stable and text_present and posts_rendered:
+                    if url_stable and text_present and posts_rendered and best_author_links > 0:
                         posts_ready = True
                         self._render_complete = True
                         logger.debug(
                             "Worker %d: render CONVERGED for %s — "
-                            "url_stable=%s text_len=%d posts=%d",
+                            "url_stable=%s text_len=%d posts=%d author_links=%d",
                             self.worker_id, username,
-                            url_stable, last_text_len, best_posts,
+                            url_stable, last_text_len, best_posts, best_author_links,
                         )
                         break
                     logger.debug(
                         "Worker %d: render poll %s offset %d — "
-                        "url_stable=%s text_len=%d posts=%d (cap %.1fs left)",
+                        "url_stable=%s text_len=%d posts=%d author_links=%d (cap %.1fs left)",
                         self.worker_id, username, offset,
                         url_stable, last_text_len, best_posts,
+                        best_author_links,
                         deadline - time.monotonic(),
                     )
                 except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail during render poll; best-effort
@@ -557,7 +565,7 @@ class Worker:
                 self._render_complete = False
                 logger.warning(
                     "navigate_to: render incomplete for %s offset %d — "
-                    "url=%s posts=%d prev_posts=%d stable=%d text_len=%d",
+                    "url=%s posts=%d prev_posts=%d stable=%d text_len=%d author_links=%d",
                     username,
                     offset,
                     last_url[:80],
@@ -565,6 +573,7 @@ class Worker:
                     prev_posts,
                     stable_rounds,
                     last_text_len,
+                    best_author_links,
                 )
 
             # Get HTML
