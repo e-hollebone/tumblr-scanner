@@ -7,7 +7,7 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 - T0 index entry in `cache/index.json` shows `status: error, dead: true, unique: 0, total: 0` from a prior failed live run; will update on next successful T0 reindex.
 - CR-1: `probe_page_zero` regex `re.findall(r'"([^"]+)"', html)` extracts all quoted strings as usernames | `worker.py:650` — reindex skip optimization broken; every blog fully crawled.
 - CR-3: `_crawl_with_recovery` returns inconsistent dict shapes (missing keys on some paths) | `worker.py:690-720` — caller crashes on missing keys.
-- CR-4: `navigate_to` render poll has no max-iterations guard | `worker.py:440-460` — infinite loop on non-converging pages.
+- CR-4: ~~`navigate_to` render poll has no max-iterations guard | `worker.py:440-460` — infinite loop on non-converging pages.~~ — RESOLVED 2026-09-10: render poll loop is now bounded by `deadline = time.monotonic() + 3.0` (reduced from 12s), which serves as a hard time-based max-iterations guard. Loop exits when deadline passes regardless of poll count.
 - CR-5: `fresh_days=0` in `index_status` — `days_old <= fresh_days` with `days_old=0.003` fails | `cache.py:159` + `queue_integration.py:304` — same-run duplicate enqueue.
 - M-2: `detect_login_wall` ignores `page_text` and `html` params — URL-only detection; `LOGIN_WALL_PHRASES` config is dead code | `agent.py:327-339`.
 - M-3: Empty `else: pass` branches in `_crawl_with_recovery` — 0-username blogs with status="ok" fall through silently | `worker.py:690-720`.
@@ -15,7 +15,7 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 - M-5: `MAX_RECOVERY_PER_BLOG` retry loop doesn't check `wall_halt` between attempts | `worker.py:700-710`.
 - M-6: `close_tab` in `finally` block can raise, masking original exception | `worker.py:600-610`.
 - M-7: `_should_skip` patterns may match substrings unexpectedly | `worker.py:41-44`.
-- M-8: `DEAD_PHRASES` matching is case-sensitive | `worker.py:570-575`.
+- M-8: ~~`DEAD_PHRASES` matching is case-sensitive~~ — FALSE POSITIVE: all dead-phrase checks in worker.py lowercase the page text/URL before matching (`page_text = html.lower()`, `low_text = cur_text.lower()`, `low_early = early_text.lower()`, `low_url = cur_url.lower()`), and `DEAD_PHRASES` are all lowercase. Matching is already case-insensitive. | Resolved 2026-09-10
 - M-9: `crawl_blog` in `agent.py` has no timeout on `Runtime.evaluate` calls | `agent.py:214-220`.
 - M-10: `queue_integration._preflight_t0_login_check` doesn't check `wall_halt` | `queue_integration.py:280-310`.
 
@@ -25,7 +25,13 @@ Rule: after every run/analysis/failure, append a date-stamped entry and refresh 
 - **Claim:** `worker.py:581` and `agent.py` `fetch_page_html()` used single-nested CDP response extraction `result.get("result", {}).get("value", "{}")`, but `Runtime.evaluate` with `returnByValue=True` returns double-nested `{"result": {"result": {"value": "..."}}}`. This caused every HTML fetch to silently return `html=""` and `final_url=""`.
 - **Evidence:** Sub-agent code review (deleg_d2d2aff4) identified the discrepancy. Verified `cdp_use.CDPClient.send_raw()` returns raw CDP response dict at `cdp_use/__init__.py`. The render poll already used double-nested with fallback; only the HTML fetch was single-nested.
 - **Fix:** Changed `worker.py:581` from `result.get("result", {}).get("value", "{}")` → `result.get("result", {}).get("result", {}).get("value", "{}")`. Applied same fix to 3 CDP response extraction sites in `agent.py:fetch_page_html` (lines 214, 257, 281, 307) for consistency. Updated test mocks in `tests/test_dead_phrase.py` (2 locations) from single-nested to double-nested to match real CDP protocol shape.
-- **Verification:** All 48 tests pass (`.venv/bin/python3 -m pytest tests/ -v --tb=short --timeout=15`); `py_compile` clean on `worker.py`, `agent.py`; `ruff check tests/` passes.
+|- **Verification:** All 48 tests pass (`.venv/bin/python3 -m pytest tests/ -v --tb=short --timeout=15`); `py_compile` clean on `worker.py`, `agent.py`; `ruff check tests/` passes.
+
+### 2026-09-10 — Render poll + Page.navigate timeout reductions (worker.py)
+|- **Claim:** Session summary (d2, node 293) directed reducing Page.navigate timeout from 15s→5s and render poll convergence cap from 12s→3s, but the current code still had `timeout=15.0` on Page.navigate (line 329) and `deadline = time.monotonic() + 12.0` (line 407). These had not yet been applied.
+|- **Evidence:** `worker.py:329` still had `timeout=15.0`; `worker.py:407` still had deadline cap `12.0`; comments at lines 325, 339, 347, 405 still referenced 12s/15s values.
+|- **Fix:** Changed `Page.navigate` timeout `15.0` → `5.0` (line 329); changed render poll deadline cap `12.0` → `3.0` (line 407); updated all stale comment/log references from 12s→3s and 15s→5s. Note: the render poll convergence cap of 3s is now the outer loop deadline; individual `cdp_send` calls within the poll already use explicit `timeout=3.0` (line 440) and HTML fetch uses `timeout=10.0` (line 578, unchanged — needs full page HTML which can be large).
+|- **Verification:** `py_compile` clean; all 48 tests pass; `ruff check` clean.
 
 ### 2026-09-09 — Login-wall retry (Option A: retry-then-confirm) — RESOLVED
 - **Claim:** Login-wall retry was listed as pending implementation (Option A: retry-then-confirm).
