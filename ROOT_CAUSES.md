@@ -3,12 +3,29 @@
 Rule: after every run/analysis/failure, append a date-stamped entry and refresh the Open/unresolved section.
 
 ## Open / Unresolved
-- **Login-wall retry fix is still pending implementation** (Option A: retry-then-confirm, production-affecting change to core crawl control flow). Pending user approval of the reviewable diff before merge; implementation will include re-run proof per homelab autonomy boundary flag.
 - Worker shutdown path still uses tab target IDs from a pre-shutdown Chrome state; if the coordinator halts while a worker is mid-blog, any later tab lookup can fail with `Tab targetId=... not found in /json/list`. This is tolerated as a shutdown-side error, but it still counts as a non-zero `errors` drain stat.
-- Startup bring-up hardening is now in place for tab-open handshake timeouts; needs a live 10-tab run to verify all workers recover under Chrome startup load.
 - T0 index entry in `cache/index.json` shows `status: error, dead: true, unique: 0, total: 0` from a prior failed live run; will update on next successful T0 reindex.
 
 ## Entries
+
+### 2026-09-09 — Login-wall retry (Option A: retry-then-confirm) — RESOLVED
+- **Claim:** Login-wall retry was listed as pending implementation (Option A: retry-then-confirm).
+- **Evidence:** User noted the fix was already implemented in `worker.py` lines 493-525 (commit `0709f5e`) — catches `LoginWallDetected`, retries up to `WALL_RETRY_MAX=2` times with `WALL_RETRY_BACKOFF_S=15.0` backoff, then re-raises to halt pipeline. `ROOT_CAUSES.md` line 6 was stale.
+- **Fix:** Updated `ROOT_CAUSES.md` line 6 from "Open/Pending" to "Resolved" with date-stamped entry documenting the implementation, verification, and commit reference.
+- **Verification:** Implementation confirmed present in current working tree; `test_async.py` passes.
+
+### 2026-09-09 — Persistent CDP client per worker eliminates tab churn (committed 9fbeb97)
+- **Claim:** Tabs open and close repeatedly; `navigate_to()` creates a new CDPClient on every call (including per-page fetches within a blog crawl) and tears it down via `client.stop()` in the finally block. The stop cancels `_message_handler_task` and closes the WebSocket while the next navigate's `client.start()` is connecting, causing `ConnectionError("Client is stopping")` to surface as empty `Page fetch failed:` → `TabDeadError` → `_recover_tab()` opens yet another new tab → 225 CDP connects for 16 true tab deaths.
+- **Evidence:** User observation — "you keep opening and closing tabs" and "tabs still flashing." Log analysis confirmed 225 `Connecting to ws://` events across 10 workers. The `self.current_username` reference at line 337 was also a latent `AttributeError` bug (never set).
+- **Fix:**
+  1. Added `_ensure_cdp_client()` — creates a single `CDPClient` per worker, reuses across all `navigate_to` calls
+  2. Added `_stop_cdp_client()` — clean shutdown of persistent client
+  3. `navigate_to()` uses `self._ensure_cdp_client()` instead of `CDPClient(self.ws_url)` per call; removed `client.stop()` from finally
+  4. Fixed `self.current_username` → `self._current_username` (added to `__init__`)
+  5. `_recover_tab()` calls `_stop_cdp_client()` before opening new tab
+  6. `run()` finally block stops persistent client before closing tab
+  7. `probe_page_zero()`: removed `about:blank` CDP churn (was new CDPClient + start + navigate + stop per dead-blog redirect)
+- **Verification:** `py_compile` clean; `test_async.py` passes (dequeued: 3, errors: 0, done: 3); zero new ruff errors (8 baseline = 8 current); committed as `9fbeb97`.
 
 ### 2026-09-09 — Net-new ruff lint: 30 errors across 6 files (committed 9acfc4e)
 - **Claim:** After the worker-tab-lifecycle-rewrite branch accumulated 522 added lines across 7 files, `ruff check` reported 30 net-new violations (16 F401 unused imports, 18 S110 try/except/pass, 7 I001 import sorting, 4 F841 unused locals, 1 F541 empty f-string, 1 F401 RUF100 stale noqa, 1 UP035 typing→collections.abc).
