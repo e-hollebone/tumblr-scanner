@@ -366,6 +366,10 @@ def restart_chrome() -> dict[str, Any]:
         # but its per-tab WebSocket server is dead: workers hang forever on
         # CDPClient.start() with "timed out during opening handshake".
         if _probe_cdp_health(running_port):
+            # Inject cached Tumblr session cookies to bypass login wall
+            from cookie_inject import inject_cookies
+            inject_cookies(running_port)
+
             login_wall = _probe_login_wall(running_port)
             _minimize_chrome_window(running_port)
             return {
@@ -431,6 +435,10 @@ def restart_chrome() -> dict[str, Any]:
                 pass
 
         if port_ready:
+            # Inject cached Tumblr session cookies to bypass login wall
+            from cookie_inject import inject_cookies
+            inject_cookies(port)
+
             login_wall = _probe_login_wall(port)
             try:
                 with urllib.request.urlopen(
