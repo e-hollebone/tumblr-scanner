@@ -526,9 +526,9 @@ async def _drain_queue(
 
     worker_tasks = [
         asyncio.create_task(_run_worker(worker_instances, i,
-                                        preset_ws_url=t0_ws_url,
-                                        preset_target_id=t0_target_id,
-                                        preset_cdp_client=t0_cdp_client))
+                                        preset_ws_url=t0_ws_url if i == 0 else None,
+                                        preset_target_id=t0_target_id if i == 0 else None,
+                                        preset_cdp_client=t0_cdp_client if i == 0 else None))
         for i in range(pool_size)
     ]
 
