@@ -227,16 +227,16 @@ class Worker:
     async def _ensure_cdp_client(self) -> Any:
         """Get a CDP client for the worker's tab.
 
-        Creates a fresh client on each call — no caching, no reuse,
-        no health-check loop. This eliminates the discard/recreate
-        cycle that was causing tab recreation and focus-steal issues.
-
-        Caller is responsible for ensuring ws_url is set before calling.
+        Creates a fresh client on first call, then reuses it for the
+        worker's lifetime. _stop_cdp_client() handles teardown.
         """
         from cdp_use import CDPClient
 
         if not self.ws_url:
             raise TabDeadError("No WS URL for CDP client")
+
+        if self._cdp_client is not None:
+            return self._cdp_client
 
         logger.info(
             "Worker %d: creating fresh CDP client for ws_url=%s",
@@ -245,8 +245,18 @@ class Worker:
         )
         client = CDPClient(self.ws_url)
         await asyncio.wait_for(client.start(), timeout=3.0)
+        self._cdp_client = client
         logger.info("Worker %d: CDP client started", self.worker_id)
         return client
+
+    async def _stop_cdp_client(self) -> None:
+        """Stop the persistent CDP client (if connected)."""
+        if self._cdp_client is not None:
+            try:
+                await self._cdp_client.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Worker %d: CDP client stop raised: %s", self.worker_id, exc)
+            self._cdp_client = None
     async def navigate_to(self, username: str, offset: int = 0) -> tuple[str, str]:
         """Navigate worker's persistent tab to a Tumblr blog page.
 
@@ -704,6 +714,7 @@ class Worker:
                 on_progress=self.progress_cb,
                 first_html=first_html,
                 first_url=first_url,
+                observed_posts_fn=lambda: self._current_posts,
             )
 
         for attempt in range(1, MAX_RECOVERY + 1):

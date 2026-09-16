@@ -1,8 +1,8 @@
 """Unit tests for ``Worker._ensure_cdp_client``.
 
 Tests the CDP client lifecycle logic:
-    - Create fresh client when called
-    - Create fresh client every call (no caching)
+    - Create fresh client when called (when _cdp_client is None)
+    - Cache the client on first call, reuse on subsequent calls
     - Timeout on start() is handled gracefully
 """
 from __future__ import annotations
@@ -31,37 +31,30 @@ class TestEnsureCDPClient:
     """Tests for Worker._ensure_cdp_client()."""
 
     async def test_create_fresh_when_no_cached_client(self, mock_cdp, tmp_path):
-        """When _cdp_client is None, a new client is created and started."""
+        """When _cdp_client is None, a new client is created and cached."""
         w = _make_worker(tmp_path)
         assert w._cdp_client is None
         w.ws_url = "ws://fake-devtools"
         w.target_id = "TAB1"
 
-        # The factory (mock_cdp) creates MockCDPClient with start_fails=False
         client = await w._ensure_cdp_client()
 
         assert client is not None
         assert client.started is True
-        # Production does NOT cache — _cdp_client stays None
-        assert w._cdp_client is None
+        assert w._cdp_client is client
 
-    async def test_creates_new_client_every_call(self, mock_cdp, tmp_path):
-        """Each call to _ensure_cdp_client creates a fresh client (no caching)."""
+    async def test_reuses_cached_client_on_second_call(self, mock_cdp, tmp_path):
+        """Second call reuses the cached client (no recreation)."""
         w = _make_worker(tmp_path)
         w.ws_url = "ws://fake-devtools"
         w.target_id = "TAB1"
 
-        # First call creates a client
         client1 = await w._ensure_cdp_client()
         assert client1.started is True
 
-        # Second call creates a NEW client (no caching in production)
         client2 = await w._ensure_cdp_client()
-
-        assert client2 is not client1, "Production creates fresh client every call"
+        assert client2 is client1, "Reused cached client on second call"
         assert client2.started is True
-        # Production does NOT cache — _cdp_client stays None
-        assert w._cdp_client is None
 
     async def test_timeout_on_start_handled(self, mock_cdp, tmp_path):
         """When client.start() fails, _ensure_cdp_client raises."""

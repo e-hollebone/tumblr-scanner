@@ -29,7 +29,7 @@ class TestEnsureCDPClient:
     """Unit tests for Worker._ensure_cdp_client()."""
 
     async def test_creates_new_client_when_none_cached(self, mock_cdp, wall_halt):
-        """_ensure_cdp_client creates a fresh CDPClient each call (no caching)."""
+        """_ensure_cdp_client creates a fresh CDPClient when none is cached."""
         w = Worker(
             worker_id=0,
             browser_ws="ws://fake",
@@ -44,26 +44,18 @@ class TestEnsureCDPClient:
 
         assert client1 is not None
         assert client1.started is True
-        # Production creates a fresh client every call — no caching
-        assert w._cdp_client is None
-        # Production does NOT send Page.enable here — that happens in
-        # navigate_to(). _ensure_cdp_client just creates + starts the client.
+        # Production caches the client on first call
+        assert w._cdp_client is client1
         assert client1.call_log == []
 
-        # Second call creates ANOTHER fresh client (no reuse)
+        # Second call reuses the cached client
         client2 = await w._ensure_cdp_client()
         assert client2 is not None
-        assert client2 is not client1, "Each call creates a fresh client (no caching)"
+        assert client2 is client1, "Second call reuses cached client"
         assert client2.started is True
 
     async def test_reuses_cached_client_when_alive(self, mock_cdp, wall_halt):
-        """NOTE: _ensure_cdp_client no longer caches — each call creates fresh.
-
-        This test documents the current behavior: production code creates a new
-        CDPClient on every _ensure_cdp_client() call. No reuse, no health-check
-        loop. The previous caching behavior was removed to eliminate the
-        discard/recreate cycle.
-        """
+        """_ensure_cdp_client reuses the cached client when it's already set."""
         w = Worker(
             worker_id=0,
             browser_ws="ws://fake",
@@ -74,7 +66,7 @@ class TestEnsureCDPClient:
         w.ws_url = "ws://fake-devtools"
         w.target_id = "TAB1"
 
-        # Pre-set a cached client (simulating old behavior)
+        # Pre-set a cached client
         cached = MockCDPClient(
             "ws://fake-devtools",
             default_response={"result": {"type": "string", "value": "1"}},
@@ -82,22 +74,19 @@ class TestEnsureCDPClient:
         cached.started = True
         w._cdp_client = cached
 
-        # Production _ensure_cdp_client ignores the cached client and creates fresh
+        # Production _ensure_cdp_client reuses the cached client
         client = await w._ensure_cdp_client()
 
-        assert client is not cached, "Fresh client created (cached client ignored)"
+        assert client is cached, "Reused the cached client"
         assert client.started is True
-        # Production doesn't cache — _cdp_client retains its pre-set value
         assert w._cdp_client is cached
-        # Health check not sent on pre-existing client (fresh client created instead)
-        assert cached.call_log == []
 
-    async def test_recreates_dead_cached_client(self, mock_cdp, wall_halt):
-        """NOTE: _ensure_cdp_client no longer caches — always creates fresh.
+    async def test_reuses_cached_client_even_if_dead(self, mock_cdp, wall_halt):
+        """_ensure_cdp_client reuses whatever is cached, even if dead.
 
-        Even when _cdp_client is set to a dead client, production code creates
-        a fresh CDPClient rather than detecting the dead client and recreating.
-        The dead client detection path no longer exists in production.
+        Production code doesn't health-check the cached client — it trusts
+        that _stop_cdp_client() was called before _ensure_cdp_client() when
+        the tab died. If a dead client is cached, it's reused as-is.
         """
         w = Worker(
             worker_id=0,
@@ -122,13 +111,10 @@ class TestEnsureCDPClient:
         dead.send_raw = _dead_send_raw
         w._cdp_client = dead
 
-        # Production _ensure_cdp_client ignores the dead cached client and creates fresh
+        # Production _ensure_cdp_client reuses the cached client (no health check)
         client = await w._ensure_cdp_client()
 
-        assert client is not None
-        assert client is not dead, "Fresh client created (dead client ignored)"
-        assert client.started is True
-        # Production doesn't cache — _cdp_client retains its pre-set value
+        assert client is dead, "Reused the cached dead client"
         assert w._cdp_client is dead
 
     async def test_raises_when_no_ws_url(self, mock_cdp, wall_halt):

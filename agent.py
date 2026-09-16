@@ -407,6 +407,7 @@ async def crawl_blog(
     on_progress: callable | None = None,
     first_html: str | None = None,
     first_url: str | None = None,
+    observed_posts_fn: Callable[[], int] | None = None,
 ) -> dict[str, Any]:
     """Crawl a single blog from start to stop condition.
 
@@ -522,12 +523,21 @@ async def crawl_blog(
         if on_progress:
             on_progress(f"page_fetched:{username}:offset:{offset}:posts:{page_posts}:unique:{page_unique}")
 
-        # Dynamic offset: Tumblr returns a variable number of posts per
-        # offset page (not always 20). Advance by the actual count so
-        # the next request fetches the correct slice. If a page returned
-        # 0 posts (shouldn't happen — detect_end_of_posts would have
-        # caught it), fall back to 20 to avoid an infinite loop.
-        offset += page_posts if page_posts > 0 else 20
+        # Dynamic offset: use the render poll's observed post count
+        # (ground truth from CDP) when available, else fall back to
+        # page_posts from extract_from_html, else 20 to avoid infinite loop.
+        if observed_posts_fn is not None:
+            try:
+                observed = observed_posts_fn()
+                if observed > 0:
+                    offset += observed
+                    logger.debug("Dynamic offset += %d (observed) for %s", observed, username)
+                else:
+                    offset += page_posts if page_posts > 0 else 20
+            except Exception:
+                offset += page_posts if page_posts > 0 else 20
+        else:
+            offset += page_posts if page_posts > 0 else 20
 
         # Random delay between pages (interruptible on shutdown)
         delay = random.uniform(delay_min, delay_max)
