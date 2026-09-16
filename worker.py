@@ -491,7 +491,14 @@ class Worker:
                             break  # out of render-poll while loop
                         # else: no dead phrase — fall through to convergence
 
-                    url_stable = cur_url == last_url and cur_url != ""
+                    # Content-warning interstitial: Tumblr's age-gate page
+                    # that auto-redirects to the real blog after a short delay.
+                    # Force url_stable=False so the render poll keeps waiting
+                    # for the redirect instead of timing out on the bare
+                    # interstitial (which has 0 posts and minimal text).
+                    is_content_warning = "content_warning_wall" in cur_url
+
+                    url_stable = cur_url == last_url and cur_url != "" and not is_content_warning
                     text_present = last_text_len > 100
                     posts_rendered = best_posts > 0
                     # Posts are stable when count is flat or still rising but
