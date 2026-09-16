@@ -287,6 +287,7 @@ class Worker:
             username,
         )
         try:
+            self._cw_bypass_attempts = 0  # Reset per-navigation
             logger.info(
                 "Worker %d: Page.navigate -> %s (timeout=5s)",
                 self.worker_id,
@@ -491,22 +492,45 @@ class Worker:
                             break  # out of render-poll while loop
                         # else: no dead phrase — fall through to convergence
 
-                    # Content-warning interstitial: Tumblr's age-gate page
-                    # that auto-redirects to the real blog. The wall URL
-                    # contains "content_warning_wall" and the page has no
-                    # posts. Strip the wall parameters and navigate back
-                    # to the same URL so Tumblr's JS accepts the session
-                    # cookie and renders the real page.
+                    # Content-warning interstitial: Tumblr's age-gate page.
+                    # There are two variants:
+                    #   1. Click-through wall: "This blog may contain sensitive media"
+                    #      with a "View this blog" button — can be bypassed.
+                    #   2. Hard login wall: "To view this blog, sign up or login" —
+                    #      requires an authenticated session. Cannot bypass.
+                    # Detect the hard login wall and abort with a clear error.
                     is_content_warning = "content_warning_wall" in cur_url
                     if is_content_warning:
+                        # Check if this is a hard login wall
+                        if "sign up or login" in cur_text.lower() or "sign in" in cur_text.lower():
+                            logger.error(
+                                "HARD LOGIN WALL for %s — Chrome profile is not logged "
+                                "into Tumblr. Log into Tumblr in the Chrome profile "
+                                "(profile path: /Users/eric/Documents/tumblr-scanner/chrome_profile) "
+                                "and retry.",
+                                username,
+                            )
+                            self._render_complete = False
+                            return ("", cur_url)
+                        # Otherwise: click-through wall, attempt bypass
+                        # Guard against infinite bypass loop: only try once per render poll
+                        if not hasattr(self, '_cw_bypass_attempts'):
+                            self._cw_bypass_attempts = 0
+                        if self._cw_bypass_attempts >= 2:
+                            logger.warning(
+                                "Content warning bypass failed for %s after %d attempts — "
+                                "likely a hard wall requiring login.",
+                                username, self._cw_bypass_attempts,
+                            )
+                            self._render_complete = False
+                            return ("", cur_url)
+                        self._cw_bypass_attempts += 1
                         try:
                             from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
                             parsed = urlparse(cur_url)
                             qs = parse_qs(parsed.query)
-                            # Remove content_warning_wall params
                             qs.pop("source", None)
                             qs.pop("redirect_to", None)
-                            # Rebuild URL without wall params (preserves offset)
                             clean_query = urlencode(qs, doseq=True)
                             clean_url = urlunparse((
                                 parsed.scheme, parsed.netloc, parsed.path,
@@ -518,7 +542,8 @@ class Worker:
                                 {"url": clean_url},
                                 timeout=10.0,
                             )
-                            logger.debug("Bypassed content warning for %s -> %s", username, clean_url)
+                            deadline = time.monotonic() + 5.0
+                            logger.debug("Bypassed content warning for %s -> %s (deadline reset)", username, clean_url)
                         except Exception as _exc:
                             logger.debug("Content warning bypass failed: %s", _exc)
 
