@@ -546,6 +546,14 @@ async def _drain_queue(
             await asyncio.wait_for(wall_halt.wait(), timeout=2.0)
         except TimeoutError:
             pass
+        # Log when wall_halt fires so we can distinguish drain-complete from
+        # signal-induced shutdown in the logs (the signal handler sets wall_halt
+        # silently — this line makes it visible).
+        if wall_halt.is_set():
+            logger.info("Coordinator: wall_halt set — exiting drain loop (cancelled=%s qsize=%d pending=%d in_progress=%d)",
+                        all(t.done() for t in worker_tasks), active_count(queue_path),
+                        pending_count(queue_path), in_progress_count(queue_path))
+            break
         loop_count += 1
         qsize = active_count(queue_path)
         crawling = any(e.is_set() for e in busy_events)

@@ -105,8 +105,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     import logging
-    from logging import DEBUG, INFO, basicConfig
+    from logging import DEBUG, INFO, basicConfig, getLogger
     from logging.handlers import RotatingFileHandler
+
+    logger = getLogger(__name__)
 
     log_path = Path.home() / ".hermes" / "logs" / "tumblr-scanner.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
                 "Halting workers, finishing current blog, then exiting...",
                 file=sys.stderr,
             )
+            logger.info("SHUTDOWN: SIGINT/SIGTERM received — setting wall_halt (source=signal)")
             wall_halt.set()
 
         try:
@@ -158,16 +161,21 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError:
             pass
 
-        # The only production path is queue-mode: fresh Chrome, seed-on-queue,
-        # worker pool drains T1/T2 in parallel from first extraction.
-        result = await queue_mode(
-            target_blog=args.target_blog,
-            browser_ws=args.browser,
-            cache_dir=args.cache_dir,
-            verbose=args.verbose,
-            pool_size=args.tabs,
-            wall_halt=wall_halt,
-        )
+        # Double-Ctrl+C (KeyboardInterrupt) bypasses the signal handler.
+        # Catch it so we can log the cause before exiting.
+        try:
+            result = await queue_mode(
+                target_blog=args.target_blog,
+                browser_ws=args.browser,
+                cache_dir=args.cache_dir,
+                verbose=args.verbose,
+                pool_size=args.tabs,
+                wall_halt=wall_halt,
+            )
+        except KeyboardInterrupt:
+            logger.warning("SHUTDOWN: KeyboardInterrupt (double Ctrl+C) — force-cancelling workers")
+            wall_halt.set()
+            result = {"processed": 0, "errors": 1, "new_enqueued": 0, "elapsed_seconds": 0, "queue_final": 0, "wall_halt": wall_halt}
         return result
 
     try:
