@@ -225,72 +225,28 @@ class Worker:
             raise RuntimeError(f"Failed to refresh WS URL: {exc}") from exc
 
     async def _ensure_cdp_client(self) -> Any:
-        """Get or create the persistent CDPClient for our tab.
+        """Get a CDP client for the worker's tab.
 
-        The client lives for the worker's lifetime — one connection per tab.
-        Creating/stopping per navigate caused races where client.stop() killed
-        in-flight requests from the render poll, surfacing as TabDeadError.
+        Creates a fresh client on each call — no caching, no reuse,
+        no health-check loop. This eliminates the discard/recreate
+        cycle that was causing tab recreation and focus-steal issues.
+
+        Caller is responsible for ensuring ws_url is set before calling.
         """
         from cdp_use import CDPClient
 
-        from cdp_wrapper import cdp_send
-
-        if self._cdp_client is not None:
-            # Sanity-check: if the cached client is not started, discard it.
-            # This can happen if a previous start() timed out after we
-            # assigned self._cdp_client but before the await returned.
-            try:
-                # Quick health check — send a no-op command.
-                # If the client is dead, this raises and we recreate.
-                await asyncio.wait_for(
-                    self._cdp_client.send_raw("Runtime.evaluate", {"expression": "1"}),
-                    timeout=2.0,
-                )
-                logger.debug(
-                    "Worker %d: _ensure_cdp_client reused cached client",
-                    self.worker_id,
-                )
-                return self._cdp_client
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "Worker %d: cached CDP client dead, recreating",
-                    self.worker_id,
-                )
-                self._cdp_client = None
         if not self.ws_url:
             raise TabDeadError("No WS URL for CDP client")
+
         logger.info(
-            "Worker %d: creating new CDP client for ws_url=%s",
+            "Worker %d: creating fresh CDP client for ws_url=%s",
             self.worker_id,
             self.ws_url[:60] if self.ws_url else None,
         )
         client = CDPClient(self.ws_url)
         await asyncio.wait_for(client.start(), timeout=3.0)
-        # Enable the Page domain so Page.navigate events fire correctly and
-        # Runtime.evaluate has a stable execution context. Without this, the
-        # page may be in a transitional state where JS evaluation times out
-        # or returns stale data from the previous loaded page.
-        try:
-            await cdp_send(client, "Page.enable", {}, timeout=5.0)
-            logger.debug("Worker %d: Page.enable sent", self.worker_id)
-        except Exception as _exc:  # noqa: BLE001
-            logger.debug("Worker %d: Page.enable failed (non-fatal): %s", self.worker_id, _exc)
-        self._cdp_client = client
-        logger.info(
-            "Worker %d: CDP client started successfully",
-            self.worker_id,
-        )
-        return self._cdp_client
-
-    async def _stop_cdp_client(self) -> None:
-        """Stop the persistent CDP client if any."""
-        if self._cdp_client is not None:
-            try:
-                await self._cdp_client.stop()
-            except (asyncio.CancelledError, Exception) as _exc:  # noqa: BLE001
-                logger.debug("CDP client stop failed: %s", _exc)
-            self._cdp_client = None
-
+        logger.info("Worker %d: CDP client started", self.worker_id)
+        return client
     async def navigate_to(self, username: str, offset: int = 0) -> tuple[str, str]:
         """Navigate worker's persistent tab to a Tumblr blog page.
 
@@ -326,7 +282,7 @@ class Worker:
                 self.worker_id,
                 url,
             )
-            await cdp_send(client, "Page.navigate", {"url": url}, timeout=5.0)
+            await cdp_send(client, "Page.navigate", {"url": url}, timeout=45.0)
             logger.info(
                 "Worker %d: Page.navigate returned for %s, starting render poll",
                 self.worker_id,
@@ -362,9 +318,9 @@ class Worker:
                 )
                 early_text = ""
                 if isinstance(early, dict):
-                    val = early.get("result", {}).get("result", {}).get("value")
+                    val = early.get("value")
                     if val is None:
-                        val = early.get("result", {}).get("value")
+                        val = early.get("value")
                     if isinstance(val, str):
                         # returnByValue: True returns a JSON-encoded string
                         import json as _json
@@ -453,9 +409,9 @@ class Worker:
                     # not result.result.result.value (triple-nested). Try the
                     # expected path first; fall back to the shallow path so
                     # the render poll never silently gets {} on every poll.
-                    val = result.get("result", {}).get("result", {}).get("value")
+                    val = result.get("value")
                     if val is None:
-                        val = result.get("result", {}).get("value", "{}")
+                        val = result.get("value", "{}")
                     # DEBUG: log raw CDP response shape to diagnose empty render polls
                     logger.debug(
                         "Worker %d: render poll raw response for %s — "
@@ -586,7 +542,7 @@ class Worker:
                 },
                 timeout=10.0,
             )
-            payload = result.get("result", {}).get("result", {}).get("value", "{}")
+            payload = result.get("value", "{}")
             try:
                 data = json.loads(payload)
                 html = data.get("html", "")
@@ -1188,7 +1144,7 @@ class Worker:
                     from agent import close_tab
                     await asyncio.wait_for(
                         close_tab(self.browser_ws, self.target_id),
-                        timeout=5.0,
+                        timeout=45.0,
                     )
                 except (asyncio.CancelledError, Exception) as _exc:  # noqa: BLE001
                     logger.debug(

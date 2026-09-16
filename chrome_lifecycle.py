@@ -323,7 +323,7 @@ def _probe_cdp_health(port: int) -> bool:
                 await asyncio.wait_for(ws.send(msg), timeout=5)
                 resp_raw = await asyncio.wait_for(ws.recv(), timeout=10)
                 result = json.loads(resp_raw)
-                val = result.get("result", {}).get("result", {}).get("value")
+                val = result.get("value")
                 return val == 2
         except Exception as _exc:  # noqa: BLE001 — WebSocket roundtrip may fail; server unhealthy
             logger.debug("CDP health WS roundtrip failed on port %d: %s", port, _exc)

@@ -159,11 +159,9 @@ async def _preflight_t0_login_check(
                             },
                             timeout=15.0,
                         )
-                        val = result.get("result", {}).get("result", {}).get("value", "{}")
+                        val = result.get("value", "{}")
                         if not val or val == "{}":
-                            alt_val = result.get("result", {}).get("value", "{}")
-                            if alt_val and alt_val != "{}":
-                                val = alt_val
+                            val = "{}"
                         import json as _json
                         snap = _json.loads(val)
                         final_url = snap.get("url", "")
@@ -528,9 +526,9 @@ async def _drain_queue(
 
     worker_tasks = [
         asyncio.create_task(_run_worker(worker_instances, i,
-                                        preset_ws_url=t0_ws_url if i == 0 else None,
-                                        preset_target_id=t0_target_id if i == 0 else None,
-                                        preset_cdp_client=t0_cdp_client if i == 0 else None))
+                                        preset_ws_url=t0_ws_url,
+                                        preset_target_id=t0_target_id,
+                                        preset_cdp_client=t0_cdp_client))
         for i in range(pool_size)
     ]
 

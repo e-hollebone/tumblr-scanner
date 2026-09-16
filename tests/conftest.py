@@ -45,7 +45,7 @@ class MockCDPClient:
     ):
         self.url = url
         self._script: list[dict[str, Any]] = list(script) if script else []
-        self._default = default_response or {"result": {"result": {"value": "{}"}}}
+        self._default = default_response or {"result": {"type": "string", "value": "{}"}}
         self._start_delay = start_delay
         self._start_fails = start_fails
         self._stop_fails = stop_fails
@@ -135,14 +135,12 @@ def _page_ready_response(url: str = "https://www.tumblr.com/",
                          text: str = "") -> dict:
     """Build a Runtime.evaluate response for the page-state snapshot."""
     payload = json.dumps({"url": url, "text": text})
-    return {"result": {"result": {"value": payload}}}
+    return {"result": {"type": "string", "value": payload}}
 
 
 def make_cdp_response(value: str, *, is_json: bool = False) -> dict:
     """Build a CDP Runtime.evaluate response with the given value."""
-    if is_json:
-        return {"result": {"result": {"value": value}}}
-    return {"result": {"result": {"value": value}}}
+    return {"result": {"type": "string", "value": value}}
 
 
 @pytest.fixture

@@ -212,7 +212,7 @@ async def fetch_page_html(
             },
             timeout=10.0,
         )
-        snap = json.loads(res.get("result", {}).get("result", {}).get("value", "{}"))
+        snap = json.loads(res.get("value", "{}"))
         snap_url = snap.get("url", "")
         snap_text = (snap.get("text") or "").lower()
         if "blog-explorer" in snap_url.lower():
@@ -257,7 +257,7 @@ async def fetch_page_html(
                 },
                 timeout=10.0,
             )
-            cell_count = int(res.get("result", {}).get("result", {}).get("value", 0) or 0)
+            cell_count = int(res.get("value", 0) or 0)
         except Exception as _exc:  # noqa: BLE001 — CDP evaluate may fail; default to 0 cells
             logger.debug("Cell count JS evaluation failed: %s", _exc)
             cell_count = 0
@@ -282,7 +282,7 @@ async def fetch_page_html(
                 },
                 timeout=10.0,
             )
-            new_text = result.get("result", {}).get("result", {}).get("value", "")
+            new_text = result.get("value", "")
             if new_text:
                 last_text = new_text
                 if len(new_text) > 100:
@@ -309,7 +309,7 @@ async def fetch_page_html(
             },
             timeout=10.0,
         )
-        payload = result.get("result", {}).get("result", {}).get("value", "{}")
+        payload = result.get("value", "{}")
         try:
             data = json.loads(payload)
             html = data.get("html", "")
