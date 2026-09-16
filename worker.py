@@ -498,11 +498,19 @@ class Worker:
                     #      with a "View this blog" button — can be bypassed.
                     #   2. Hard login wall: "To view this blog, sign up or login" —
                     #      requires an authenticated session. Cannot bypass.
-                    # Detect the hard login wall and abort with a clear error.
+                    # Detect the hard login wall by checking for login-related
+                    # links/buttons on the page. The page has separate "Sign up"
+                    # and "Log in" links — not the combined phrase "sign up or login".
                     is_content_warning = "content_warning_wall" in cur_url
                     if is_content_warning:
-                        # Check if this is a hard login wall
-                        if "sign up or login" in cur_text.lower() or "sign in" in cur_text.lower():
+                        low_text = cur_text.lower()
+                        is_hard_login = (
+                            "sign up" in low_text
+                            or "log in" in low_text
+                            or "sign in" in low_text
+                            or "login" in low_text
+                        )
+                        if is_hard_login:
                             logger.error(
                                 "HARD LOGIN WALL for %s — Chrome profile is not logged "
                                 "into Tumblr. Log into Tumblr in the Chrome profile "
