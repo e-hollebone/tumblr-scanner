@@ -492,11 +492,35 @@ class Worker:
                         # else: no dead phrase — fall through to convergence
 
                     # Content-warning interstitial: Tumblr's age-gate page
-                    # that auto-redirects to the real blog after a short delay.
-                    # Force url_stable=False so the render poll keeps waiting
-                    # for the redirect instead of timing out on the bare
-                    # interstitial (which has 0 posts and minimal text).
+                    # that auto-redirects to the real blog. The wall URL
+                    # contains "content_warning_wall" and the page has no
+                    # posts. Strip the wall parameters and navigate back
+                    # to the same URL so Tumblr's JS accepts the session
+                    # cookie and renders the real page.
                     is_content_warning = "content_warning_wall" in cur_url
+                    if is_content_warning:
+                        try:
+                            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+                            parsed = urlparse(cur_url)
+                            qs = parse_qs(parsed.query)
+                            # Remove content_warning_wall params
+                            qs.pop("source", None)
+                            qs.pop("redirect_to", None)
+                            # Rebuild URL without wall params (preserves offset)
+                            clean_query = urlencode(qs, doseq=True)
+                            clean_url = urlunparse((
+                                parsed.scheme, parsed.netloc, parsed.path,
+                                parsed.params, clean_query, parsed.fragment
+                            ))
+                            await cdp_send(
+                                client,
+                                "Page.navigate",
+                                {"url": clean_url},
+                                timeout=10.0,
+                            )
+                            logger.debug("Bypassed content warning for %s -> %s", username, clean_url)
+                        except Exception as _exc:
+                            logger.debug("Content warning bypass failed: %s", _exc)
 
                     url_stable = cur_url == last_url and cur_url != "" and not is_content_warning
                     text_present = last_text_len > 100
