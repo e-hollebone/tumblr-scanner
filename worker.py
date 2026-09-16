@@ -361,9 +361,11 @@ class Worker:
             #     have no author links; this prevents false convergence on SPA
             #     placeholder markup before real post content loads
             #   * cell count trend is flat for 2 consecutive fast polls
-            # Poll interval is 500ms, cap is 3s. On a healthy page this
+            # Poll interval is 500ms, cap is 5s. On a healthy page this
             # usually exits in 1-3s; slow paths still have a hard stop.
-            deadline = time.monotonic() + 3.0
+            # Extended from 3s: Tumblr SPA render + content warning
+            # interstitial can take 3.5s to fully populate post cells.
+            deadline = time.monotonic() + 5.0
             last_url = ""
             last_text_len = 0
             best_posts = 0

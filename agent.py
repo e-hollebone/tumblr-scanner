@@ -337,11 +337,12 @@ def detect_login_wall(page_text: str, html: str = "", url: str = "") -> bool:
     keywords (e.g. "recaptcha") causes false positives — that word
     appears in analytics/tracking scripts on every page, including
     authenticated ones. So we check the URL only.
+
+    Note: content_warning_wall is NOT a login wall — it's an age/
+    content interstitial that still renders real posts through it.
     """
     u = url.lower()
-    if "login" in u or "signup" in u:
-        return True
-    return "content_warning_wall" in u
+    return "login" in u or "signup" in u
 
 
 def detect_login_wall_detail(page_text: str, html: str = "", url: str = "") -> tuple[bool, str]:
@@ -351,8 +352,6 @@ def detect_login_wall_detail(page_text: str, html: str = "", url: str = "") -> t
         return True, "url:login"
     if "signup" in u:
         return True, "url:signup"
-    if "content_warning_wall" in u:
-        return True, "url:content_warning_wall"
     return False, ""
 
 
